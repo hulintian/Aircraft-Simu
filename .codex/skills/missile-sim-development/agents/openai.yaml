@@ -1,0 +1,4 @@
+interface:
+  display_name: "飞控闭环仿真开发"
+  short_description: "按设计计划推进飞控、环境、多实例、测试及项目文档实现"
+  default_prompt: "使用 $missile-sim-development 核对项目进度并继续实现下一项计划。"

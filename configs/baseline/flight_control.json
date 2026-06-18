@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "scheduler": {
+    "base_rate_hz": 100,
+    "tasks": [
+      { "name": "receive", "period_ticks": 1 },
+      { "name": "navigation", "period_ticks": 1 },
+      { "name": "guidance", "period_ticks": 1 },
+      { "name": "controller", "period_ticks": 1 },
+      { "name": "safety", "period_ticks": 1 },
+      { "name": "log", "period_ticks": 10 }
+    ]
+  },
+  "guidance": {
+    "type": "PNG_3D",
+    "navigation_constant": 4.0,
+    "max_accel_mps2": 350.0,
+    "max_accel_rate_mps3": 2000.0
+  },
+  "safety": {
+    "sensor_timeout_s": 0.1,
+    "command_hold_s": 0.2,
+    "reject_nan": true,
+    "reject_old_seq": true
+  }
+}
+

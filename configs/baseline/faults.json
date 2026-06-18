@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "faults": [
+    {
+      "time_s": 12.5,
+      "duration_s": 3.0,
+      "target": "sensor.seeker.los_rate",
+      "type": "BIAS",
+      "value": 0.001
+    }
+  ]
+}
+
