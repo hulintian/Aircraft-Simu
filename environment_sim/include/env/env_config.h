@@ -8,5 +8,7 @@
 #define ENV_DEFAULT_SCENARIO_CONFIG "configs/baseline/scenario.json"
 /** @brief 默认运行时配置文件路径。 */
 #define ENV_DEFAULT_RUNTIME_CONFIG "configs/baseline/runtime.json"
+/** @brief 默认故障脚本配置文件路径。 */
+#define ENV_DEFAULT_FAULTS_CONFIG "configs/baseline/faults.json"
 
 #endif

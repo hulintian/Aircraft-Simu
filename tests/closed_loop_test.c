@@ -20,6 +20,14 @@
 #include <time.h>
 #include <unistd.h>
 
+/** @brief 一次闭环回归运行的隔离路径集合。 */
+typedef struct ClosedLoopRun {
+    char output_dir[256];
+    char instance_dir[320];
+    char runtime_path[320];
+    char faults_path[320];
+} ClosedLoopRun;
+
 /** @brief 让内核临时分配一个可用的本地 UDP 端口。 */
 static int allocate_udp_port(unsigned int *out)
 {
@@ -81,6 +89,30 @@ static int write_runtime(
     return fclose(file);
 }
 
+/** @brief 为闭环测试生成一个不影响前三帧传感器校验的故障脚本。 */
+static int write_faults(const char *path)
+{
+    FILE *file = fopen(path, "wb");
+
+    if (file == 0) {
+        return -1;
+    }
+    (void)fprintf(file, "{\n");
+    (void)fprintf(file, "  \"schema_version\": 1,\n");
+    (void)fprintf(file, "  \"faults\": [\n");
+    (void)fprintf(file, "    {\n");
+    (void)fprintf(file, "      \"id\": \"closed_loop_speed_dropout\",\n");
+    (void)fprintf(file, "      \"enabled\": true,\n");
+    (void)fprintf(file, "      \"start_time_s\": 0.05,\n");
+    (void)fprintf(file, "      \"duration_s\": 0.02,\n");
+    (void)fprintf(file, "      \"target\": \"sensor.speedometer\",\n");
+    (void)fprintf(file, "      \"type\": \"DROPOUT\"\n");
+    (void)fprintf(file, "    }\n");
+    (void)fprintf(file, "  ]\n");
+    (void)fprintf(file, "}\n");
+    return fclose(file);
+}
+
 /** @brief fork/exec 启动飞控测试进程。 */
 static pid_t launch_flight_control(
     const char *program,
@@ -109,7 +141,8 @@ static pid_t launch_flight_control(
 static pid_t launch_environment(
     const char *program,
     const char *scenario_path,
-    const char *runtime_path)
+    const char *runtime_path,
+    const char *faults_path)
 {
     pid_t pid = fork();
 
@@ -123,6 +156,8 @@ static pid_t launch_environment(
             scenario_path,
             "--runtime",
             runtime_path,
+            "--faults",
+            faults_path,
             (char *)0);
         _exit(127);
     }
@@ -234,13 +269,101 @@ static int sensor_log_reports_expected_pipeline(const char *path)
     return 1;
 }
 
-/** @brief 启动双进程闭环并校验全部 P3 运行产物。 */
-int main(int argc, char **argv)
+/** @brief 逐字节比较两个文件是否完全一致。 */
+static int files_equal(const char *left_path, const char *right_path)
 {
-    char output_dir[256];
-    char instance_dir[320];
-    char runtime_path[320];
+    unsigned char left_buffer[4096];
+    unsigned char right_buffer[4096];
+    FILE *left = fopen(left_path, "rb");
+    FILE *right = fopen(right_path, "rb");
+
+    if (left == 0 || right == 0) {
+        if (left != 0) {
+            (void)fclose(left);
+        }
+        if (right != 0) {
+            (void)fclose(right);
+        }
+        return 0;
+    }
+    for (;;) {
+        size_t left_size = fread(left_buffer, 1u, sizeof(left_buffer), left);
+        size_t right_size = fread(right_buffer, 1u, sizeof(right_buffer), right);
+
+        if (left_size != right_size ||
+            (left_size > 0u && memcmp(left_buffer, right_buffer, left_size) != 0)) {
+            (void)fclose(left);
+            (void)fclose(right);
+            return 0;
+        }
+        if (left_size < sizeof(left_buffer)) {
+            const int done = feof(left) != 0 && feof(right) != 0;
+
+            (void)fclose(left);
+            (void)fclose(right);
+            return done;
+        }
+    }
+}
+
+/** @brief 校验闭环运行产物和故障统计字段。 */
+static int validate_closed_loop_outputs(const ClosedLoopRun *run)
+{
     char path[512];
+
+    if (run == 0) {
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/run_manifest.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) ||
+        !text_file_contains(path, "\"faults_path\":") ||
+        !text_file_contains(path, "\"random_seed\": 424242") ||
+        !text_file_contains(path, "\"gravity_enabled\": true") ||
+        !text_file_contains(path, "\"aerodynamics_enabled\": true") ||
+        !text_file_contains(path, "\"earth_rotation_enabled\": true")) {
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/event_log.txt", run->instance_dir);
+    if (!file_exists_and_nonempty(path) ||
+        !text_file_contains(path, "FAULT_START") ||
+        !text_file_contains(path, "FAULT_END")) {
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/sensor_log.bin", run->instance_dir);
+    if (!file_exists_and_nonempty(path) ||
+        !sensor_log_reports_expected_pipeline(path)) {
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/command_log.bin", run->instance_dir);
+    if (!file_exists_and_nonempty(path)) {
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/trajectory.csv", run->instance_dir);
+    if (!file_exists_and_nonempty(path) ||
+        !text_file_contains(path, "missile_mass_kg") ||
+        !text_file_contains(path, "force_b_x_n")) {
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/summary.json", run->instance_dir);
+    if (!text_file_contains(path, "\"hit_flag\": true") ||
+        !text_file_contains(path, "\"fault_configured_count\": 1") ||
+        !text_file_contains(path, "\"fault_start_count\": 1") ||
+        !text_file_contains(path, "\"fault_end_count\": 1") ||
+        !text_file_contains(path, "\"fault_sensor_affected_step_count\":")) {
+        return 0;
+    }
+    return 1;
+}
+
+/** @brief 启动一次闭环回归运行并等待两个进程正常退出。 */
+static int run_closed_loop_once(
+    const char *flight_control_program,
+    const char *environment_program,
+    const char *flight_control_config,
+    const char *scenario_config,
+    const char *label,
+    ClosedLoopRun *run)
+{
     unsigned int environment_port;
     unsigned int flight_control_port;
     pid_t fc_pid;
@@ -249,37 +372,69 @@ int main(int argc, char **argv)
     int env_status = 0;
     struct timespec startup_delay = { 0, 100000000L };
 
-    if (argc != 5) {
-        (void)fprintf(stderr, "closed_loop_test: invalid arguments\n");
-        return 2;
+    if (run == 0 || label == 0) {
+        return -1;
     }
+    (void)memset(run, 0, sizeof(*run));
     if (allocate_udp_port(&environment_port) != 0 ||
         allocate_udp_port(&flight_control_port) != 0 ||
         environment_port == flight_control_port) {
         (void)fprintf(stderr, "closed_loop_test: cannot allocate UDP ports\n");
-        return 1;
+        return -1;
     }
 
-    (void)snprintf(output_dir, sizeof(output_dir), "/tmp/missile_closed_loop_%ld", (long)getpid());
-    (void)snprintf(instance_dir, sizeof(instance_dir), "%s/instance_0000", output_dir);
-    (void)snprintf(runtime_path, sizeof(runtime_path), "%s_runtime.json", output_dir);
-    if (write_runtime(runtime_path, output_dir, environment_port, flight_control_port) != 0) {
+    (void)snprintf(
+        run->output_dir,
+        sizeof(run->output_dir),
+        "/tmp/missile_closed_loop_%ld_%s",
+        (long)getpid(),
+        label);
+    (void)snprintf(
+        run->instance_dir,
+        sizeof(run->instance_dir),
+        "%s/instance_0000",
+        run->output_dir);
+    (void)snprintf(
+        run->runtime_path,
+        sizeof(run->runtime_path),
+        "%s_runtime.json",
+        run->output_dir);
+    (void)snprintf(
+        run->faults_path,
+        sizeof(run->faults_path),
+        "%s_faults.json",
+        run->output_dir);
+    if (write_runtime(run->runtime_path, run->output_dir, environment_port, flight_control_port) != 0) {
         (void)fprintf(stderr, "closed_loop_test: cannot write runtime config\n");
-        return 1;
+        return -1;
+    }
+    if (write_faults(run->faults_path) != 0) {
+        (void)fprintf(stderr, "closed_loop_test: cannot write faults config\n");
+        (void)unlink(run->runtime_path);
+        return -1;
     }
 
-    fc_pid = launch_flight_control(argv[1], argv[3], runtime_path);
+    fc_pid = launch_flight_control(
+        flight_control_program,
+        flight_control_config,
+        run->runtime_path);
     if (fc_pid <= 0) {
-        (void)unlink(runtime_path);
-        return 1;
+        (void)unlink(run->runtime_path);
+        (void)unlink(run->faults_path);
+        return -1;
     }
     (void)nanosleep(&startup_delay, 0);
-    env_pid = launch_environment(argv[2], argv[4], runtime_path);
+    env_pid = launch_environment(
+        environment_program,
+        scenario_config,
+        run->runtime_path,
+        run->faults_path);
     if (env_pid <= 0) {
         (void)kill(fc_pid, SIGTERM);
         (void)waitpid(fc_pid, &fc_status, 0);
-        (void)unlink(runtime_path);
-        return 1;
+        (void)unlink(run->runtime_path);
+        (void)unlink(run->faults_path);
+        return -1;
     }
 
     if (wait_for_children(fc_pid, env_pid, &fc_status, &env_status) != 0 ||
@@ -291,40 +446,51 @@ int main(int argc, char **argv)
             fc_status,
             env_status,
             errno);
+        return -1;
+    }
+    return 0;
+}
+
+/** @brief 启动双进程闭环并校验全部 P3 运行产物。 */
+int main(int argc, char **argv)
+{
+    ClosedLoopRun first;
+    ClosedLoopRun second;
+    char first_path[512];
+    char second_path[512];
+
+    if (argc != 5) {
+        (void)fprintf(stderr, "closed_loop_test: invalid arguments\n");
+        return 2;
+    }
+    if (run_closed_loop_once(argv[1], argv[2], argv[3], argv[4], "a", &first) != 0) {
+        return 1;
+    }
+    if (!validate_closed_loop_outputs(&first)) {
+        return 1;
+    }
+    if (run_closed_loop_once(argv[1], argv[2], argv[3], argv[4], "b", &second) != 0) {
+        return 1;
+    }
+    if (!validate_closed_loop_outputs(&second)) {
+        return 1;
+    }
+    (void)snprintf(first_path, sizeof(first_path), "%s/summary.json", first.instance_dir);
+    (void)snprintf(second_path, sizeof(second_path), "%s/summary.json", second.instance_dir);
+    if (!files_equal(first_path, second_path)) {
+        (void)fprintf(stderr, "closed_loop_test: summary repeatability mismatch\n");
+        return 1;
+    }
+    (void)snprintf(first_path, sizeof(first_path), "%s/sensor_log.bin", first.instance_dir);
+    (void)snprintf(second_path, sizeof(second_path), "%s/sensor_log.bin", second.instance_dir);
+    if (!files_equal(first_path, second_path)) {
+        (void)fprintf(stderr, "closed_loop_test: sensor log repeatability mismatch\n");
         return 1;
     }
 
-    (void)snprintf(path, sizeof(path), "%s/run_manifest.json", instance_dir);
-    if (!file_exists_and_nonempty(path) ||
-        !text_file_contains(path, "\"random_seed\": 424242") ||
-        !text_file_contains(path, "\"gravity_enabled\": true") ||
-        !text_file_contains(path, "\"aerodynamics_enabled\": true") ||
-        !text_file_contains(path, "\"earth_rotation_enabled\": true")) {
-        return 1;
-    }
-    (void)snprintf(path, sizeof(path), "%s/event_log.txt", instance_dir);
-    if (!file_exists_and_nonempty(path)) {
-        return 1;
-    }
-    (void)snprintf(path, sizeof(path), "%s/sensor_log.bin", instance_dir);
-    if (!file_exists_and_nonempty(path) ||
-        !sensor_log_reports_expected_pipeline(path)) {
-        return 1;
-    }
-    (void)snprintf(path, sizeof(path), "%s/command_log.bin", instance_dir);
-    if (!file_exists_and_nonempty(path)) {
-        return 1;
-    }
-    (void)snprintf(path, sizeof(path), "%s/trajectory.csv", instance_dir);
-    if (!file_exists_and_nonempty(path) ||
-        !text_file_contains(path, "missile_mass_kg") ||
-        !text_file_contains(path, "force_b_x_n")) {
-        return 1;
-    }
-    (void)snprintf(path, sizeof(path), "%s/summary.json", instance_dir);
-    if (!text_file_contains(path, "\"hit_flag\": true")) {
-        return 1;
-    }
-
+    (void)unlink(first.runtime_path);
+    (void)unlink(first.faults_path);
+    (void)unlink(second.runtime_path);
+    (void)unlink(second.faults_path);
     return 0;
 }

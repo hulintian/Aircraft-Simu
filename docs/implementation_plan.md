@@ -391,6 +391,53 @@ actuator_pos
 - 导引头输出 range、LOS unit、LOS rate、closing velocity。
 - 故障注入按时间触发。
 
+### 8.5 当前执行窗口
+
+P5 当前已经完成环境力链、6DOF 积分器、四类传感器误差、采样、延迟、丢包、
+基础 `faults.json` 故障注入、故障统计、错误配置拒绝和固定种子闭环一致性回归：
+
+```text
+faults.json
+  -> fault_injection_config
+  -> fault_runtime_state
+  -> sensor/actuator fault action
+  -> SensorFrame fault flags / actuator state
+  -> event_log.txt
+```
+
+故障事件至少包含：
+
+```text
+id
+target
+start_time_s
+duration_s
+fault_type
+parameters
+enabled
+```
+
+第一批实现已经覆盖仿真正确性需要的基础故障类型：
+
+- 传感器强制无效。
+- 传感器附加偏置。
+- 传感器整帧丢包窗口。
+- 执行机构卡死。
+- 执行机构比例缩放。
+
+当前基础验收已经证明故障触发后：
+
+- `event_log.txt` 记录触发和恢复。
+- `sensor_fault_flags` 或执行机构状态发生预期变化。
+- 飞控在导引头无效时仍按 LOCKSTEP 返回受控零指令。
+- 同一随机种子下两次运行结果一致。
+- `summary.json` 或 `campaign_summary.json` 能汇总故障触发次数和影响范围。
+
+后续扩展不再阻塞 P6，但仍应补充：
+
+- 更多真实故障类型，例如卡常值、漂移阶跃、恢复斜坡和通信窗口丢包。
+- 真实 DEM 数据集加载后的 LOS 遮挡闭环场景。
+
 ## 9. P6 飞控任务、制导与保护
 
 ### 9.1 目标

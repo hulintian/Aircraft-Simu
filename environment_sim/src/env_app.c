@@ -17,6 +17,7 @@
 #include "env/actuator_model.h"
 #include "env/earth_model.h"
 #include "env/environment_force_model.h"
+#include "env/fault_injection.h"
 #include "env/geo_coordinate.h"
 #include "env/mass_model.h"
 #include "env/missile_plant_6dof.h"
@@ -155,6 +156,24 @@ typedef struct EnvSensorState {
     SeekerSensor seeker;
     uint64_t instance_random_seed;
 } EnvSensorState;
+
+/** @brief 单实例故障脚本运行统计，用于 summary.json 和批量汇总。 */
+typedef struct FaultRunStats {
+    /** @brief 配置中启用和加载的故障定义数量。 */
+    size_t configured_fault_count;
+    /** @brief 仿真期间故障进入激活窗口的次数。 */
+    size_t fault_start_count;
+    /** @brief 仿真期间故障离开激活窗口的次数。 */
+    size_t fault_end_count;
+    /** @brief 至少一个故障处于激活状态的仿真步数。 */
+    size_t active_step_count;
+    /** @brief 传感器测量或有效位被故障影响的仿真步数。 */
+    size_t sensor_affected_step_count;
+    /** @brief 虚拟执行机构命令或状态被故障影响的仿真步数。 */
+    size_t actuator_affected_step_count;
+    /** @brief 同一仿真步内最大并发激活故障数量。 */
+    size_t max_concurrent_active;
+} FaultRunStats;
 
 /** @brief 从运行时配置读取网络和输出目录。 */
 static SimStatus load_runtime_config(const ConfigTree *runtime, EnvRuntimeConfig *out)
@@ -933,7 +952,8 @@ static SimStatus update_truth(
     EnvTruthState *state,
     const ControlCommand *command,
     const EnvScenarioConfig *cfg,
-    const EnvironmentForceModel *force_model)
+    const EnvironmentForceModel *force_model,
+    const FaultStepEffects *fault_effects)
 {
     EnvironmentForceInput force_input;
     EnvironmentForceOutput force_output;
@@ -948,6 +968,12 @@ static SimStatus update_truth(
 
     if (state == 0 || command == 0 || cfg == 0 || force_model == 0) {
         return SIM_ERR_INVALID_ARG;
+    }
+    if (fault_effects != 0) {
+        fault_injection_apply_actuators(
+            fault_effects,
+            state->acceleration_actuators,
+            commands);
     }
     for (index = 0u; index < 3u && status == SIM_OK; ++index) {
         status = actuator_model_step(
@@ -1092,6 +1118,7 @@ static SimStatus write_run_manifest(
         MISSILE_SIM_PROTOCOL_VERSION_MINOR);
     (void)fprintf(file, "  \"scenario_path\": \"%s\",\n", ctx->scenario_path);
     (void)fprintf(file, "  \"runtime_path\": \"%s\",\n", ctx->runtime_path);
+    (void)fprintf(file, "  \"faults_path\": \"%s\",\n", ctx->faults_path);
     (void)fprintf(file, "  \"dt_s\": %.17g,\n", scenario->dt);
     (void)fprintf(file, "  \"max_time_s\": %.17g,\n", scenario->max_time);
     (void)fprintf(file, "  \"environment_port\": %u,\n", env_port);
@@ -1191,13 +1218,48 @@ static SimStatus write_command_log(FILE *file, uint32_t instance_id, const Contr
     return fwrite(packet, 1u, packet_size, file) == packet_size ? SIM_OK : SIM_ERR_IO;
 }
 
-/** @brief 写出单实例终止结果和最近点统计。 */
+/** @brief 判断当前步故障效果是否改变了传感器输出或有效位。 */
+static int fault_effects_affect_sensor(const FaultStepEffects *effects)
+{
+    if (effects == 0) {
+        return 0;
+    }
+    return effects->sensor_valid_clear_mask != 0u ||
+        effects->sensor_fault_set_mask != 0u ||
+        effects->seeker_range_bias_m != 0.0 ||
+        vec3_norm(effects->seeker_los_unit_bias) > 0.0 ||
+        vec3_norm(effects->seeker_los_rate_bias_radps) > 0.0 ||
+        effects->seeker_closing_velocity_bias_mps != 0.0 ||
+        vec3_norm(effects->gyro_bias_b_radps) > 0.0 ||
+        vec3_norm(effects->accel_bias_ecef_mps2) > 0.0 ||
+        vec3_norm(effects->speed_bias_ecef_mps) > 0.0;
+}
+
+/** @brief 判断当前步故障效果是否改变了虚拟执行机构命令或状态。 */
+static int fault_effects_affect_actuator(const FaultStepEffects *effects)
+{
+    size_t index;
+
+    if (effects == 0) {
+        return 0;
+    }
+    for (index = 0u; index < 3u; ++index) {
+        if (effects->actuator_stuck[index] != 0 ||
+            effects->actuator_command_scale[index] != 1.0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** @brief 写出单实例终止结果、最近点和故障统计。 */
 static void write_summary(
     const char *instance_dir,
     int hit,
     const EnvTruthState *state,
     uint32_t steps,
-    const char *exit_reason)
+    const char *exit_reason,
+    const FaultRunStats *fault_stats)
 {
     char path[1024];
     FILE *file;
@@ -1212,7 +1274,45 @@ static void write_summary(
     (void)fprintf(file, "  \"miss_distance\": %.6f,\n", state->min_range);
     (void)fprintf(file, "  \"time_of_closest_approach\": %.6f,\n", state->time_of_closest);
     (void)fprintf(file, "  \"simulation_steps\": %u,\n", steps);
-    (void)fprintf(file, "  \"exit_reason\": \"%s\"\n", exit_reason);
+    (void)fprintf(file, "  \"exit_reason\": \"%s\",\n", exit_reason);
+    if (fault_stats != 0) {
+        (void)fprintf(
+            file,
+            "  \"fault_configured_count\": %lu,\n",
+            (unsigned long)fault_stats->configured_fault_count);
+        (void)fprintf(
+            file,
+            "  \"fault_start_count\": %lu,\n",
+            (unsigned long)fault_stats->fault_start_count);
+        (void)fprintf(
+            file,
+            "  \"fault_end_count\": %lu,\n",
+            (unsigned long)fault_stats->fault_end_count);
+        (void)fprintf(
+            file,
+            "  \"fault_active_step_count\": %lu,\n",
+            (unsigned long)fault_stats->active_step_count);
+        (void)fprintf(
+            file,
+            "  \"fault_sensor_affected_step_count\": %lu,\n",
+            (unsigned long)fault_stats->sensor_affected_step_count);
+        (void)fprintf(
+            file,
+            "  \"fault_actuator_affected_step_count\": %lu,\n",
+            (unsigned long)fault_stats->actuator_affected_step_count);
+        (void)fprintf(
+            file,
+            "  \"fault_max_concurrent_active\": %lu\n",
+            (unsigned long)fault_stats->max_concurrent_active);
+    } else {
+        (void)fprintf(file, "  \"fault_configured_count\": 0,\n");
+        (void)fprintf(file, "  \"fault_start_count\": 0,\n");
+        (void)fprintf(file, "  \"fault_end_count\": 0,\n");
+        (void)fprintf(file, "  \"fault_active_step_count\": 0,\n");
+        (void)fprintf(file, "  \"fault_sensor_affected_step_count\": 0,\n");
+        (void)fprintf(file, "  \"fault_actuator_affected_step_count\": 0,\n");
+        (void)fprintf(file, "  \"fault_max_concurrent_active\": 0\n");
+    }
     (void)fprintf(file, "}\n");
     (void)fclose(file);
 }
@@ -1293,6 +1393,8 @@ SimStatus env_app_run(const EnvContext *ctx)
     EnvRuntimeConfig runtime;
     EnvTruthState state;
     EnvSensorState sensors;
+    FaultInjection faults;
+    FaultRunStats fault_stats;
     EarthModel earth;
     TerrainModel terrain;
     Logger logger;
@@ -1311,12 +1413,14 @@ SimStatus env_app_run(const EnvContext *ctx)
     int hit = 0;
     const char *exit_reason = "timeout";
 
-    if (ctx == 0 || ctx->scenario_path == 0 || ctx->runtime_path == 0) {
+    if (ctx == 0 || ctx->scenario_path == 0 ||
+        ctx->runtime_path == 0 || ctx->faults_path == 0) {
         return SIM_ERR_INVALID_ARG;
     }
 
     memset(&scenario_tree, 0, sizeof(scenario_tree));
     memset(&runtime_tree, 0, sizeof(runtime_tree));
+    memset(&fault_stats, 0, sizeof(fault_stats));
     status = logger_open_stdout(&logger);
     if (status != SIM_OK) {
         return status;
@@ -1413,6 +1517,30 @@ SimStatus env_app_run(const EnvContext *ctx)
         config_free(&scenario_tree);
         config_free(&runtime_tree);
         return status;
+    }
+    {
+        ConfigTree faults_tree;
+
+        memset(&faults_tree, 0, sizeof(faults_tree));
+        status = config_load_file(ctx->faults_path, &faults_tree);
+        if (status != SIM_OK) {
+            (void)fprintf(stderr, "environment_sim: failed to load %s: %s\n",
+                ctx->faults_path,
+                sim_status_to_string(status));
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            return status;
+        }
+        status = fault_injection_load_config(&faults_tree, &faults);
+        config_free(&faults_tree);
+        if (status != SIM_OK) {
+            (void)fprintf(stderr, "environment_sim: invalid faults config: %s\n",
+                sim_status_to_string(status));
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            return status;
+        }
+        fault_stats.configured_fault_count = faults.fault_count;
     }
     status = init_sensor_state(
         &sensors,
@@ -1637,6 +1765,9 @@ SimStatus env_app_run(const EnvContext *ctx)
     while (status == SIM_OK && state.time <= scenario.max_time) {
         SensorFrame sensor;
         ControlCommand command;
+        FaultStepEffects fault_effects;
+        FaultTransition fault_transitions[ENV_MAX_FAULT_TRANSITIONS];
+        size_t fault_transition_count = 0u;
         double range = vec3_norm(vec3_sub(state.target_pos, state.missile_pos));
         int surface_collision = 0;
 
@@ -1660,6 +1791,60 @@ SimStatus env_app_run(const EnvContext *ctx)
             exit_reason = "hit";
             write_event(event_log, state.time, "HIT", "truth_range_threshold");
             break;
+        }
+        status = fault_injection_update(
+            &faults,
+            state.time,
+            &fault_effects,
+            fault_transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &fault_transition_count);
+        if (status != SIM_OK) {
+            exit_reason = "fault_update_failed";
+            write_event(event_log, state.time, "FAULT_ERROR", sim_status_to_string(status));
+            break;
+        }
+        {
+            size_t transition_index;
+
+            for (transition_index = 0u;
+                 transition_index < fault_transition_count &&
+                     transition_index < ENV_MAX_FAULT_TRANSITIONS;
+                 ++transition_index) {
+                char detail[192];
+
+                if (fault_transitions[transition_index].active != 0) {
+                    ++fault_stats.fault_start_count;
+                } else {
+                    ++fault_stats.fault_end_count;
+                }
+                (void)snprintf(
+                    detail,
+                    sizeof(detail),
+                    "id=%s target=%s type=%s",
+                    fault_transitions[transition_index].id,
+                    fault_transitions[transition_index].target,
+                    fault_transitions[transition_index].type);
+                write_event(
+                    event_log,
+                    state.time,
+                    fault_transitions[transition_index].active != 0 ?
+                        "FAULT_START" :
+                        "FAULT_END",
+                    detail);
+            }
+        }
+        if (fault_effects.active_fault_count > 0u) {
+            ++fault_stats.active_step_count;
+        }
+        if (fault_effects.active_fault_count > fault_stats.max_concurrent_active) {
+            fault_stats.max_concurrent_active = fault_effects.active_fault_count;
+        }
+        if (fault_effects_affect_sensor(&fault_effects) != 0) {
+            ++fault_stats.sensor_affected_step_count;
+        }
+        if (fault_effects_affect_actuator(&fault_effects) != 0) {
+            ++fault_stats.actuator_affected_step_count;
         }
         status = build_sensor_frame(
             &state,
@@ -1692,6 +1877,7 @@ SimStatus env_app_run(const EnvContext *ctx)
                 sensor.sensor_fault_flags |= SIM_SENSOR_FAULT_LOS_OCCLUDED;
             }
         }
+        fault_injection_apply_sensor(&fault_effects, &sensor);
 
         status = send_sensor_frame(sock, &fc_addr, ctx->instance_id, &sensor);
         if (status != SIM_OK) {
@@ -1726,7 +1912,8 @@ SimStatus env_app_run(const EnvContext *ctx)
             &state,
             &command,
             &scenario,
-            &scenario.force_model);
+            &scenario.force_model,
+            &fault_effects);
         if (status != SIM_OK) {
             exit_reason = "plant_update_failed";
             write_event(event_log, state.time, "PLANT_ERROR", sim_status_to_string(status));
@@ -1769,7 +1956,7 @@ SimStatus env_app_run(const EnvContext *ctx)
     if (event_log != 0) {
         (void)fclose(event_log);
     }
-    write_summary(instance_dir, hit, &state, seq, exit_reason);
+    write_summary(instance_dir, hit, &state, seq, exit_reason, &fault_stats);
 
     if (sock >= 0) {
         (void)close(sock);

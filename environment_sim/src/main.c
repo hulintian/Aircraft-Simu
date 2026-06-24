@@ -12,7 +12,9 @@
 
 static void print_usage(const char *argv0)
 {
-    (void)printf("usage: %s [--instance-id N] [--scenario PATH] [--runtime PATH]\n", argv0);
+    (void)printf(
+        "usage: %s [--instance-id N] [--scenario PATH] [--runtime PATH] [--faults PATH]\n",
+        argv0);
 }
 
 /** @brief 解析环境进程参数并运行指定实例。 */
@@ -21,7 +23,8 @@ int main(int argc, char **argv)
     EnvContext ctx = {
         0u,
         ENV_DEFAULT_SCENARIO_CONFIG,
-        ENV_DEFAULT_RUNTIME_CONFIG
+        ENV_DEFAULT_RUNTIME_CONFIG,
+        ENV_DEFAULT_FAULTS_CONFIG
     };
     SimStatus status;
     int i;
@@ -41,6 +44,10 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--runtime") == 0 && (i + 1) < argc) {
             ctx.runtime_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--faults") == 0 && (i + 1) < argc) {
+            ctx.faults_path = argv[++i];
             continue;
         }
         print_usage(argv[0]);

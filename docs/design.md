@@ -2226,3 +2226,352 @@ $$
 ```
 
 重点不是先写一个简化演示，而是从第一天就按最终工业级架构拆模块、定协议、建日志、做测试。模型保真度可以逐步填充，但接口、数据流、状态机和验证体系必须一次设计到位。
+
+## 21. 设计完成基线与落地边界
+
+本节作为当前阶段的设计收敛基线，用于把目标设计、当前代码和后续实现计划对齐。
+后续开发必须优先保持本节定义的边界，避免把临时模型误描述为最终能力。
+
+### 21.1 当前已经落地的闭环设计
+
+当前工程已经落地的软件在环闭环为：
+
+```text
+environment_sim
+  -> SensorFrame
+  -> flight_control_sim
+  -> ControlCommand
+  -> environment_sim
+```
+
+单个飞行实例的定义保持不变：
+
+```text
+FlightInstance(i) =
+  environment_sim(instance_id=i)
+  + flight_control_sim(instance_id=i)
+```
+
+每个实例只允许访问本实例的运行状态、端口、日志目录和随机流。多个实例可以
+共享只读程序、默认配置和地图资源，但不得共享可变状态。
+
+闭环时序采用环境拥有仿真时间的锁步模式：
+
+$$
+t_{k+1}=t_k+\Delta t
+$$
+
+每一个有效仿真步满足：
+
+$$
+\text{SensorFrame}_k
+\rightarrow
+\text{ControlCommand}_k
+\rightarrow
+\mathbf x_{k+1}
+$$
+
+其中 \(\mathbf x_k\) 是环境程序内部的真值状态，飞控程序不能直接读取该状态，
+只能读取协议中的传感器测量。
+
+### 21.2 环境被控对象设计基线
+
+环境程序的被控对象按六自由度刚体设计。连续状态为：
+
+$$
+\mathbf x =
+\left[
+\mathbf r_e,\,
+\mathbf v_e,\,
+\mathbf q_{be},\,
+\boldsymbol\omega_b
+\right]
+$$
+
+其中：
+
+- \(\mathbf r_e\)：ECEF 位置，单位 m。
+- \(\mathbf v_e\)：ECEF 速度，单位 m/s。
+- \(\mathbf q_{be}\)：机体系到 ECEF 的姿态四元数。
+- \(\boldsymbol\omega_b\)：机体系角速度，单位 rad/s。
+
+平动方程设计为：
+
+$$
+\dot{\mathbf r}_e = \mathbf v_e
+$$
+
+$$
+\dot{\mathbf v}_e =
+\frac{1}{m}\mathbf C_{be}\mathbf F_b
++ \mathbf g_e
++ \mathbf a_{\text{rot},e}
+$$
+
+其中：
+
+$$
+\mathbf a_{\text{rot},e}
+=
+-2\boldsymbol\Omega_e \times \mathbf v_e
+-
+\boldsymbol\Omega_e \times
+\left(
+\boldsymbol\Omega_e \times \mathbf r_e
+\right)
+$$
+
+转动方程设计为：
+
+$$
+\dot{\mathbf q}_{be}
+=
+\frac{1}{2}
+\mathbf q_{be}
+\otimes
+\left[
+0,\boldsymbol\omega_b
+\right]
+$$
+
+$$
+\dot{\boldsymbol\omega}_b
+=
+\mathbf I_b^{-1}
+\left(
+\mathbf M_b
+-
+\boldsymbol\omega_b
+\times
+\mathbf I_b\boldsymbol\omega_b
+\right)
+$$
+
+环境力链的设计顺序为：
+
+```text
+scenario/runtime
+  -> WGS-84 / terrain / target truth
+  -> atmosphere / gravity / propulsion / aerodynamics / mass
+  -> actuator response
+  -> force_b / moment_b
+  -> 6DOF integrator
+  -> geodetic state / AGL / collision / hit detect
+  -> sensor models
+  -> SensorFrame
+```
+
+当前代码已经接入该主链路，但仍保留两项工程边界：
+
+- 飞控输出仍解释为 ECEF 加速度级虚拟指令，再换算为等效机体系控制力。
+- 气动模型当前为可配置低阶模型，不是气动表插值模型。
+
+因此当前环境程序可用于闭环结构、数值积分、坐标系统、传感器接口和多实例验证；
+在气动表、控制面分配、真实 DEM 和完整故障链路完成前，不把它描述为高保真型号仿真。
+
+### 21.3 传感器设计基线
+
+传感器模型不得直接把理想真值复制给飞控。每类传感器按以下通用链路设计：
+
+```text
+truth measurement
+  -> bias
+  -> scale/noise/random walk
+  -> quantization/limit
+  -> sample-and-hold
+  -> fixed delay
+  -> dropout/fault flag
+  -> SensorFrame
+```
+
+标量测量的通用形式为：
+
+$$
+y_k =
+\operatorname{clip}
+\left(
+\operatorname{quantize}
+\left(
+y_k^\ast + b_k + n_k
+\right)
+\right)
+$$
+
+随机游走偏置按实例私有随机流更新：
+
+$$
+b_{k+1}=b_k+\sigma_{\text{rw}}\sqrt{\Delta t}\,w_k
+$$
+
+三轴测量按分量执行同样处理，并在导引头 LOS 单位向量测量后重新归一化：
+
+$$
+\hat{\mathbf r}_{\text{meas}}
+=
+\frac{\hat{\mathbf r}_{\text{raw}}}
+{\left\|\hat{\mathbf r}_{\text{raw}}\right\|}
+$$
+
+当前已经进入主链路的传感器包括：
+
+- IMU 陀螺仪：\(\boldsymbol\omega_b\)。
+- 加速度计：ECEF 加速度测量。
+- 速度计：ECEF 速度测量。
+- 导引头：距离、LOS 单位向量、LOS 角速度和闭合速度。
+- 大地坐标、高度和 AGL：当前作为派生地理测量直接写入帧。
+
+基础 `faults.json` 已接入环境主链路，可按仿真时间触发传感器偏置、
+传感器强制无效/丢包、虚拟执行机构卡滞和命令缩放，并记录开始/恢复事件。
+单实例和成功批次会汇总故障触发次数和影响步数。尚未完成的是更完整的故障类型库、
+真实 DEM 遮挡闭环场景和更多工程级故障恢复模式。
+
+### 21.4 飞控程序设计基线
+
+飞控程序的最终工程链路为：
+
+```text
+SensorFrame
+  -> interface validation
+  -> scheduler
+  -> navigation / estimator
+  -> health and mode state machine
+  -> guidance manager
+  -> autopilot / command manager
+  -> safety monitor
+  -> ControlCommand
+```
+
+当前已经落地的是协议校验、旧帧拒绝、导引头有效位检查、三维比例导引和幅值限幅。
+比例导引指令为：
+
+$$
+\mathbf a_c =
+N V_c
+\left(
+\boldsymbol\omega_{\text{LOS}}
+\times
+\hat{\mathbf r}
+\right)
+$$
+
+幅值限幅为：
+
+$$
+\mathbf a_{\text{cmd}} =
+\begin{cases}
+\mathbf a_c,
+&
+\left\|\mathbf a_c\right\|\le a_{\max}
+\\
+\dfrac{a_{\max}}{\left\|\mathbf a_c\right\|}
+\mathbf a_c,
+&
+\left\|\mathbf a_c\right\|>a_{\max}
+\end{cases}
+$$
+
+下一步必须补齐的飞控设计项为变化率限制：
+
+$$
+\Delta \mathbf a =
+\mathbf a_{\text{cmd},k}
+-
+\mathbf a_{\text{cmd},k-1}
+$$
+
+$$
+\mathbf a_{\text{cmd},k}^{\text{limited}}
+=
+\mathbf a_{\text{cmd},k-1}
++
+\operatorname{sat}_{\dot a_{\max}\Delta t}
+\left(
+\Delta \mathbf a
+\right)
+$$
+
+以及状态机：
+
+```text
+FC_POWER_ON
+FC_SELF_TEST
+FC_WAIT_SENSOR
+FC_NAV_READY
+FC_GUIDANCE_STANDBY
+FC_GUIDANCE_ACTIVE
+FC_COMMAND_HOLD
+FC_DEGRADED
+FC_FAULT
+FC_SHUTDOWN
+```
+
+在这些模块完成前，`flight_control_sim` 是“比例导引控制器模拟件”，不是完整飞控软件。
+
+### 21.5 多实例与并行化设计基线
+
+多实例运行的工程目标是实例级并行，而不是在一个环境进程内部混合多个对象：
+
+```text
+instance_manager
+  -> environment_sim(i), flight_control_sim(i)
+  -> environment_sim(j), flight_control_sim(j)
+  -> ...
+```
+
+实例端口分配为：
+
+$$
+P_{\text{env}}(i)=P_{\text{env,base}}+2i
+$$
+
+$$
+P_{\text{fc}}(i)=P_{\text{fc,base}}+2i
+$$
+
+当前已经实现进程级并发、端口隔离和输出隔离。后续必须让管理器真正读取
+`runtime.json` 的 `instances[]`，包括：
+
+- `instance_id`
+- `scenario`
+- `flight_control`
+- `faults`
+- `random_seed`
+- `enabled`
+
+关于 GPU 或 SIMD 并行化，当前代码没有实现 GPU 后端。设计上只保留如下边界：
+
+- 单实例闭环语义不能因并行化改变。
+- 实例之间仍不得共享可变状态。
+- 可并行化对象优先选择批量运行中的独立实例、传感器批处理、气动表插值和统计后处理。
+- GPU 加速属于 P8 之后的性能扩展，不作为当前 P5-P7 正确性验收条件。
+
+### 21.6 后续实现的完成判据
+
+P5 完成判据：
+
+- `faults.json` 被环境程序读取和校验。当前基础能力已实现。
+- 故障按仿真时间触发，能作用于传感器有效位、测量值或执行机构。当前基础能力已实现。
+- 触发、持续、恢复和拒绝原因写入 `event_log.txt`。当前开始/恢复事件已实现。
+- `summary.json` 和成功实例的 `campaign_summary.json` 汇总故障统计。当前基础能力已实现。
+- 闭环测试覆盖延迟预热、丢包、至少一种脚本故障和固定种子双跑一致性。当前基础能力已实现。
+
+P6 完成判据：
+
+- 飞控模块形成可测试静态库。
+- PNG 有独立单元测试，覆盖 LOS 方向、限幅和异常输入。
+- 加速度变化率限制接入主链路。
+- 状态机、命令保持、传感器超时和 NaN/Inf 保护有闭环回归。
+
+P7 完成判据：
+
+- 管理器读取逐实例配置，而不是硬编码 baseline 路径。
+- 支持并验证 `PARALLEL`、`SEQUENTIAL`、并发上限和失败继续策略。
+- 单实例失败不会终止其他实例。
+- `campaign_summary.json` 汇总每个实例的退出原因、最小距离和故障统计。
+
+P8 完成判据：
+
+- `sensor_log.bin` 可回放驱动飞控。
+- `command_log.bin` 可转换为可读格式。
+- 批量运行能输出脱靶量统计、成功率、失败原因分布和配置快照。
+- 回放结果在固定种子下可重复。

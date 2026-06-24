@@ -250,12 +250,17 @@ static int test_config(void)
     int failures = 0;
     char valid_json[] =
         "{\"schema_version\":1,\"simulation\":{\"dt\":0.01},"
-        "\"enabled\":true,\"offset\":-3,\"values\":[1.0,2.0,3.0]}";
+        "\"enabled\":true,\"offset\":-3,\"values\":[1.0,2.0,3.0],"
+        "\"faults\":[{\"time_s\":1.0,\"target\":\"sensor.seeker\"},"
+        "{\"time_s\":2.0,\"target\":\"sensor.imu\"}]}";
     char invalid_json[] = "{\"schema_version\":1,\"simulation\":[1,2,]}";
     ConfigTree valid = { valid_json, sizeof(valid_json) - 1u };
     ConfigTree invalid = { invalid_json, sizeof(invalid_json) - 1u };
     double dt = 0.0;
     double values[3];
+    double fault_time = 0.0;
+    char target[32];
+    size_t fault_count = 0u;
     int offset = 0;
     int enabled = 0;
 
@@ -282,6 +287,18 @@ static int test_config(void)
         config_get_double_array(&valid, "values", values, 3u) == SIM_OK,
         "config_get_array");
     failures += expect_near(values[2], 3.0, 0.0, "config_array_value");
+    failures += expect_int(
+        config_get_array_count(&valid, "faults", &fault_count) == SIM_OK &&
+            fault_count == 2u,
+        "config_array_count");
+    failures += expect_int(
+        config_get_double(&valid, "faults[1].time_s", &fault_time) == SIM_OK,
+        "config_array_object_double");
+    failures += expect_near(fault_time, 2.0, 0.0, "config_array_object_double_value");
+    failures += expect_int(
+        config_get_string(&valid, "faults[0].target", target, sizeof(target)) == SIM_OK &&
+            strcmp(target, "sensor.seeker") == 0,
+        "config_array_object_string");
     return failures;
 }
 

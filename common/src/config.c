@@ -319,6 +319,172 @@ static int key_equals(const char *key_start, const char *key_end, const char *ke
     return key_len == span_len && strncmp(key_start, key, key_len) == 0;
 }
 
+/** @brief 解析点路径中的单段名称和可选数组下标。 */
+static SimStatus parse_path_part(
+    const char *part,
+    char *key,
+    size_t key_size,
+    int *has_index,
+    size_t *index)
+{
+    const char *bracket;
+    size_t key_len;
+
+    if (part == 0 || key == 0 || key_size == 0u ||
+        has_index == 0 || index == 0 || part[0] == '\0') {
+        return SIM_ERR_INVALID_ARG;
+    }
+    bracket = strchr(part, '[');
+    if (bracket == 0) {
+        key_len = strlen(part);
+        if (key_len == 0u || key_len >= key_size) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        (void)memcpy(key, part, key_len + 1u);
+        *has_index = 0;
+        *index = 0u;
+        return SIM_OK;
+    }
+    key_len = (size_t)(bracket - part);
+    if (key_len == 0u || key_len >= key_size) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    if (bracket[1] == '-' || bracket[1] == '\0') {
+        return SIM_ERR_CONFIG;
+    }
+    {
+        char *endptr;
+        unsigned long parsed;
+
+        errno = 0;
+        parsed = strtoul(bracket + 1, &endptr, 10);
+        if (endptr == bracket + 1 || errno == ERANGE ||
+            *endptr != ']' || endptr[1] != '\0') {
+            return SIM_ERR_CONFIG;
+        }
+        (void)memcpy(key, part, key_len);
+        key[key_len] = '\0';
+        *has_index = 1;
+        *index = (size_t)parsed;
+        return SIM_OK;
+    }
+}
+
+/** @brief 定位一个 JSON 值的结束位置，返回结束后一字节。 */
+static const char *find_json_value_end(const char *value, const char *end)
+{
+    const char *p;
+
+    if (value == 0 || value >= end) {
+        return 0;
+    }
+    p = skip_ws(value, end);
+    if (p >= end) {
+        return 0;
+    }
+    if (*p == '{' || *p == '[') {
+        const char *matched = find_matching_bracket(p, end);
+        return matched == 0 ? 0 : matched + 1;
+    }
+    if (*p == '"') {
+        return skip_json_string(p, end);
+    }
+    while (p < end && *p != ',' && *p != '}' && *p != ']') {
+        ++p;
+    }
+    return p;
+}
+
+/** @brief 从 JSON 数组中定位第 index 个元素。 */
+static SimStatus find_array_element(
+    const char *array_start,
+    const char *end,
+    size_t index,
+    const char **value)
+{
+    const char *array_end;
+    const char *p;
+    size_t current = 0u;
+
+    if (array_start == 0 || value == 0 || array_start >= end || *array_start != '[') {
+        return SIM_ERR_CONFIG;
+    }
+    array_end = find_matching_bracket(array_start, end);
+    if (array_end == 0) {
+        return SIM_ERR_CONFIG;
+    }
+    p = skip_ws(array_start + 1, array_end);
+    if (p >= array_end) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    for (;;) {
+        const char *next;
+
+        p = skip_ws(p, array_end);
+        if (p >= array_end) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        if (current == index) {
+            *value = p;
+            return SIM_OK;
+        }
+        next = find_json_value_end(p, array_end);
+        if (next == 0 || next <= p) {
+            return SIM_ERR_CONFIG;
+        }
+        p = skip_ws(next, array_end);
+        if (p >= array_end) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        if (*p != ',') {
+            return SIM_ERR_CONFIG;
+        }
+        ++p;
+        ++current;
+    }
+}
+
+/** @brief 计算 JSON 数组元素数量。 */
+static SimStatus count_array_elements(const char *array_start, const char *end, size_t *out)
+{
+    const char *array_end;
+    const char *p;
+    size_t count = 0u;
+
+    if (array_start == 0 || out == 0 || array_start >= end || *array_start != '[') {
+        return SIM_ERR_CONFIG;
+    }
+    array_end = find_matching_bracket(array_start, end);
+    if (array_end == 0) {
+        return SIM_ERR_CONFIG;
+    }
+    p = skip_ws(array_start + 1, array_end);
+    if (p >= array_end) {
+        *out = 0u;
+        return SIM_OK;
+    }
+    for (;;) {
+        const char *next = find_json_value_end(p, array_end);
+
+        if (next == 0 || next <= p) {
+            return SIM_ERR_CONFIG;
+        }
+        ++count;
+        p = skip_ws(next, array_end);
+        if (p >= array_end) {
+            *out = count;
+            return SIM_OK;
+        }
+        if (*p != ',') {
+            return SIM_ERR_CONFIG;
+        }
+        p = skip_ws(p + 1, array_end);
+        if (p >= array_end) {
+            return SIM_ERR_CONFIG;
+        }
+    }
+}
+
 /** @brief 在给定对象范围内定位键值对。 */
 static const char *find_key_value(const char *start, const char *end, const char *key)
 {
@@ -362,6 +528,7 @@ static const char *find_key_value(const char *start, const char *end, const char
 static SimStatus find_path_value(const ConfigTree *config, const char *path, const char **value)
 {
     char path_copy[CONFIG_PATH_MAX];
+    char key[CONFIG_PATH_MAX];
     char *part;
     const char *start;
     const char *end;
@@ -387,9 +554,23 @@ static SimStatus find_path_value(const ConfigTree *config, const char *path, con
     part = strtok(path_copy, ".");
     while (part != 0) {
         char *next = strtok(0, ".");
-        const char *v = find_key_value(start, end, part);
+        const char *v;
+        int has_index = 0;
+        size_t index = 0u;
+        SimStatus status = parse_path_part(part, key, sizeof(key), &has_index, &index);
+
+        if (status != SIM_OK) {
+            return status;
+        }
+        v = find_key_value(start, end, key);
         if (v == 0) {
             return SIM_ERR_CONFIG;
+        }
+        if (has_index != 0) {
+            status = find_array_element(v, end, index, &v);
+            if (status != SIM_OK) {
+                return status;
+            }
         }
         if (next == 0) {
             *value = v;
@@ -558,6 +739,21 @@ SimStatus config_require_section(const ConfigTree *config, const char *path)
         return status;
     }
     return *value == '{' ? SIM_OK : SIM_ERR_CONFIG;
+}
+
+/** @brief 读取 JSON 数组长度。 */
+SimStatus config_get_array_count(const ConfigTree *config, const char *path, size_t *out)
+{
+    const char *value;
+    SimStatus status = find_path_value(config, path, &value);
+
+    if (status != SIM_OK) {
+        return status;
+    }
+    if (out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    return count_array_elements(value, config->data + config->size, out);
 }
 
 /** @brief 读取浮点字段。 */

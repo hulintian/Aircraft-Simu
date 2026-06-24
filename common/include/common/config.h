@@ -35,6 +35,8 @@ SimStatus config_validate_json(const ConfigTree *config);
 SimStatus config_validate_schema(const ConfigTree *config, unsigned int expected_version);
 /** @brief 要求指定点路径存在且值为 JSON 对象。 */
 SimStatus config_require_section(const ConfigTree *config, const char *path);
+/** @brief 读取 JSON 数组元素数量。点路径支持 `items[0].field` 形式。 */
+SimStatus config_get_array_count(const ConfigTree *config, const char *path, size_t *out);
 /** @brief 读取 JSON 浮点字段。 */
 SimStatus config_get_double(const ConfigTree *config, const char *path, double *out);
 /** @brief 读取 JSON 有符号整数字段。 */

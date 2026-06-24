@@ -2,12 +2,14 @@
  *  @brief 地球坐标和地形模型单元测试。
  */
 #include "common/math_constants.h"
+#include "common/config.h"
 #include "common/random.h"
 #include "env/actuator_model.h"
 #include "env/aero_model.h"
 #include "env/atmosphere_model.h"
 #include "env/earth_model.h"
 #include "env/environment_force_model.h"
+#include "env/fault_injection.h"
 #include "env/geo_coordinate.h"
 #include "env/gravity_model.h"
 #include "env/map_tile.h"
@@ -714,6 +716,173 @@ static int test_seeker_sensor_pipeline(void)
     return failures;
 }
 
+/** @brief 验证故障脚本解析、激活窗口和故障效果应用。 */
+static int test_fault_injection(void)
+{
+    char json[] =
+        "{"
+        "\"schema_version\":1,"
+        "\"faults\":["
+        "{"
+        "\"id\":\"los_bias\","
+        "\"start_time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"sensor.seeker.los_rate\","
+        "\"type\":\"BIAS\","
+        "\"value_xyz\":[0.0,0.0,0.01]"
+        "},"
+        "{"
+        "\"id\":\"speed_drop\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"sensor.speedometer\","
+        "\"type\":\"DROPOUT\""
+        "},"
+        "{"
+        "\"id\":\"x_stuck\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"actuator.accel_x\","
+        "\"type\":\"STUCK\""
+        "},"
+        "{"
+        "\"id\":\"y_scale\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"actuator.accel_y\","
+        "\"type\":\"SCALE\","
+        "\"scale\":0.5"
+        "}"
+        "]"
+        "}";
+    ConfigTree config = { json, sizeof(json) - 1u };
+    FaultInjection faults;
+    FaultStepEffects effects;
+    FaultTransition transitions[ENV_MAX_FAULT_TRANSITIONS];
+    size_t transition_count = 0u;
+    SensorFrame sensor;
+    ActuatorState actuators[3];
+    double commands[3] = { 10.0, 20.0, 30.0 };
+    int failures = 0;
+
+    failures += expect(
+        fault_injection_load_config(&config, &faults) == SIM_OK &&
+            faults.fault_count == 4u,
+        "fault_load");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            0.5,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 0u &&
+            transition_count == 0u,
+        "fault_inactive_step");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            1.0,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 4u &&
+            transition_count == 4u,
+        "fault_active_step");
+    failures += expect(
+        transitions[0].active != 0 &&
+            strcmp(transitions[0].id, "los_bias") == 0,
+        "fault_start_transition");
+
+    (void)memset(&sensor, 0, sizeof(sensor));
+    sensor.sensor_valid_flags = SIM_SENSOR_VALID_SEEKER | SIM_SENSOR_VALID_SPEED;
+    sensor.target_los_unit_ecef_meas = vec3_make(1.0, 0.0, 0.0);
+    sensor.target_los_rate_ecef_meas = vec3_make(0.0, 0.0, 1.0);
+    sensor.missile_vel_ecef_meas = vec3_make(100.0, 0.0, 0.0);
+    fault_injection_apply_sensor(&effects, &sensor);
+    failures += expect_near(
+        sensor.target_los_rate_ecef_meas.z,
+        1.01,
+        1.0e-12,
+        "fault_sensor_bias");
+    failures += expect(
+        (sensor.sensor_valid_flags & SIM_SENSOR_VALID_SPEED) == 0u &&
+            (sensor.sensor_fault_flags & SIM_SENSOR_FAULT_SPEED_DROPOUT) != 0u,
+        "fault_sensor_dropout");
+
+    (void)memset(actuators, 0, sizeof(actuators));
+    fault_injection_apply_actuators(&effects, actuators, commands);
+    failures += expect(
+        (actuators[0].fault_flags & ACTUATOR_FAULT_STUCK) != 0u,
+        "fault_actuator_stuck");
+    failures += expect_near(commands[1], 10.0, 1.0e-12, "fault_actuator_scale");
+
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            3.0,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 0u &&
+            transition_count == 4u,
+        "fault_recovery_step");
+    commands[0] = 10.0;
+    commands[1] = 20.0;
+    commands[2] = 30.0;
+    fault_injection_apply_actuators(&effects, actuators, commands);
+    failures += expect(
+        (actuators[0].fault_flags & ACTUATOR_FAULT_STUCK) == 0u,
+        "fault_actuator_recovered");
+    failures += expect_near(commands[1], 20.0, 1.0e-12, "fault_scale_recovered");
+    return failures;
+}
+
+/** @brief 验证故障脚本错误路径在加载阶段被拒绝。 */
+static int test_fault_injection_rejects_bad_config(void)
+{
+    char bad_target_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"target\":\"sensor.unknown\","
+        "\"type\":\"DROPOUT\""
+        "}]}";
+    char bad_duration_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,"
+        "\"duration_s\":-1.0,"
+        "\"target\":\"sensor.speedometer\","
+        "\"type\":\"DROPOUT\""
+        "}]}";
+    char bad_pair_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"target\":\"sensor.speedometer\","
+        "\"type\":\"STUCK\""
+        "}]}";
+    ConfigTree bad_target = { bad_target_json, sizeof(bad_target_json) - 1u };
+    ConfigTree bad_duration = { bad_duration_json, sizeof(bad_duration_json) - 1u };
+    ConfigTree bad_pair = { bad_pair_json, sizeof(bad_pair_json) - 1u };
+    FaultInjection faults;
+    int failures = 0;
+
+    failures += expect(
+        fault_injection_load_config(&bad_target, &faults) == SIM_ERR_CONFIG,
+        "fault_reject_bad_target");
+    failures += expect(
+        fault_injection_load_config(&bad_duration, &faults) == SIM_ERR_OUT_OF_RANGE,
+        "fault_reject_bad_duration");
+    failures += expect(
+        fault_injection_load_config(&bad_pair, &faults) == SIM_ERR_CONFIG,
+        "fault_reject_bad_type_target_pair");
+    return failures;
+}
+
 /** @brief 运行环境基础模型单元测试。 */
 int main(void)
 {
@@ -731,5 +900,7 @@ int main(void)
     failures += test_sensor_noise();
     failures += test_vector_sensor_pipeline();
     failures += test_seeker_sensor_pipeline();
+    failures += test_fault_injection();
+    failures += test_fault_injection_rejects_bad_config();
     return failures == 0 ? 0 : 1;
 }

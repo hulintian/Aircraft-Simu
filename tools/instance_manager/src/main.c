@@ -7,6 +7,7 @@
 #include "common/status.h"
 
 #include <errno.h>
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #define DEFAULT_RUNTIME_CONFIG "configs/baseline/runtime.json"
 #define DEFAULT_SCENARIO_CONFIG "configs/baseline/scenario.json"
 #define DEFAULT_FC_CONFIG "configs/baseline/flight_control.json"
+#define DEFAULT_FAULTS_CONFIG "configs/baseline/faults.json"
 #define MAX_INSTANCES 128u
 
 typedef struct ManagedInstance {
@@ -36,6 +38,29 @@ typedef struct ManagedInstance {
     /** @brief waitpid 返回的环境退出状态。 */
     int env_status;
 } ManagedInstance;
+
+typedef struct InstanceSummary {
+    /** @brief 是否成功读取该实例的 summary.json。 */
+    int available;
+    /** @brief 实例是否命中目标。 */
+    int hit_flag;
+    /** @brief 最近点距离，单位米。 */
+    double miss_distance_m;
+    /** @brief 最近点时刻，单位秒。 */
+    double time_of_closest_s;
+    /** @brief 实例仿真步数。 */
+    unsigned int simulation_steps;
+    /** @brief 退出原因字符串。 */
+    char exit_reason[64];
+    /** @brief 故障进入激活窗口次数。 */
+    unsigned int fault_start_count;
+    /** @brief 故障离开激活窗口次数。 */
+    unsigned int fault_end_count;
+    /** @brief 传感器受故障影响的步数。 */
+    unsigned int fault_sensor_affected_step_count;
+    /** @brief 执行机构受故障影响的步数。 */
+    unsigned int fault_actuator_affected_step_count;
+} InstanceSummary;
 
 typedef struct ManagerConfig {
     /** @brief 本次任务计划运行的实例数。 */
@@ -109,6 +134,8 @@ static pid_t launch_process(
             DEFAULT_SCENARIO_CONFIG,
             "--runtime",
             runtime_path,
+            "--faults",
+            DEFAULT_FAULTS_CONFIG,
             (char *)0);
     } else {
         execl(
@@ -162,6 +189,51 @@ static int process_ok(int status)
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+/** @brief 读取单实例 summary.json 中用于任务汇总的稳定字段。 */
+static void read_instance_summary(
+    const ManagerConfig *cfg,
+    unsigned int instance_id,
+    InstanceSummary *out)
+{
+    char path[512];
+    ConfigTree tree;
+    SimStatus status;
+
+    if (cfg == 0 || out == 0) {
+        return;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    (void)snprintf(out->exit_reason, sizeof(out->exit_reason), "missing_summary");
+    (void)snprintf(
+        path,
+        sizeof(path),
+        "%s/instance_%04u/summary.json",
+        cfg->output_dir,
+        instance_id);
+    (void)memset(&tree, 0, sizeof(tree));
+    status = config_load_file(path, &tree);
+    if (status != SIM_OK) {
+        return;
+    }
+    out->available = 1;
+    (void)config_get_bool(&tree, "hit_flag", &out->hit_flag);
+    (void)config_get_double(&tree, "miss_distance", &out->miss_distance_m);
+    (void)config_get_double(&tree, "time_of_closest_approach", &out->time_of_closest_s);
+    (void)config_get_uint32(&tree, "simulation_steps", &out->simulation_steps);
+    (void)config_get_string(&tree, "exit_reason", out->exit_reason, sizeof(out->exit_reason));
+    (void)config_get_uint32(&tree, "fault_start_count", &out->fault_start_count);
+    (void)config_get_uint32(&tree, "fault_end_count", &out->fault_end_count);
+    (void)config_get_uint32(
+        &tree,
+        "fault_sensor_affected_step_count",
+        &out->fault_sensor_affected_step_count);
+    (void)config_get_uint32(
+        &tree,
+        "fault_actuator_affected_step_count",
+        &out->fault_actuator_affected_step_count);
+    config_free(&tree);
+}
+
 /** @brief 写出全局任务摘要。 */
 static void write_campaign_summary(const ManagerConfig *cfg, const ManagedInstance *instances)
 {
@@ -170,6 +242,14 @@ static void write_campaign_summary(const ManagerConfig *cfg, const ManagedInstan
     unsigned int i;
     unsigned int completed = 0u;
     unsigned int failed = 0u;
+    unsigned int summary_available = 0u;
+    unsigned int hit_count = 0u;
+    unsigned int total_fault_start_count = 0u;
+    unsigned int total_fault_end_count = 0u;
+    unsigned int total_fault_sensor_affected_steps = 0u;
+    unsigned int total_fault_actuator_affected_steps = 0u;
+    double min_miss_distance = DBL_MAX;
+    InstanceSummary summaries[MAX_INSTANCES];
 
     (void)mkdir("runs", 0777);
     (void)mkdir(cfg->output_dir, 0777);
@@ -185,19 +265,66 @@ static void write_campaign_summary(const ManagerConfig *cfg, const ManagedInstan
         } else {
             ++failed;
         }
+        (void)memset(&summaries[i], 0, sizeof(summaries[i]));
+        (void)snprintf(summaries[i].exit_reason, sizeof(summaries[i].exit_reason), "process_failed");
+        if (process_ok(instances[i].env_status) && process_ok(instances[i].fc_status)) {
+            read_instance_summary(cfg, instances[i].instance_id, &summaries[i]);
+        }
+        if (summaries[i].available != 0) {
+            ++summary_available;
+            if (summaries[i].hit_flag != 0) {
+                ++hit_count;
+            }
+            if (summaries[i].miss_distance_m < min_miss_distance) {
+                min_miss_distance = summaries[i].miss_distance_m;
+            }
+            total_fault_start_count += summaries[i].fault_start_count;
+            total_fault_end_count += summaries[i].fault_end_count;
+            total_fault_sensor_affected_steps += summaries[i].fault_sensor_affected_step_count;
+            total_fault_actuator_affected_steps += summaries[i].fault_actuator_affected_step_count;
+        }
     }
 
     (void)fprintf(file, "{\n");
     (void)fprintf(file, "  \"instance_count\": %u,\n", cfg->instance_count);
     (void)fprintf(file, "  \"completed_count\": %u,\n", completed);
     (void)fprintf(file, "  \"failed_count\": %u,\n", failed);
+    (void)fprintf(file, "  \"summary_available_count\": %u,\n", summary_available);
+    (void)fprintf(file, "  \"hit_count\": %u,\n", hit_count);
+    (void)fprintf(
+        file,
+        "  \"min_miss_distance\": %.6f,\n",
+        summary_available > 0u ? min_miss_distance : 0.0);
+    (void)fprintf(file, "  \"total_fault_start_count\": %u,\n", total_fault_start_count);
+    (void)fprintf(file, "  \"total_fault_end_count\": %u,\n", total_fault_end_count);
+    (void)fprintf(
+        file,
+        "  \"total_fault_sensor_affected_step_count\": %u,\n",
+        total_fault_sensor_affected_steps);
+    (void)fprintf(
+        file,
+        "  \"total_fault_actuator_affected_step_count\": %u,\n",
+        total_fault_actuator_affected_steps);
     (void)fprintf(file, "  \"instances\": [\n");
     for (i = 0u; i < cfg->instance_count; ++i) {
         (void)fprintf(file,
-            "    { \"instance_id\": %u, \"env_status\": %d, \"fc_status\": %d }%s\n",
+            "    { \"instance_id\": %u, \"env_status\": %d, \"fc_status\": %d, "
+            "\"summary_available\": %s, \"hit_flag\": %s, "
+            "\"miss_distance\": %.6f, \"exit_reason\": \"%s\", "
+            "\"fault_start_count\": %u, \"fault_end_count\": %u, "
+            "\"fault_sensor_affected_step_count\": %u, "
+            "\"fault_actuator_affected_step_count\": %u }%s\n",
             instances[i].instance_id,
             process_ok(instances[i].env_status) ? 0 : 1,
             process_ok(instances[i].fc_status) ? 0 : 1,
+            summaries[i].available != 0 ? "true" : "false",
+            summaries[i].hit_flag != 0 ? "true" : "false",
+            summaries[i].miss_distance_m,
+            summaries[i].exit_reason,
+            summaries[i].fault_start_count,
+            summaries[i].fault_end_count,
+            summaries[i].fault_sensor_affected_step_count,
+            summaries[i].fault_actuator_affected_step_count,
             i + 1u == cfg->instance_count ? "" : ",");
     }
     (void)fprintf(file, "  ]\n");

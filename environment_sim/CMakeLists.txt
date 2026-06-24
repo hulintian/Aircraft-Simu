@@ -10,6 +10,7 @@ set(ENV_MODEL_HEADERS
     include/env/atmosphere_model.h
     include/env/earth_model.h
     include/env/environment_force_model.h
+    include/env/fault_injection.h
     include/env/geo_coordinate.h
     include/env/gravity_model.h
     include/env/map_tile.h
@@ -31,6 +32,7 @@ set(ENV_MODEL_SOURCES
     src/atmosphere_model.c
     src/earth_model.c
     src/environment_force_model.c
+    src/fault_injection.c
     src/geo_coordinate.c
     src/gravity_model.c
     src/map_tile.c

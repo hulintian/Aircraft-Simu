@@ -14,6 +14,8 @@ typedef struct EnvContext {
     const char *scenario_path;
     /** @brief 运行时配置文件路径。 */
     const char *runtime_path;
+    /** @brief 故障脚本配置文件路径。 */
+    const char *faults_path;
 } EnvContext;
 
 #endif
