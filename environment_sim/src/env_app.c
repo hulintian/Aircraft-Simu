@@ -1095,6 +1095,7 @@ static SimStatus write_run_manifest(
     const EnvContext *ctx,
     const EnvScenarioConfig *scenario,
     const EnvRuntimeConfig *runtime,
+    uint64_t instance_random_seed,
     unsigned int env_port,
     unsigned int fc_port)
 {
@@ -1126,7 +1127,7 @@ static SimStatus write_run_manifest(
     (void)fprintf(
         file,
         "  \"random_seed\": %llu,\n",
-        (unsigned long long)(runtime->base_random_seed + ctx->instance_id));
+        (unsigned long long)instance_random_seed);
     (void)fprintf(file, "  \"initial_mass_kg\": %.17g,\n", scenario->mass_kg);
     (void)fprintf(
         file,
@@ -1412,6 +1413,7 @@ SimStatus env_app_run(const EnvContext *ctx)
     uint32_t seq = 0u;
     int hit = 0;
     const char *exit_reason = "timeout";
+    uint64_t instance_random_seed;
 
     if (ctx == 0 || ctx->scenario_path == 0 ||
         ctx->runtime_path == 0 || ctx->faults_path == 0) {
@@ -1542,10 +1544,13 @@ SimStatus env_app_run(const EnvContext *ctx)
         }
         fault_stats.configured_fault_count = faults.fault_count;
     }
+    instance_random_seed = ctx->has_random_seed_override != 0 ?
+        ctx->random_seed_override :
+        runtime.base_random_seed + ctx->instance_id;
     status = init_sensor_state(
         &sensors,
         &scenario,
-        runtime.base_random_seed + ctx->instance_id);
+        instance_random_seed);
     if (status != SIM_OK) {
         (void)fprintf(stderr, "environment_sim: invalid sensor config: %s\n",
             sim_status_to_string(status));
@@ -1588,6 +1593,7 @@ SimStatus env_app_run(const EnvContext *ctx)
         ctx,
         &scenario,
         &runtime,
+        instance_random_seed,
         env_port,
         fc_port);
     if (status != SIM_OK) {

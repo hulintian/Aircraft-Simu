@@ -18,14 +18,20 @@ SimStatus guidance_png_update(
     if (cfg == 0 || in == 0 || out == 0) {
         return SIM_ERR_INVALID_ARG;
     }
+    out->accel_cmd_ecef = vec3_make(0.0, 0.0, 0.0);
     if (!isfinite(cfg->navigation_constant) ||
         !isfinite(cfg->max_accel_mps2) ||
+        !isfinite(cfg->max_accel_rate_mps3) ||
         !isfinite(in->closing_velocity_mps) ||
         !vec3_isfinite(in->los_unit_ecef) ||
         !vec3_isfinite(in->los_rate_ecef)) {
         return SIM_ERR_NUMERIC;
     }
-    if (in->range_m <= 0.0 || cfg->max_accel_mps2 < 0.0) {
+    if (in->range_m <= 0.0 ||
+        in->closing_velocity_mps <= 0.0 ||
+        cfg->navigation_constant <= 0.0 ||
+        cfg->max_accel_mps2 < 0.0 ||
+        cfg->max_accel_rate_mps3 < 0.0) {
         return SIM_ERR_OUT_OF_RANGE;
     }
 

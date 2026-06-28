@@ -10,7 +10,15 @@
 #include "common/status.h"
 #include "common/vec3.h"
 
-/** @brief PNG 制导参数。 */
+/** @brief PNG 制导参数。
+ *
+ *  @var navigation_constant
+ *  比例导引导航比 N，无量纲，必须为正有限数。
+ *  @var max_accel_mps2
+ *  期望加速度范数上限，单位 m/s^2，必须为非负有限数。
+ *  @var max_accel_rate_mps3
+ *  指令变化率上限，单位 m/s^3，由命令管理器使用。
+ */
 typedef struct GuidancePngConfig {
     /** @brief 导引系数。 */
     double navigation_constant;
@@ -38,7 +46,13 @@ typedef struct GuidancePngOutput {
     Vec3 accel_cmd_ecef;
 } GuidancePngOutput;
 
-/** @brief 执行一次 PNG 制导更新。 */
+/** @brief 执行一次 PNG 制导更新。
+ *
+ *  使用三维比例导引公式
+ *  @f$ \mathbf a_c = N V_c(\boldsymbol\omega_{LOS}\times\hat{\mathbf r}) @f$。
+ *  输入和输出均位于 ECEF 坐标系。若距离、闭合速度或有限性检查失败，
+ *  函数返回错误并不产生可用指令。
+ */
 SimStatus guidance_png_update(
     const GuidancePngConfig *cfg,
     const GuidancePngInput *in,

@@ -13,7 +13,7 @@
 static void print_usage(const char *argv0)
 {
     (void)printf(
-        "usage: %s [--instance-id N] [--scenario PATH] [--runtime PATH] [--faults PATH]\n",
+        "usage: %s [--instance-id N] [--scenario PATH] [--runtime PATH] [--faults PATH] [--random-seed N]\n",
         argv0);
 }
 
@@ -24,7 +24,9 @@ int main(int argc, char **argv)
         0u,
         ENV_DEFAULT_SCENARIO_CONFIG,
         ENV_DEFAULT_RUNTIME_CONFIG,
-        ENV_DEFAULT_FAULTS_CONFIG
+        ENV_DEFAULT_FAULTS_CONFIG,
+        0,
+        0u
     };
     SimStatus status;
     int i;
@@ -48,6 +50,11 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--faults") == 0 && (i + 1) < argc) {
             ctx.faults_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--random-seed") == 0 && (i + 1) < argc) {
+            ctx.random_seed_override = (uint64_t)strtoull(argv[++i], 0, 10);
+            ctx.has_random_seed_override = 1;
             continue;
         }
         print_usage(argv[0]);

@@ -1,5 +1,5 @@
 add_executable(closed_loop_test closed_loop_test.c)
-target_link_libraries(closed_loop_test PRIVATE missile_common m)
+target_link_libraries(closed_loop_test PRIVATE missile_flight_control missile_common m)
 
 add_test(
     NAME closed_loop_test
@@ -10,3 +10,14 @@ add_test(
         ${CMAKE_SOURCE_DIR}/configs/baseline/scenario.json
 )
 set_tests_properties(closed_loop_test PROPERTIES TIMEOUT 15)
+
+add_executable(instance_manager_test instance_manager_test.c)
+add_test(
+    NAME instance_manager_test
+    COMMAND instance_manager_test
+        $<TARGET_FILE:instance_manager>
+        ${CMAKE_SOURCE_DIR}
+        $<TARGET_FILE:environment_sim>
+        $<TARGET_FILE:flight_control_sim>
+)
+set_tests_properties(instance_manager_test PROPERTIES TIMEOUT 30)

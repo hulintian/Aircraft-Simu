@@ -16,6 +16,10 @@ typedef struct EnvContext {
     const char *runtime_path;
     /** @brief 故障脚本配置文件路径。 */
     const char *faults_path;
+    /** @brief 是否使用命令行传入的显式随机种子。 */
+    int has_random_seed_override;
+    /** @brief 实例显式随机种子；仅在 has_random_seed_override 非零时生效。 */
+    uint64_t random_seed_override;
 } EnvContext;
 
 #endif

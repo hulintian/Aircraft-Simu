@@ -22,8 +22,13 @@
     "event_log": true,
     "flush_every_steps": 100
   },
+  "tools": {
+    "environment_program": "./build/environment_sim/environment_sim",
+    "flight_control_program": "./build/flight_control_sim/flight_control_sim"
+  },
   "instances": [
     {
+      "enabled": true,
       "instance_id": 0,
       "scenario": "configs/baseline/scenario.json",
       "flight_control": "configs/baseline/flight_control.json",
@@ -31,6 +36,7 @@
       "random_seed": 12345
     },
     {
+      "enabled": true,
       "instance_id": 1,
       "scenario": "configs/baseline/scenario.json",
       "flight_control": "configs/baseline/flight_control.json",

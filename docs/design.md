@@ -1739,6 +1739,8 @@ ABORT_BY_OPERATOR
     }
   ],
   "tools": {
+    "environment_program": "./build/environment_sim/environment_sim",
+    "flight_control_program": "./build/flight_control_sim/flight_control_sim",
     "write_summary_json": true,
     "write_run_manifest": true,
     "write_campaign_summary": true
@@ -2441,7 +2443,8 @@ SensorFrame
   -> ControlCommand
 ```
 
-当前已经落地的是协议校验、旧帧拒绝、导引头有效位检查、三维比例导引和幅值限幅。
+当前已经落地的是协议校验、安全监视、导航估计、模式状态机、三维比例导引、
+虚拟自动驾驶仪、命令管理、幅值限幅和变化率限幅。
 比例导引指令为：
 
 $$
@@ -2470,7 +2473,7 @@ $$
 \end{cases}
 $$
 
-下一步必须补齐的飞控设计项为变化率限制：
+变化率限制已经进入 `command_manager` 主链路：
 
 $$
 \Delta \mathbf a =
@@ -2490,7 +2493,7 @@ $$
 \right)
 $$
 
-以及状态机：
+状态机已经进入 `fc_modes` 主链路：
 
 ```text
 FC_POWER_ON
@@ -2505,7 +2508,8 @@ FC_FAULT
 FC_SHUTDOWN
 ```
 
-在这些模块完成前，`flight_control_sim` 是“比例导引控制器模拟件”，不是完整飞控软件。
+当前 `flight_control_sim` 已经是具备飞控任务链路的模拟件，但真实姿态环、
+角速度环、舵面控制分配和严格多速率任务执行仍未完成，因此还不是完整真实飞控软件。
 
 ### 21.5 多实例与并行化设计基线
 
@@ -2528,7 +2532,7 @@ $$
 P_{\text{fc}}(i)=P_{\text{fc,base}}+2i
 $$
 
-当前已经实现进程级并发、端口隔离和输出隔离。后续必须让管理器真正读取
+当前已经实现进程级并发、端口隔离、输出隔离，并且管理器会读取
 `runtime.json` 的 `instances[]`，包括：
 
 - `instance_id`
@@ -2537,6 +2541,10 @@ $$
 - `faults`
 - `random_seed`
 - `enabled`
+
+管理器还会读取 `runtime.tools.environment_program` 和
+`runtime.tools.flight_control_program`，用于覆盖默认子程序路径，避免编排工具
+必须从仓库根目录启动。
 
 关于 GPU 或 SIMD 并行化，当前代码没有实现 GPU 后端。设计上只保留如下边界：
 
@@ -2557,17 +2565,21 @@ P5 完成判据：
 
 P6 完成判据：
 
-- 飞控模块形成可测试静态库。
-- PNG 有独立单元测试，覆盖 LOS 方向、限幅和异常输入。
-- 加速度变化率限制接入主链路。
-- 状态机、命令保持、传感器超时和 NaN/Inf 保护有闭环回归。
+- 飞控模块形成可测试静态库。当前已实现。
+- PNG 有独立单元测试，覆盖 LOS 方向、限幅和异常输入。当前已实现基础覆盖。
+- 加速度变化率限制接入主链路。当前已实现。
+- 状态机、命令保持、传感器超时和 NaN/Inf 保护有单元测试或闭环回归。当前已实现基础覆盖。
+- 真实姿态环、角速度环和执行机构/舵面控制分配接入后，P6 才可标记为完全完成。
 
 P7 完成判据：
 
-- 管理器读取逐实例配置，而不是硬编码 baseline 路径。
-- 支持并验证 `PARALLEL`、`SEQUENTIAL`、并发上限和失败继续策略。
-- 单实例失败不会终止其他实例。
-- `campaign_summary.json` 汇总每个实例的退出原因、最小距离和故障统计。
+- 管理器读取逐实例配置，而不是硬编码 baseline 路径。当前已实现。
+- 支持并验证 `PARALLEL`、`SEQUENTIAL`、并发上限和失败策略。当前已实现基础行为，已覆盖 `PARALLEL` 两实例回归和 `STOP_ON_FAILURE` 跳过路径。
+- 单实例失败不会终止其他实例。当前 `CONTINUE_ON_FAILURE` 路径已实现，并覆盖了飞控绑定前早退失败路径。
+- `campaign_summary.json` 汇总每个实例的退出原因、最小距离、端口、配置路径、随机种子和故障统计。当前已实现。
+- 子程序路径可通过 `runtime.tools` 配置。当前已实现，并由管理器集成测试覆盖。
+- 端口占用预检失败路径已由管理器集成测试覆盖。
+- 应用层就绪/心跳握手完成后，P7 才可标记为完全完成。
 
 P8 完成判据：
 

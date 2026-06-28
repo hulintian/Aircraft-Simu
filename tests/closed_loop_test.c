@@ -5,6 +5,8 @@
 
 #include "common/packet.h"
 #include "common/protocol.h"
+#include "fc/fc_health.h"
+#include "fc/fc_modes.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -269,6 +271,42 @@ static int sensor_log_reports_expected_pipeline(const char *path)
     return 1;
 }
 
+/** @brief 解码前三条控制命令并验证 P6 飞控模式和保护位。 */
+static int command_log_reports_expected_protection(const char *path)
+{
+    unsigned char packet[SIM_CONTROL_PACKET_WIRE_SIZE];
+    ControlCommand command;
+    FILE *file = fopen(path, "rb");
+    unsigned int index;
+
+    if (file == 0) {
+        return 0;
+    }
+    for (index = 0u; index < 3u; ++index) {
+        if (fread(packet, 1u, sizeof(packet), file) != sizeof(packet) ||
+            packet_decode_control_command(packet, sizeof(packet), 0u, &command) != SIM_OK) {
+            (void)fclose(file);
+            return 0;
+        }
+        if (index < 2u) {
+            if (command.command_mode != (uint32_t)FC_COMMAND_HOLD ||
+                (command.command_status & FC_HEALTH_WARNING_MEASUREMENT_INVALID) == 0u ||
+                (command.command_status & FC_HEALTH_WARNING_COMMAND_HELD) == 0u) {
+                (void)fclose(file);
+                return 0;
+            }
+        } else {
+            if (command.command_mode != (uint32_t)FC_GUIDANCE_ACTIVE ||
+                (command.command_status & FC_HEALTH_WARNING_RATE_LIMITED) == 0u) {
+                (void)fclose(file);
+                return 0;
+            }
+        }
+    }
+    (void)fclose(file);
+    return 1;
+}
+
 /** @brief 逐字节比较两个文件是否完全一致。 */
 static int files_equal(const char *left_path, const char *right_path)
 {
@@ -335,7 +373,8 @@ static int validate_closed_loop_outputs(const ClosedLoopRun *run)
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/command_log.bin", run->instance_dir);
-    if (!file_exists_and_nonempty(path)) {
+    if (!file_exists_and_nonempty(path) ||
+        !command_log_reports_expected_protection(path)) {
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/trajectory.csv", run->instance_dir);

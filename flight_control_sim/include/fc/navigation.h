@@ -7,9 +7,18 @@
 #ifndef FC_NAVIGATION_H
 #define FC_NAVIGATION_H
 
+#include "common/protocol.h"
+#include "common/status.h"
 #include "common/vec3.h"
 
 #include <stdint.h>
+
+/** @brief 导航状态中速度、加速度和角速度估计有效。 */
+#define FC_NAV_VALID_KINEMATICS UINT32_C(0x00000001)
+/** @brief 导航状态中导引头目标测量有效。 */
+#define FC_NAV_VALID_SEEKER UINT32_C(0x00000002)
+/** @brief 导航状态中经纬高和 AGL 测量有效。 */
+#define FC_NAV_VALID_GEODETIC UINT32_C(0x00000004)
 
 /** @brief 导航估计状态。 */
 typedef struct NavState {
@@ -42,5 +51,18 @@ typedef struct NavState {
     /** @brief 有效数据标志。 */
     uint32_t valid_flags;
 } NavState;
+
+/** @brief 将传感器帧转换为飞控导航状态。
+ *
+ *  @param sensor 环境程序发来的传感器帧，ECEF/LLA 单位遵循协议定义。
+ *  @param out 调用方持有的导航状态输出。
+ *
+ *  该函数只使用传感器侧公开测量，不读取环境真值。无效通道不会写入
+ *  对应 @c FC_NAV_VALID_* 位。
+ */
+SimStatus navigation_update_from_sensor(const SensorFrame *sensor, NavState *out);
+
+/** @brief 判断导航状态是否具备比例导引所需的目标测量。 */
+int navigation_has_guidance_solution(const NavState *nav);
 
 #endif

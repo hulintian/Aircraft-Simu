@@ -508,6 +508,38 @@ FC_SHUTDOWN
 - 指令限幅和变化率限制生效。
 - 飞控内部日志记录每次保护动作。
 
+### 9.6 当前执行窗口
+
+P6 当前已经把飞控主链路从单一 PNG 函数扩展为可测试静态库：
+
+```text
+SensorFrame
+  -> safety_monitor
+  -> estimator/navigation
+  -> fc_modes/fc_health
+  -> guidance_manager/guidance_png
+  -> autopilot
+  -> command_manager
+  -> ControlCommand
+```
+
+第一批实现已经完成：
+
+- `missile_flight_control` 静态库和 `flight_control_tests`。
+- `FC_POWER_ON` 到 `FC_SHUTDOWN` 的模式状态机。
+- 健康/保护位写入 `ControlCommand.command_status`。
+- 导航估计、制导管理、虚拟自动驾驶仪和命令管理模块。
+- 加速度幅值限制和变化率限制。
+- 旧帧、NaN/Inf、传感器超时、目标测量无效和闭合速度异常保护。
+- 闭环测试会解码 `command_log.bin`，验证导引头预热时进入命令保持，
+  有效测量后进入制导激活并触发变化率限制。
+
+后续扩展仍应补充：
+
+- 真实姿态环、角速度环和执行机构/舵面控制分配。
+- 严格按 `scheduler.tasks[]` 执行的多速率任务调度。
+- 飞控内部保护动作的持久化日志和长时间故障恢复策略。
+
 ## 10. P7 多实例管理器
 
 ### 10.1 目标
@@ -543,6 +575,38 @@ tools/instance_manager
 - `instance_id` 唯一。
 - 单个实例失败时，其他实例继续运行。
 - 生成 `campaign_summary.json`。
+
+### 10.5 当前执行窗口
+
+P7 当前已经把 `instance_manager` 从固定 baseline 启动器扩展为逐实例计划执行器：
+
+```text
+runtime.instances[]
+  -> InstancePlan(instance_id, scenario, flight_control, faults, random_seed, enabled)
+  -> tools(environment_program, flight_control_program)
+  -> port preflight
+  -> environment_sim --random-seed
+  -> flight_control_sim --config
+  -> campaign_summary.json
+```
+
+第一批实现已经完成：
+
+- 读取启用的 `instances[]`，传递逐实例场景、飞控、故障配置和显式随机种子。
+- 环境程序支持 `--random-seed`，并在 `run_manifest.json` 记录实际种子。
+- 支持 `PARALLEL`、`SEQUENTIAL`、并发上限和基础失败策略。
+- 支持通过 `runtime.tools.environment_program` 和 `runtime.tools.flight_control_program`
+  配置子程序路径，管理器测试会从 `/tmp` 启动以验证不依赖仓库根目录。
+- 启动前校验 `instance_id` 唯一、端口唯一和 UDP 端口可绑定。
+- 管理器子进程失败时返回非零退出码，不再把失败批次伪装为成功。
+- `campaign_summary.json` 汇总每个实例的端口、配置路径、随机种子、退出状态和故障统计。
+- `instance_manager_test` 覆盖两实例并行计划、端口隔离、端口占用预检、显式种子、飞控端口就绪等待、
+  飞控早退失败路径、`STOP_ON_FAILURE` 跳过路径和批次摘要。
+
+后续扩展仍应补充：
+
+- 应用层就绪/心跳握手，用于区分“端口已绑定”和“飞控业务循环可服务”。
+- 应用层就绪/心跳握手的集成测试。
 
 ## 11. P8 日志、回放、批量验证
 

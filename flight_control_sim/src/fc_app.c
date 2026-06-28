@@ -11,7 +11,9 @@
 #include "common/packet.h"
 #include "common/protocol.h"
 #include "common/status.h"
-#include "fc/guidance_png.h"
+#include "fc/fc_health.h"
+#include "fc/fc_modes.h"
+#include "fc/fc_state.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -32,6 +34,43 @@ typedef struct FcRuntimeConfig {
     /** @brief 环境目标 IPv4 地址。 */
     char host[64];
 } FcRuntimeConfig;
+
+/** @brief 从飞控配置中读取安全保护参数。 */
+static SimStatus load_safety_config(const ConfigTree *config, FcSafetyConfig *out)
+{
+    SimStatus status;
+
+    if (config == 0 || out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = config_get_double(config, "safety.sensor_timeout_s", &out->sensor_timeout_s);
+    if (status != SIM_OK) {
+        return status;
+    }
+    status = config_get_double(config, "safety.command_hold_s", &out->command_hold_s);
+    if (status != SIM_OK) {
+        return status;
+    }
+    status = config_get_bool(config, "safety.reject_nan", &out->reject_nan);
+    if (status != SIM_OK) {
+        return status;
+    }
+    status = config_get_bool(config, "safety.reject_old_seq", &out->reject_old_seq);
+    if (status != SIM_OK) {
+        return status;
+    }
+    out->max_consecutive_bad_frames = 3u;
+    return SIM_OK;
+}
+
+/** @brief 从飞控配置中读取调度器基准频率。 */
+static SimStatus load_scheduler_config(const ConfigTree *config, double *base_rate_hz)
+{
+    if (config == 0 || base_rate_hz == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    return config_get_double(config, "scheduler.base_rate_hz", base_rate_hz);
+}
 
 /** @brief 从运行时配置中读取网络参数。 */
 static SimStatus load_runtime_config(const ConfigTree *runtime, FcRuntimeConfig *out)
@@ -149,14 +188,14 @@ SimStatus fc_app_run(const FcContext *ctx)
     ConfigTree fc_tree;
     ConfigTree runtime_tree;
     FcRuntimeConfig runtime_cfg;
-    GuidancePngConfig guidance_cfg;
+    FlightControllerConfig controller_cfg;
+    FlightController controller;
     Logger logger;
     SimStatus status;
     int sock = -1;
     unsigned int fc_port;
     unsigned int env_port;
-    uint32_t last_seq = 0u;
-    int have_seq = 0;
+    FcMode last_reported_mode = FC_POWER_ON;
 
     if (ctx == 0 || ctx->flight_control_path == 0 || ctx->runtime_path == 0) {
         return SIM_ERR_INVALID_ARG;
@@ -211,9 +250,24 @@ SimStatus fc_app_run(const FcContext *ctx)
         config_free(&runtime_tree);
         return status;
     }
-    status = load_guidance_config(&fc_tree, &guidance_cfg);
+    memset(&controller_cfg, 0, sizeof(controller_cfg));
+    status = load_guidance_config(&fc_tree, &controller_cfg.guidance);
+    if (status == SIM_OK) {
+        status = load_safety_config(&fc_tree, &controller_cfg.safety);
+    }
+    if (status == SIM_OK) {
+        status = load_scheduler_config(&fc_tree, &controller_cfg.scheduler_base_rate_hz);
+    }
     if (status != SIM_OK) {
-        (void)fprintf(stderr, "flight_control_sim: invalid guidance config: %s\n",
+        (void)fprintf(stderr, "flight_control_sim: invalid flight-control config: %s\n",
+            sim_status_to_string(status));
+        config_free(&fc_tree);
+        config_free(&runtime_tree);
+        return status;
+    }
+    status = flight_controller_init(&controller, &controller_cfg);
+    if (status != SIM_OK) {
+        (void)fprintf(stderr, "flight_control_sim: controller init failed: %s\n",
             sim_status_to_string(status));
         config_free(&fc_tree);
         config_free(&runtime_tree);
@@ -241,8 +295,6 @@ SimStatus fc_app_run(const FcContext *ctx)
         socklen_t from_len = sizeof(from);
         ssize_t got = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_len);
         SensorFrame sensor;
-        GuidancePngInput guidance_in;
-        GuidancePngOutput guidance_out;
         ControlCommand command;
 
         if (got < 0) {
@@ -264,38 +316,26 @@ SimStatus fc_app_run(const FcContext *ctx)
                 sim_status_to_string(status));
             continue;
         }
-        if (have_seq != 0 && sensor.seq <= last_seq) {
-            continue;
+        status = flight_controller_step(&controller, &sensor, &command);
+        if (status != SIM_OK) {
+            (void)fprintf(stderr, "flight_control_sim: controller step failed seq=%u status=%s\n",
+                sensor.seq,
+                sim_status_to_string(status));
+            break;
         }
-        have_seq = 1;
-        last_seq = sensor.seq;
-
-        memset(&command, 0, sizeof(command));
-        command.seq = sensor.seq;
-        command.sim_time = sensor.sim_time;
-        if ((sensor.sensor_valid_flags & SIM_SENSOR_VALID_SEEKER) != 0u) {
-            guidance_in.range_m = sensor.target_range_meas;
-            guidance_in.closing_velocity_mps =
-                sensor.target_closing_velocity_meas;
-            guidance_in.los_unit_ecef = sensor.target_los_unit_ecef_meas;
-            guidance_in.los_rate_ecef = sensor.target_los_rate_ecef_meas;
-            status = guidance_png_update(
-                &guidance_cfg,
-                &guidance_in,
-                &guidance_out);
-            if (status == SIM_OK) {
-                command.accel_cmd_ecef = guidance_out.accel_cmd_ecef;
-                command.command_status = 0u;
-            } else {
-                command.command_status = 1u;
-            }
-        } else {
-            /*
-             * LOCKSTEP 仍需对每个传感器帧返回一条命令。导引头延迟预热、
-             * 丢包或遮挡期间输出受控零加速度，避免使用无效测量。
-             */
-            command.command_status = 2u;
-            status = SIM_OK;
+        if (controller.mode != last_reported_mode) {
+            (void)fprintf(stdout, "flight_control_sim: mode %s -> %s at t=%.6f seq=%u\n",
+                fc_mode_to_string(last_reported_mode),
+                fc_mode_to_string(controller.mode),
+                sensor.sim_time,
+                sensor.seq);
+            last_reported_mode = controller.mode;
+        }
+        if (command.command_status != FC_COMMAND_STATUS_OK) {
+            (void)fprintf(stdout, "flight_control_sim: protection seq=%u mode=%s status=0x%08x\n",
+                command.seq,
+                fc_mode_to_string((FcMode)command.command_mode),
+                command.command_status);
         }
         from.sin_port = htons((uint16_t)env_port);
         status = send_control_command(sock, &from, ctx->instance_id, &command);
