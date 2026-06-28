@@ -117,6 +117,10 @@ SimStatus command_manager_build(
         if (autopilot_cmd == 0 || !vec3_isfinite(autopilot_cmd->accel_cmd_ecef)) {
             return SIM_ERR_NUMERIC;
         }
+        if (!vec3_isfinite(autopilot_cmd->attitude_cmd) ||
+            !vec3_isfinite(autopilot_cmd->body_rate_cmd)) {
+            return SIM_ERR_NUMERIC;
+        }
         requested_accel = autopilot_cmd->accel_cmd_ecef;
         command.attitude_cmd = autopilot_cmd->attitude_cmd;
         command.body_rate_cmd = autopilot_cmd->body_rate_cmd;

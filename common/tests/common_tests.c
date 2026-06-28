@@ -241,6 +241,24 @@ static int test_packet(void)
         failures += expect_near(decoded.accel_cmd_ecef.y, -20.0, 0.0, "control_packet_value");
         failures += expect_near(decoded.actuator_cmd[2], 0.15, 0.0, "control_packet_actuator");
     }
+    {
+        unsigned char wire[SIM_HEARTBEAT_PACKET_WIRE_SIZE];
+        PacketHeader decoded;
+        size_t wire_size = 0u;
+
+        failures += expect_int(
+            packet_encode_heartbeat(5u, 99u, 0.125, wire, sizeof(wire), &wire_size) == SIM_OK &&
+                wire_size == SIM_HEARTBEAT_PACKET_WIRE_SIZE,
+            "heartbeat_packet_encode");
+        failures += expect_int(
+            packet_decode_heartbeat(wire, wire_size, 5u, &decoded) == SIM_OK,
+            "heartbeat_packet_decode");
+        failures += expect_int(decoded.type == (uint16_t)PACKET_HEARTBEAT, "heartbeat_packet_type");
+        failures += expect_int(decoded.seq == 99u, "heartbeat_packet_seq");
+        failures += expect_int(
+            packet_decode_heartbeat(wire, wire_size, 6u, &decoded) == SIM_ERR_BAD_PACKET,
+            "heartbeat_packet_instance");
+    }
     return failures;
 }
 

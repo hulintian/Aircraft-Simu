@@ -17,6 +17,16 @@
     "max_accel_mps2": 350.0,
     "max_accel_rate_mps3": 2000.0
   },
+  "autopilot": {
+    "enable_attitude_loop": true,
+    "enable_control_allocation": true,
+    "max_attitude_cmd_rad": 0.35,
+    "max_body_rate_cmd_radps": 1.0,
+    "attitude_time_constant_s": 0.25,
+    "gyro_damping_gain": 0.2,
+    "fin_accel_effectiveness_mps2_per_rad": 150.0,
+    "max_fin_deflection_rad": 0.35
+  },
   "safety": {
     "sensor_timeout_s": 0.1,
     "command_hold_s": 0.2,
@@ -24,4 +34,3 @@
     "reject_old_seq": true
   }
 }
-

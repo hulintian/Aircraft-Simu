@@ -23,6 +23,8 @@
 #define SIM_SENSOR_PACKET_WIRE_SIZE (SIM_PACKET_HEADER_WIRE_SIZE + SIM_SENSOR_FRAME_WIRE_SIZE)
 /** @brief 完整控制报文最大固定长度。 */
 #define SIM_CONTROL_PACKET_WIRE_SIZE (SIM_PACKET_HEADER_WIRE_SIZE + SIM_CONTROL_COMMAND_WIRE_SIZE)
+/** @brief 零载荷心跳报文固定长度。 */
+#define SIM_HEARTBEAT_PACKET_WIRE_SIZE SIM_PACKET_HEADER_WIRE_SIZE
 
 /** @brief 校验报文头字段是否符合预期。
  *
@@ -70,5 +72,19 @@ SimStatus packet_decode_control_command(
     size_t data_size,
     uint32_t expected_instance_id,
     ControlCommand *out);
+/** @brief 编码零载荷应用层心跳报文。 */
+SimStatus packet_encode_heartbeat(
+    uint32_t instance_id,
+    uint32_t seq,
+    double sim_time,
+    unsigned char *out,
+    size_t out_capacity,
+    size_t *out_size);
+/** @brief 解码并校验零载荷应用层心跳报文。 */
+SimStatus packet_decode_heartbeat(
+    const unsigned char *data,
+    size_t data_size,
+    uint32_t expected_instance_id,
+    PacketHeader *out_header);
 
 #endif

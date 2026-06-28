@@ -14,6 +14,8 @@ typedef struct FcContext {
     const char *flight_control_path;
     /** @brief 运行时配置文件路径。 */
     const char *runtime_path;
+    /** @brief 管理器应用层就绪心跳 UDP 端口；为 0 时不发送。 */
+    uint32_t ready_port;
 } FcContext;
 
 #endif

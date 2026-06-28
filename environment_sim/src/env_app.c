@@ -990,6 +990,8 @@ static SimStatus update_truth(
     force_input.plant = &state->missile_plant;
     force_input.height_m = state->missile_lla.height_m;
     force_input.virtual_acceleration_ecef_mps2 = state->missile_actual_accel;
+    force_input.pitch_actuator_rad = command->actuator_cmd[0];
+    force_input.yaw_actuator_rad = command->actuator_cmd[1];
     force_input.propellant_mass_kg = state->missile_mass.propellant_mass_kg;
     force_input.dt_s = cfg->dt;
     status = environment_force_model_evaluate(

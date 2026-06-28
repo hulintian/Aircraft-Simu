@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "common/config.h"
+#include "common/packet.h"
 #include "common/status.h"
 
 #include <arpa/inet.h>
@@ -74,6 +75,10 @@ typedef struct ManagedInstance {
     int fc_done;
     /** @brief 环境子进程是否已被回收。 */
     int env_done;
+    /** @brief 等待飞控应用层 ready 心跳的 UDP 套接字。 */
+    int ready_sock;
+    /** @brief 传给飞控的管理器 ready 心跳端口。 */
+    unsigned int ready_port;
     /** @brief waitpid 返回的飞控退出状态。 */
     int fc_status;
     /** @brief waitpid 返回的环境退出状态。 */
@@ -445,16 +450,75 @@ static SimStatus preflight_ports(const ManagerConfig *cfg, const InstancePlan *p
     return SIM_OK;
 }
 
+/** @brief 创建用于接收飞控应用层 ready 心跳的临时 UDP socket。 */
+static SimStatus create_ready_socket(int *sock_out, unsigned int *port_out)
+{
+    int sock;
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+
+    if (sock_out == 0 || port_out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return SIM_ERR_IO;
+    }
+    (void)memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0u);
+    if (bind(sock, (const struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        getsockname(sock, (struct sockaddr *)&addr, &addr_len) != 0) {
+        (void)close(sock);
+        return SIM_ERR_IO;
+    }
+    *sock_out = sock;
+    *port_out = (unsigned int)ntohs(addr.sin_port);
+    return SIM_OK;
+}
+
+/** @brief 非阻塞检查 ready socket 是否收到指定实例的心跳。 */
+static SimStatus poll_ready_heartbeat(const ManagedInstance *instance, int *ready_out)
+{
+    unsigned char buffer[SIM_HEARTBEAT_PACKET_WIRE_SIZE];
+    ssize_t got;
+    PacketHeader header;
+
+    if (instance == 0 || ready_out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    *ready_out = 0;
+    got = recvfrom(instance->ready_sock, buffer, sizeof(buffer), MSG_DONTWAIT, 0, 0);
+    if (got < 0) {
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? SIM_OK : SIM_ERR_IO;
+    }
+    if ((size_t)got != SIM_HEARTBEAT_PACKET_WIRE_SIZE) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    if (packet_decode_heartbeat(
+            buffer,
+            (size_t)got,
+            instance->plan.instance_id,
+            &header) != SIM_OK) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    *ready_out = 1;
+    return SIM_OK;
+}
+
 /** @brief 启动单个子进程。 */
 static pid_t launch_process(
     const ManagerConfig *cfg,
     const InstancePlan *plan,
     const char *runtime_path,
+    unsigned int ready_port,
     int is_environment)
 {
     pid_t pid = fork();
     char instance_arg[32];
     char seed_arg[32];
+    char ready_port_arg[32];
 
     if (pid != 0) {
         return pid;
@@ -462,6 +526,7 @@ static pid_t launch_process(
 
     (void)snprintf(instance_arg, sizeof(instance_arg), "%u", plan->instance_id);
     (void)snprintf(seed_arg, sizeof(seed_arg), "%llu", (unsigned long long)plan->random_seed);
+    (void)snprintf(ready_port_arg, sizeof(ready_port_arg), "%u", ready_port);
     if (is_environment != 0) {
         execl(
             cfg->environment_program,
@@ -487,16 +552,18 @@ static pid_t launch_process(
             plan->flight_control_path,
             "--runtime",
             runtime_path,
+            "--ready-port",
+            ready_port_arg,
             (char *)0);
     }
     _exit(127);
 }
 
-/** @brief 等待飞控进程完成 UDP 端口绑定。
+/** @brief 等待飞控进程完成应用层初始化并发送 ready 心跳。
  *
- *  管理器先启动飞控，再启动环境。这里通过端口从“可绑定”变为“不可绑定”
- *  判断飞控已经进入接收循环；同时轮询子进程状态，避免飞控配置错误时
- *  仍继续启动环境进程。
+ *  管理器先启动飞控，再启动环境。这里要求飞控在完成配置加载、UDP 绑定
+ *  和业务循环初始化后主动发送零载荷心跳；同时轮询子进程状态，避免飞控
+ *  配置错误时仍继续启动环境进程。
  */
 static SimStatus wait_for_flight_control_ready(ManagedInstance *instance)
 {
@@ -509,6 +576,8 @@ static SimStatus wait_for_flight_control_ready(ManagedInstance *instance)
     for (attempt = 0u; attempt < 200u; ++attempt) {
         int child_status = 0;
         pid_t result = waitpid(instance->fc_pid, &child_status, WNOHANG);
+        int ready = 0;
+        SimStatus heartbeat_status;
 
         if (result == instance->fc_pid) {
             instance->fc_done = 1;
@@ -526,7 +595,15 @@ static SimStatus wait_for_flight_control_ready(ManagedInstance *instance)
                 "fc_wait_failed");
             return SIM_ERR_IO;
         }
-        if (udp_port_available(instance->plan.flight_control_port) == 0) {
+        heartbeat_status = poll_ready_heartbeat(instance, &ready);
+        if (heartbeat_status != SIM_OK && heartbeat_status != SIM_ERR_BAD_PACKET) {
+            (void)snprintf(
+                instance->launch_error,
+                sizeof(instance->launch_error),
+                "fc_ready_recv_failed");
+            return heartbeat_status;
+        }
+        if (ready != 0) {
             return SIM_OK;
         }
         (void)nanosleep(&delay, 0);
@@ -549,12 +626,23 @@ static SimStatus launch_instance(
     if (instance == 0 || runtime_path == 0 || cfg == 0) {
         return SIM_ERR_INVALID_ARG;
     }
-    instance->fc_pid = launch_process(cfg, &instance->plan, runtime_path, 0);
+    status = create_ready_socket(&instance->ready_sock, &instance->ready_port);
+    if (status != SIM_OK) {
+        (void)snprintf(instance->launch_error, sizeof(instance->launch_error), "ready_socket_failed");
+        return status;
+    }
+    instance->fc_pid = launch_process(cfg, &instance->plan, runtime_path, instance->ready_port, 0);
     if (instance->fc_pid <= 0) {
         (void)snprintf(instance->launch_error, sizeof(instance->launch_error), "launch_fc_failed");
+        (void)close(instance->ready_sock);
+        instance->ready_sock = -1;
         return SIM_ERR_INTERNAL;
     }
     status = wait_for_flight_control_ready(instance);
+    if (instance->ready_sock >= 0) {
+        (void)close(instance->ready_sock);
+        instance->ready_sock = -1;
+    }
     if (status != SIM_OK) {
         if (instance->fc_done == 0) {
             int child_status = 0;
@@ -566,7 +654,7 @@ static SimStatus launch_instance(
         }
         return status;
     }
-    instance->env_pid = launch_process(cfg, &instance->plan, runtime_path, 1);
+    instance->env_pid = launch_process(cfg, &instance->plan, runtime_path, 0u, 1);
     if (instance->env_pid <= 0) {
         (void)snprintf(instance->launch_error, sizeof(instance->launch_error), "launch_env_failed");
         (void)kill(instance->fc_pid, SIGTERM);
@@ -796,6 +884,8 @@ static void initialize_managed_instances(
         instances[i].plan = plans[i];
         instances[i].fc_pid = -1;
         instances[i].env_pid = -1;
+        instances[i].ready_sock = -1;
+        instances[i].ready_port = 0u;
         instances[i].fc_status = 1;
         instances[i].env_status = 1;
     }

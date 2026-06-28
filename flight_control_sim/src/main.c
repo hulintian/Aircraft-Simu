@@ -12,7 +12,7 @@
 
 static void print_usage(const char *argv0)
 {
-    (void)printf("usage: %s [--instance-id N] [--config PATH] [--runtime PATH]\n", argv0);
+    (void)printf("usage: %s [--instance-id N] [--config PATH] [--runtime PATH] [--ready-port PORT]\n", argv0);
 }
 
 /** @brief 解析飞控进程参数并运行指定实例。 */
@@ -21,7 +21,8 @@ int main(int argc, char **argv)
     FcContext ctx = {
         0u,
         FC_DEFAULT_CONFIG,
-        FC_DEFAULT_RUNTIME_CONFIG
+        FC_DEFAULT_RUNTIME_CONFIG,
+        0u
     };
     SimStatus status;
     int i;
@@ -41,6 +42,10 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--runtime") == 0 && (i + 1) < argc) {
             ctx.runtime_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--ready-port") == 0 && (i + 1) < argc) {
+            ctx.ready_port = (uint32_t)strtoul(argv[++i], 0, 10);
             continue;
         }
         print_usage(argv[0]);

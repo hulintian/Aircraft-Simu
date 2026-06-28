@@ -646,3 +646,70 @@ SimStatus packet_decode_control_command(
     }
     return status;
 }
+
+/** @brief 编码只有协议头、没有载荷的应用层心跳报文。 */
+SimStatus packet_encode_heartbeat(
+    uint32_t instance_id,
+    uint32_t seq,
+    double sim_time,
+    unsigned char *out,
+    size_t out_capacity,
+    size_t *out_size)
+{
+    PacketWriter packet_writer = { out, out_capacity, 0u };
+    PacketHeader header;
+    SimStatus status;
+
+    if (out == 0 || out_size == 0 || !isfinite(sim_time)) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (out_capacity < SIM_HEARTBEAT_PACKET_WIRE_SIZE) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    header = packet_header_make(
+        PACKET_HEARTBEAT,
+        instance_id,
+        seq,
+        sim_time,
+        0u,
+        crc32_compute(0, 0u));
+    status = encode_header(&packet_writer, &header);
+    if (status == SIM_OK && packet_writer.offset != SIM_HEARTBEAT_PACKET_WIRE_SIZE) {
+        status = SIM_ERR_INTERNAL;
+    }
+    *out_size = packet_writer.offset;
+    return status;
+}
+
+/** @brief 解码并校验零载荷应用层心跳报文。 */
+SimStatus packet_decode_heartbeat(
+    const unsigned char *data,
+    size_t data_size,
+    uint32_t expected_instance_id,
+    PacketHeader *out_header)
+{
+    PacketReader reader = { data, data_size, 0u };
+    PacketHeader header;
+    SimStatus status;
+
+    if (data == 0 || out_header == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (data_size != SIM_HEARTBEAT_PACKET_WIRE_SIZE) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    status = decode_header(&reader, &header);
+    if (status == SIM_OK) {
+        status = validate_wire_header(&header, PACKET_HEARTBEAT, expected_instance_id, 0u);
+    }
+    if (status == SIM_OK && header.payload_crc32 != crc32_compute(0, 0u)) {
+        status = SIM_ERR_BAD_PACKET;
+    }
+    if (status == SIM_OK && reader.offset != data_size) {
+        status = SIM_ERR_BAD_PACKET;
+    }
+    if (status == SIM_OK) {
+        *out_header = header;
+    }
+    return status;
+}

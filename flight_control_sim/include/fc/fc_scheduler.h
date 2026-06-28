@@ -14,11 +14,13 @@
 
 /** @brief 飞控调度器最多保存的任务数量。 */
 #define FC_SCHEDULER_MAX_TASKS 8u
+/** @brief 飞控调度任务名最大长度，含结尾零。 */
+#define FC_SCHEDULER_TASK_NAME_SIZE 32u
 
 /** @brief 单个周期任务的调度信息。 */
 typedef struct FcTask {
     /** @brief 任务名称。 */
-    const char *name;
+    char name[FC_SCHEDULER_TASK_NAME_SIZE];
     /** @brief 周期，单位 tick。 */
     uint32_t period_ticks;
     /** @brief 上次执行的 tick。 */
@@ -47,6 +49,9 @@ SimStatus fc_scheduler_add_task(FcScheduler *scheduler, const char *name, uint32
 
 /** @brief 判断指定任务在当前 tick 是否到期。 */
 int fc_scheduler_task_due(const FcScheduler *scheduler, uint32_t task_index);
+
+/** @brief 按任务名称判断当前 tick 是否到期；未知任务返回 0。 */
+int fc_scheduler_task_due_name(const FcScheduler *scheduler, const char *name);
 
 /** @brief 推进一个调度 tick。 */
 void fc_scheduler_advance(FcScheduler *scheduler);

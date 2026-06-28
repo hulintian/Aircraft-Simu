@@ -21,3 +21,12 @@ add_test(
         $<TARGET_FILE:flight_control_sim>
 )
 set_tests_properties(instance_manager_test PROPERTIES TIMEOUT 30)
+
+add_executable(log_convert_test log_convert_test.c)
+target_link_libraries(log_convert_test PRIVATE missile_common m)
+add_test(
+    NAME log_convert_test
+    COMMAND log_convert_test
+        $<TARGET_FILE:log_convert>
+)
+set_tests_properties(log_convert_test PROPERTIES TIMEOUT 10)

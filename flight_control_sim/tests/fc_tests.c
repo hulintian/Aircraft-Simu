@@ -3,6 +3,7 @@
  */
 #include "common/protocol.h"
 #include "common/vec3.h"
+#include "fc/autopilot.h"
 #include "fc/command_manager.h"
 #include "fc/fc_health.h"
 #include "fc/fc_modes.h"
@@ -67,6 +68,14 @@ static FlightControllerConfig make_controller_config(void)
     config.guidance.navigation_constant = 4.0;
     config.guidance.max_accel_mps2 = 350.0;
     config.guidance.max_accel_rate_mps3 = 2000.0;
+    config.autopilot.enable_attitude_loop = 1;
+    config.autopilot.enable_control_allocation = 1;
+    config.autopilot.max_attitude_cmd_rad = 0.35;
+    config.autopilot.max_body_rate_cmd_radps = 1.0;
+    config.autopilot.attitude_time_constant_s = 0.25;
+    config.autopilot.gyro_damping_gain = 0.2;
+    config.autopilot.fin_accel_effectiveness_mps2_per_rad = 150.0;
+    config.autopilot.max_fin_deflection_rad = 0.35;
     config.safety.sensor_timeout_s = 0.1;
     config.safety.command_hold_s = 0.2;
     config.safety.reject_nan = 1;
@@ -74,6 +83,15 @@ static FlightControllerConfig make_controller_config(void)
     config.safety.max_consecutive_bad_frames = 3u;
     config.scheduler_base_rate_hz = 100.0;
     return config;
+}
+
+/** @brief 向测试控制器配置写入一个调度任务。 */
+static void add_test_task(FlightControllerConfig *config, const char *name, uint32_t period_ticks)
+{
+    FcTask *task = &config->scheduler_tasks[config->scheduler_task_count++];
+
+    (void)snprintf(task->name, sizeof(task->name), "%s", name);
+    task->period_ticks = period_ticks;
 }
 
 /** @brief 验证三维 PNG 的叉乘方向和限幅方向。 */
@@ -97,6 +115,46 @@ static int test_guidance_png_direction(void)
     failures += expect_int(
         guidance_png_update(&config, &input, &output) == SIM_ERR_OUT_OF_RANGE,
         "png_reject_negative_closing");
+    return failures;
+}
+
+/** @brief 验证自动驾驶仪生成姿态、角速度和舵面分配命令。 */
+static int test_autopilot_attitude_allocation(void)
+{
+    int failures = 0;
+    Autopilot autopilot;
+    AutopilotConfig config;
+    NavState nav;
+    GuidancePngOutput guidance;
+    AutopilotCommand command;
+
+    (void)memset(&config, 0, sizeof(config));
+    config.enable_attitude_loop = 1;
+    config.enable_control_allocation = 1;
+    config.max_attitude_cmd_rad = 0.35;
+    config.max_body_rate_cmd_radps = 1.0;
+    config.attitude_time_constant_s = 0.25;
+    config.gyro_damping_gain = 0.2;
+    config.fin_accel_effectiveness_mps2_per_rad = 100.0;
+    config.max_fin_deflection_rad = 0.2;
+    failures += expect_int(autopilot_init(&autopilot, &config) == SIM_OK, "autopilot_init");
+
+    (void)memset(&nav, 0, sizeof(nav));
+    nav.missile_vel_ecef_est = vec3_make(300.0, 0.0, 0.0);
+    nav.omega_b_est = vec3_make(0.0, 0.1, -0.1);
+    nav.lat_rad = 0.0;
+    nav.lon_rad = 0.0;
+    nav.valid_flags = FC_NAV_VALID_KINEMATICS | FC_NAV_VALID_GEODETIC;
+    guidance.accel_cmd_ecef = vec3_make(0.0, 20.0, 30.0);
+    failures += expect_int(
+        autopilot_update(&autopilot, &nav, &guidance, &command) == SIM_OK,
+        "autopilot_update");
+    failures += expect_int(command.attitude_cmd.y > 0.0, "autopilot_pitch_cmd");
+    failures += expect_int(command.attitude_cmd.z > 0.0, "autopilot_yaw_cmd");
+    failures += expect_int(command.body_rate_cmd.y > 0.0, "autopilot_pitch_rate_cmd");
+    failures += expect_int(command.body_rate_cmd.z > 0.0, "autopilot_yaw_rate_cmd");
+    failures += expect_near(command.actuator_cmd[0], 0.2, 1.0e-12, "autopilot_pitch_fin_limit");
+    failures += expect_near(command.actuator_cmd[1], 0.2, 1.0e-12, "autopilot_yaw_fin_limit");
     return failures;
 }
 
@@ -240,13 +298,51 @@ static int test_flight_controller_protection(void)
     return failures;
 }
 
+/** @brief 验证控制器按 scheduler.tasks[] 周期复用导航缓存。 */
+static int test_flight_controller_multirate_scheduler(void)
+{
+    int failures = 0;
+    FlightController controller;
+    FlightControllerConfig config = make_controller_config();
+    ControlCommand command;
+    SensorFrame sensor;
+
+    add_test_task(&config, "receive", 1u);
+    add_test_task(&config, "navigation", 2u);
+    add_test_task(&config, "guidance", 1u);
+    add_test_task(&config, "controller", 1u);
+    add_test_task(&config, "safety", 1u);
+    failures += expect_int(
+        flight_controller_init(&controller, &config) == SIM_OK,
+        "multirate_init");
+    sensor = make_sensor(1u, 0.01);
+    failures += expect_int(
+        flight_controller_step(&controller, &sensor, &command) == SIM_OK,
+        "multirate_step_0");
+    failures += expect_int(controller.estimator.accepted_frames == 1u, "multirate_nav_first");
+    sensor = make_sensor(2u, 0.02);
+    sensor.missile_vel_ecef_meas = vec3_make(100.0, 200.0, 0.0);
+    failures += expect_int(
+        flight_controller_step(&controller, &sensor, &command) == SIM_OK,
+        "multirate_step_1");
+    failures += expect_int(controller.estimator.accepted_frames == 1u, "multirate_nav_hold");
+    sensor = make_sensor(3u, 0.03);
+    failures += expect_int(
+        flight_controller_step(&controller, &sensor, &command) == SIM_OK,
+        "multirate_step_2");
+    failures += expect_int(controller.estimator.accepted_frames == 2u, "multirate_nav_second");
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
 
     failures += test_guidance_png_direction();
+    failures += test_autopilot_attitude_allocation();
     failures += test_command_manager_limits();
     failures += test_mode_state_machine();
     failures += test_flight_controller_protection();
+    failures += test_flight_controller_multirate_scheduler();
     return failures == 0 ? 0 : 1;
 }

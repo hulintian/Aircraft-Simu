@@ -5,6 +5,8 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 SimStatus fc_scheduler_init(FcScheduler *scheduler, double base_rate_hz)
 {
@@ -34,7 +36,7 @@ SimStatus fc_scheduler_add_task(FcScheduler *scheduler, const char *name, uint32
         return SIM_ERR_OUT_OF_RANGE;
     }
     task = &scheduler->tasks[scheduler->task_count++];
-    task->name = name;
+    (void)snprintf(task->name, sizeof(task->name), "%s", name);
     task->period_ticks = period_ticks;
     task->last_run_tick = 0u;
     return SIM_OK;
@@ -49,6 +51,21 @@ int fc_scheduler_task_due(const FcScheduler *scheduler, uint32_t task_index)
     }
     task = &scheduler->tasks[task_index];
     return task->period_ticks != 0u && (scheduler->tick % task->period_ticks) == 0u;
+}
+
+int fc_scheduler_task_due_name(const FcScheduler *scheduler, const char *name)
+{
+    uint32_t index;
+
+    if (scheduler == 0 || name == 0) {
+        return 0;
+    }
+    for (index = 0u; index < scheduler->task_count; ++index) {
+        if (strcmp(scheduler->tasks[index].name, name) == 0) {
+            return fc_scheduler_task_due(scheduler, index);
+        }
+    }
+    return 0;
 }
 
 void fc_scheduler_advance(FcScheduler *scheduler)

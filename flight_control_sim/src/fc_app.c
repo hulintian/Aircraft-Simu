@@ -63,13 +63,69 @@ static SimStatus load_safety_config(const ConfigTree *config, FcSafetyConfig *ou
     return SIM_OK;
 }
 
-/** @brief 从飞控配置中读取调度器基准频率。 */
-static SimStatus load_scheduler_config(const ConfigTree *config, double *base_rate_hz)
+/** @brief 检查配置任务表是否包含指定任务名。 */
+static int scheduler_config_has_task(const FlightControllerConfig *config, const char *name)
 {
-    if (config == 0 || base_rate_hz == 0) {
+    uint32_t index;
+
+    if (config == 0 || name == 0) {
+        return 0;
+    }
+    for (index = 0u; index < config->scheduler_task_count; ++index) {
+        if (strcmp(config->scheduler_tasks[index].name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** @brief 从飞控配置中读取调度器基准频率和任务周期表。 */
+static SimStatus load_scheduler_config(const ConfigTree *config, FlightControllerConfig *out)
+{
+    size_t task_count = 0u;
+    size_t index;
+    SimStatus status;
+
+    if (config == 0 || out == 0) {
         return SIM_ERR_INVALID_ARG;
     }
-    return config_get_double(config, "scheduler.base_rate_hz", base_rate_hz);
+    status = config_get_double(config, "scheduler.base_rate_hz", &out->scheduler_base_rate_hz);
+    if (status != SIM_OK) {
+        return status;
+    }
+    if (config_get_array_count(config, "scheduler.tasks", &task_count) != SIM_OK) {
+        out->scheduler_task_count = 0u;
+        return SIM_OK;
+    }
+    if (task_count > FC_SCHEDULER_MAX_TASKS) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    out->scheduler_task_count = (uint32_t)task_count;
+    for (index = 0u; index < task_count; ++index) {
+        char path[96];
+        unsigned int period_ticks = 0u;
+        FcTask *task = &out->scheduler_tasks[index];
+
+        (void)snprintf(path, sizeof(path), "scheduler.tasks[%u].name", (unsigned int)index);
+        status = config_get_string(config, path, task->name, sizeof(task->name));
+        if (status != SIM_OK) {
+            return status;
+        }
+        (void)snprintf(path, sizeof(path), "scheduler.tasks[%u].period_ticks", (unsigned int)index);
+        status = config_get_uint32(config, path, &period_ticks);
+        if (status != SIM_OK || period_ticks == 0u) {
+            return status == SIM_OK ? SIM_ERR_OUT_OF_RANGE : status;
+        }
+        task->period_ticks = period_ticks;
+    }
+    if (!scheduler_config_has_task(out, "receive") ||
+        !scheduler_config_has_task(out, "navigation") ||
+        !scheduler_config_has_task(out, "guidance") ||
+        !scheduler_config_has_task(out, "controller") ||
+        !scheduler_config_has_task(out, "safety")) {
+        return SIM_ERR_CONFIG;
+    }
+    return SIM_OK;
 }
 
 /** @brief 从运行时配置中读取网络参数。 */
@@ -111,6 +167,34 @@ static SimStatus load_guidance_config(const ConfigTree *config, GuidancePngConfi
     }
     status = config_get_double(config, "guidance.max_accel_rate_mps3", &out->max_accel_rate_mps3);
     return status;
+}
+
+/** @brief 从飞控配置中读取自动驾驶仪参数，缺失时使用保守默认值。 */
+static SimStatus load_autopilot_config(const ConfigTree *config, AutopilotConfig *out)
+{
+    if (config == 0 || out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    out->enable_attitude_loop = 1;
+    out->enable_control_allocation = 1;
+    out->max_attitude_cmd_rad = 0.35;
+    out->max_body_rate_cmd_radps = 1.0;
+    out->attitude_time_constant_s = 0.25;
+    out->gyro_damping_gain = 0.2;
+    out->fin_accel_effectiveness_mps2_per_rad = 150.0;
+    out->max_fin_deflection_rad = 0.35;
+    (void)config_get_bool(config, "autopilot.enable_attitude_loop", &out->enable_attitude_loop);
+    (void)config_get_bool(config, "autopilot.enable_control_allocation", &out->enable_control_allocation);
+    (void)config_get_double(config, "autopilot.max_attitude_cmd_rad", &out->max_attitude_cmd_rad);
+    (void)config_get_double(config, "autopilot.max_body_rate_cmd_radps", &out->max_body_rate_cmd_radps);
+    (void)config_get_double(config, "autopilot.attitude_time_constant_s", &out->attitude_time_constant_s);
+    (void)config_get_double(config, "autopilot.gyro_damping_gain", &out->gyro_damping_gain);
+    (void)config_get_double(
+        config,
+        "autopilot.fin_accel_effectiveness_mps2_per_rad",
+        &out->fin_accel_effectiveness_mps2_per_rad);
+    (void)config_get_double(config, "autopilot.max_fin_deflection_rad", &out->max_fin_deflection_rad);
+    return SIM_OK;
 }
 
 /** @brief 绑定 UDP 监听套接字。 */
@@ -180,6 +264,39 @@ static SimStatus send_control_command(
         return SIM_ERR_IO;
     }
     return SIM_OK;
+}
+
+/** @brief 向实例管理器发送应用层就绪心跳。 */
+static SimStatus send_ready_heartbeat(
+    int sock,
+    const char *host,
+    unsigned int ready_port,
+    uint32_t instance_id)
+{
+    unsigned char buffer[SIM_HEARTBEAT_PACKET_WIRE_SIZE];
+    struct sockaddr_in peer;
+    size_t packet_size = 0u;
+    ssize_t sent;
+    SimStatus status;
+
+    if (ready_port == 0u) {
+        return SIM_OK;
+    }
+    if (host == 0 || ready_port > 65535u) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = packet_encode_heartbeat(instance_id, 1u, 0.0, buffer, sizeof(buffer), &packet_size);
+    if (status != SIM_OK) {
+        return status;
+    }
+    (void)memset(&peer, 0, sizeof(peer));
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons((uint16_t)ready_port);
+    if (inet_pton(AF_INET, host, &peer.sin_addr) != 1) {
+        return SIM_ERR_CONFIG;
+    }
+    sent = sendto(sock, buffer, packet_size, 0, (const struct sockaddr *)&peer, sizeof(peer));
+    return sent == (ssize_t)packet_size ? SIM_OK : SIM_ERR_IO;
 }
 
 /** @brief 运行飞控仿真主循环。 */
@@ -253,10 +370,13 @@ SimStatus fc_app_run(const FcContext *ctx)
     memset(&controller_cfg, 0, sizeof(controller_cfg));
     status = load_guidance_config(&fc_tree, &controller_cfg.guidance);
     if (status == SIM_OK) {
+        status = load_autopilot_config(&fc_tree, &controller_cfg.autopilot);
+    }
+    if (status == SIM_OK) {
         status = load_safety_config(&fc_tree, &controller_cfg.safety);
     }
     if (status == SIM_OK) {
-        status = load_scheduler_config(&fc_tree, &controller_cfg.scheduler_base_rate_hz);
+        status = load_scheduler_config(&fc_tree, &controller_cfg);
     }
     if (status != SIM_OK) {
         (void)fprintf(stderr, "flight_control_sim: invalid flight-control config: %s\n",
@@ -288,6 +408,15 @@ SimStatus fc_app_run(const FcContext *ctx)
 
     (void)logger_info(&logger, "flight_control_sim UDP loop started");
     (void)printf("instance_id=%u fc_port=%u env_port=%u\n", ctx->instance_id, fc_port, env_port);
+    status = send_ready_heartbeat(sock, runtime_cfg.host, ctx->ready_port, ctx->instance_id);
+    if (status != SIM_OK) {
+        (void)fprintf(stderr, "flight_control_sim: failed to send ready heartbeat: %s\n",
+            sim_status_to_string(status));
+        (void)close(sock);
+        config_free(&fc_tree);
+        config_free(&runtime_tree);
+        return status;
+    }
 
     for (;;) {
         unsigned char buffer[FC_PACKET_BUFFER_SIZE];

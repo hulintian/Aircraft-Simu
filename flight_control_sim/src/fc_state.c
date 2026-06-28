@@ -29,6 +29,50 @@ static FcMode advance_mode(FcMode current, const FcModeInput *input)
     return mode;
 }
 
+/** @brief 注册默认飞控任务表，保持旧配置的每帧执行行为。 */
+static SimStatus register_default_tasks(FcScheduler *scheduler)
+{
+    SimStatus status;
+
+    status = fc_scheduler_add_task(scheduler, "receive", 1u);
+    if (status == SIM_OK) {
+        status = fc_scheduler_add_task(scheduler, "navigation", 1u);
+    }
+    if (status == SIM_OK) {
+        status = fc_scheduler_add_task(scheduler, "guidance", 1u);
+    }
+    if (status == SIM_OK) {
+        status = fc_scheduler_add_task(scheduler, "controller", 1u);
+    }
+    if (status == SIM_OK) {
+        status = fc_scheduler_add_task(scheduler, "safety", 1u);
+    }
+    return status;
+}
+
+/** @brief 按配置注册飞控任务表。 */
+static SimStatus register_configured_tasks(
+    FcScheduler *scheduler,
+    const FlightControllerConfig *config)
+{
+    uint32_t index;
+    SimStatus status = SIM_OK;
+
+    if (scheduler == 0 || config == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (config->scheduler_task_count == 0u) {
+        return register_default_tasks(scheduler);
+    }
+    for (index = 0u; index < config->scheduler_task_count && status == SIM_OK; ++index) {
+        status = fc_scheduler_add_task(
+            scheduler,
+            config->scheduler_tasks[index].name,
+            config->scheduler_tasks[index].period_ticks);
+    }
+    return status;
+}
+
 SimStatus flight_controller_init(
     FlightController *controller,
     const FlightControllerConfig *config)
@@ -43,19 +87,7 @@ SimStatus flight_controller_init(
     controller->mode = FC_POWER_ON;
     status = fc_scheduler_init(&controller->scheduler, config->scheduler_base_rate_hz);
     if (status == SIM_OK) {
-        status = fc_scheduler_add_task(&controller->scheduler, "receive", 1u);
-    }
-    if (status == SIM_OK) {
-        status = fc_scheduler_add_task(&controller->scheduler, "navigation", 1u);
-    }
-    if (status == SIM_OK) {
-        status = fc_scheduler_add_task(&controller->scheduler, "guidance", 1u);
-    }
-    if (status == SIM_OK) {
-        status = fc_scheduler_add_task(&controller->scheduler, "controller", 1u);
-    }
-    if (status == SIM_OK) {
-        status = fc_scheduler_add_task(&controller->scheduler, "safety", 1u);
+        status = register_configured_tasks(&controller->scheduler, config);
     }
     if (status == SIM_OK) {
         status = estimator_init(&controller->estimator);
@@ -64,7 +96,7 @@ SimStatus flight_controller_init(
         status = guidance_manager_init(&controller->guidance, &config->guidance);
     }
     if (status == SIM_OK) {
-        status = autopilot_init(&controller->autopilot);
+        status = autopilot_init(&controller->autopilot, &config->autopilot);
     }
     if (status == SIM_OK) {
         status = safety_monitor_init(&controller->safety, &config->safety);
@@ -92,6 +124,9 @@ SimStatus flight_controller_step(
     int guidance_valid = 0;
     int nav_valid = 0;
     int request_hold = 0;
+    int navigation_due;
+    int guidance_due;
+    int controller_due;
     SimStatus status;
 
     if (controller == 0 || sensor == 0 || command == 0) {
@@ -116,14 +151,48 @@ SimStatus flight_controller_step(
     (void)memset(&guidance, 0, sizeof(guidance));
 
     if (assessment.accept_frame != 0) {
-        status = estimator_update(&controller->estimator, sensor, &nav);
+        navigation_due = fc_scheduler_task_due_name(&controller->scheduler, "navigation");
+        guidance_due = fc_scheduler_task_due_name(&controller->scheduler, "guidance");
+        controller_due = fc_scheduler_task_due_name(&controller->scheduler, "controller");
+        if (navigation_due != 0 || controller->have_last_nav == 0) {
+            status = estimator_update(&controller->estimator, sensor, &nav);
+            if (status == SIM_OK) {
+                controller->last_nav = nav;
+                controller->have_last_nav = 1;
+            }
+        } else {
+            nav = controller->last_nav;
+            status = SIM_OK;
+        }
         if (status == SIM_OK) {
             nav_valid = (nav.valid_flags & FC_NAV_VALID_KINEMATICS) != 0u;
             if (navigation_has_guidance_solution(&nav)) {
-                status = guidance_manager_update(&controller->guidance, &nav, &guidance);
-                if (status == SIM_OK) {
-                    status = autopilot_update(&controller->autopilot, &guidance, &autopilot_command);
-                    guidance_valid = status == SIM_OK;
+                if (guidance_due != 0 || controller->have_last_guidance == 0) {
+                    status = guidance_manager_update(&controller->guidance, &nav, &guidance);
+                    if (status == SIM_OK) {
+                        controller->last_guidance = guidance;
+                        controller->have_last_guidance = 1;
+                    }
+                } else {
+                    guidance = controller->last_guidance;
+                    status = SIM_OK;
+                }
+                if (status == SIM_OK && controller->have_last_guidance != 0) {
+                    if (controller_due != 0 || controller->have_last_autopilot_command == 0) {
+                        status = autopilot_update(
+                            &controller->autopilot,
+                            &nav,
+                            &guidance,
+                            &autopilot_command);
+                        if (status == SIM_OK) {
+                            controller->last_autopilot_command = autopilot_command;
+                            controller->have_last_autopilot_command = 1;
+                        }
+                    } else {
+                        autopilot_command = controller->last_autopilot_command;
+                        status = SIM_OK;
+                    }
+                    guidance_valid = status == SIM_OK && controller->have_last_autopilot_command != 0;
                 }
             }
         }

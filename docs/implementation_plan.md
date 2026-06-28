@@ -529,6 +529,8 @@ SensorFrame
 - `FC_POWER_ON` 到 `FC_SHUTDOWN` 的模式状态机。
 - 健康/保护位写入 `ControlCommand.command_status`。
 - 导航估计、制导管理、虚拟自动驾驶仪和命令管理模块。
+- 姿态/角速度自动驾驶仪、俯仰/偏航舵偏控制分配，并由环境气动模型消费。
+- 严格按 `scheduler.tasks[]` 执行的多速率导航、制导和控制缓存更新。
 - 加速度幅值限制和变化率限制。
 - 旧帧、NaN/Inf、传感器超时、目标测量无效和闭合速度异常保护。
 - 闭环测试会解码 `command_log.bin`，验证导引头预热时进入命令保持，
@@ -536,8 +538,6 @@ SensorFrame
 
 后续扩展仍应补充：
 
-- 真实姿态环、角速度环和执行机构/舵面控制分配。
-- 严格按 `scheduler.tasks[]` 执行的多速率任务调度。
 - 飞控内部保护动作的持久化日志和长时间故障恢复策略。
 
 ## 10. P7 多实例管理器
@@ -585,6 +585,8 @@ runtime.instances[]
   -> InstancePlan(instance_id, scenario, flight_control, faults, random_seed, enabled)
   -> tools(environment_program, flight_control_program)
   -> port preflight
+  -> flight_control_sim --ready-port
+  -> PACKET_HEARTBEAT ready
   -> environment_sim --random-seed
   -> flight_control_sim --config
   -> campaign_summary.json
@@ -598,15 +600,14 @@ runtime.instances[]
 - 支持通过 `runtime.tools.environment_program` 和 `runtime.tools.flight_control_program`
   配置子程序路径，管理器测试会从 `/tmp` 启动以验证不依赖仓库根目录。
 - 启动前校验 `instance_id` 唯一、端口唯一和 UDP 端口可绑定。
+- 飞控启动完成后发送应用层 ready 心跳，管理器收到合法 `PACKET_HEARTBEAT`
+  后才启动环境程序。
 - 管理器子进程失败时返回非零退出码，不再把失败批次伪装为成功。
 - `campaign_summary.json` 汇总每个实例的端口、配置路径、随机种子、退出状态和故障统计。
-- `instance_manager_test` 覆盖两实例并行计划、端口隔离、端口占用预检、显式种子、飞控端口就绪等待、
+- `instance_manager_test` 覆盖两实例并行计划、端口隔离、端口占用预检、显式种子、应用层 ready 心跳、
   飞控早退失败路径、`STOP_ON_FAILURE` 跳过路径和批次摘要。
 
-后续扩展仍应补充：
-
-- 应用层就绪/心跳握手，用于区分“端口已绑定”和“飞控业务循环可服务”。
-- 应用层就绪/心跳握手的集成测试。
+P7 计划内主链路能力已完成；后续只保留更复杂的调度器集成，例如远程节点启动和资源配额。
 
 ## 11. P8 日志、回放、批量验证
 
@@ -636,6 +637,22 @@ tools/plot
 - 固定随机种子结果可复现。
 - 相同输入日志重新驱动飞控，输出一致。
 - 回归误差超过阈值时测试失败。
+
+### 11.5 当前执行窗口
+
+P8 当前已经完成第一批可验证工具：
+
+- 新增 `tools/log_convert`，支持 `--type sensor|command`、`--instance-id`、
+  `--input` 和 `--output`。
+- `sensor_log.bin` 与 `command_log.bin` 可按固定线格式解码、校验实例号和 CRC，
+  并转换为 CSV。
+- 新增 `log_convert_test`，覆盖 `command_log.bin` 到 CSV 的转换路径。
+
+后续扩展仍应补充：
+
+- `tools/replay`：使用 `sensor_log.bin` 重新驱动飞控并生成新的 `command_log.bin`。
+- `tools/batch_runner` 或统计工具：汇总多个 `summary.json` 和 `campaign_summary.json`。
+- 固定随机种子回放一致性阈值比较。
 
 ## 12. 开发提交建议
 

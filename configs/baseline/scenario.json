@@ -59,8 +59,8 @@
     "reference_area_m2": 0.01,
     "reference_length_m": 1.0,
     "drag_coefficient": 0.1,
-    "control_force_coefficient": 0.0,
-    "control_moment_coefficient": 0.0
+    "control_force_coefficient": 0.002,
+    "control_moment_coefficient": 0.001
   },
   "missile": {
     "initial_lla_deg_m": [30.0, 120.0, 1000.0],

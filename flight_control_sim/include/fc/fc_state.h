@@ -30,8 +30,13 @@ typedef struct FcState {
 /** @brief 飞控控制器运行配置。 */
 typedef struct FlightControllerConfig {
     GuidancePngConfig guidance;
+    AutopilotConfig autopilot;
     FcSafetyConfig safety;
     double scheduler_base_rate_hz;
+    /** @brief 配置文件中声明的调度任务表；为空时使用内置默认任务。 */
+    FcTask scheduler_tasks[FC_SCHEDULER_MAX_TASKS];
+    /** @brief 调度任务数量。 */
+    uint32_t scheduler_task_count;
 } FlightControllerConfig;
 
 /** @brief 单实例飞控控制器对象。 */
@@ -45,6 +50,18 @@ typedef struct FlightController {
     Autopilot autopilot;
     CommandManager command_manager;
     SafetyMonitor safety;
+    /** @brief 最近一次有效导航状态，用于多速率任务非到期 tick 复用。 */
+    NavState last_nav;
+    /** @brief 最近一次有效制导输出，用于多速率制导保持。 */
+    GuidancePngOutput last_guidance;
+    /** @brief 最近一次有效自动驾驶仪输出，用于多速率控制保持。 */
+    AutopilotCommand last_autopilot_command;
+    /** @brief 最近一次导航状态是否有效。 */
+    int have_last_nav;
+    /** @brief 最近一次制导输出是否有效。 */
+    int have_last_guidance;
+    /** @brief 最近一次自动驾驶仪输出是否有效。 */
+    int have_last_autopilot_command;
     uint32_t last_seq;
     int have_seq;
     double last_sensor_time;
