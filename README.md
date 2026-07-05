@@ -15,6 +15,7 @@ environment_sim
 文档入口：
 
 - [新成员上手指南](docs/onboarding.md)：按阅读顺序、构建运行、工具用途和常见改法快速进入项目。
+- [工具使用指南](docs/tools.md)：说明 `instance_manager`、日志转换、回放、比较、批量统计、地图预处理、批跑和绘图工具的用法。
 - [项目框架与当前实现](docs/project_framework.md)：以现有源码为准的模块、数据流、集成状态和缺口。
 - [总体设计](docs/design.md)：系统的目标架构、数学模型、完整能力设计和当前设计收敛基线。
 - [实现计划](docs/implementation_plan.md)：P0-P8 阶段任务和验收标准。
@@ -115,6 +116,7 @@ tools/compare_logs/     对比 sensor/command 二进制日志并输出 JSON 结�
 tools/batch_stats/      聚合 summary.json 与 campaign_summary.json
 tools/map_preprocess/   ASCII 高程网格到内部地形瓦片的预处理工具
 tools/batch_runner/     批次清单入口，顺序调用 instance_manager 并可选聚合统计
+tools/plot/             轨迹、状态时序、数值诊断和批次统计 PNG 绘图工具
 configs/baseline/       基线 JSON 配置
 docs/                   当前框架、目标设计和实现计划
 scripts/                轨迹绘图辅助脚本
@@ -380,34 +382,41 @@ DEM 瓦片目录整体移动到运行环境。
 
 P5 基础能力已经可用；剩余工作主要是更多故障类型和真实数据资源。
 
-## 查看轨迹
+## 绘图工具
 
-静态或动画三维轨迹：
+推荐使用 `tools/plot/` 下的命令行绘图工具。它们读取仿真输出并生成 PNG，
+适合放入报告或回归产物：
+
+```sh
+python3 tools/plot/plot_run.py \
+  --instance-dir runs/baseline_dev_001/instance_0000 \
+  --output-dir runs/baseline_dev_001/instance_0000/plots \
+  --title-prefix baseline
+
+python3 tools/plot/plot_campaign.py \
+  --campaign runs/baseline_dev_001/campaign_summary.json \
+  --output runs/baseline_dev_001/campaign_summary.png
+```
+
+`plot_run.py` 会生成 `trajectory.png`、`timeseries.png` 和 `diagnostics.png`。
+绘图工具需要 Python，以及 `pandas`、`numpy`、`matplotlib`。
+
+旧的 `scripts/plot.py`、`scripts/ploty_plot.py` 和 `scripts/earth_plot.py`
+仍保留为交互式辅助脚本，但它们使用固定或手工输入路径，不适合批量报告。
+
+静态或动画三维轨迹辅助脚本：
 
 ```sh
 python3 scripts/plot.py
-```
-
-程序提示输入文件时填写：
-
-```text
-runs/baseline_dev_001/instance_0000/trajectory.csv
-```
-
-Plotly 动画：
-
-```sh
 python3 scripts/ploty_plot.py
 ```
 
-带地球球面的 ECEF 轨迹：
+带地球球面的 ECEF 轨迹辅助脚本：
 
 ```sh
 cd scripts
 python3 earth_plot.py
 ```
-
-绘图脚本需要 Python，以及对应脚本使用的 `pandas`、`numpy`、`matplotlib` 或 `plotly`。
 
 ## 配置文件
 

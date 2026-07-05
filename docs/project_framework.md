@@ -11,9 +11,10 @@
 
 1. [onboarding.md](onboarding.md)：先完成构建、CTest、单实例和多实例运行。
 2. 本文：理解当前源码实际分层、数据流、配置、日志和验收测试。
-3. [design.md](design.md)：理解目标架构和长期边界。
-4. [implementation_plan.md](implementation_plan.md)：按 P0-P8 阶段定位历史任务与剩余增强项。
-5. [flight_sim_software_comparison.md](flight_sim_software_comparison.md)：理解本项目与成熟飞行仿真/任务工程平台的能力差距。
+3. [tools.md](tools.md)：需要处理日志、回放、比较、批量统计、地图预处理或批跑时阅读。
+4. [design.md](design.md)：理解目标架构和长期边界。
+5. [implementation_plan.md](implementation_plan.md)：按 P0-P8 阶段定位历史任务与剩余增强项。
+6. [flight_sim_software_comparison.md](flight_sim_software_comparison.md)：理解本项目与成熟飞行仿真/任务工程平台的能力差距。
 
 如果只想快速改一个功能，先读 `onboarding.md` 的“常见修改路径”，再回到本文对应章节。
 
@@ -68,6 +69,7 @@ CMake 当前生成以下主要目标：
 | `batch_stats` | 可执行程序 | 汇总单实例或批次摘要 |
 | `map_preprocess` | 可执行程序 | 裸 ASCII/ESRI ASCII Grid 高程网格到内部地形瓦片预处理工具 |
 | `batch_runner` | 可执行程序 | 批次清单入口，顺序调用实例管理器并可选聚合统计 |
+| `tools/plot/*.py` | Python 工具 | 轨迹、状态时序、数值诊断和批次统计 PNG 绘图 |
 | `common_tests` | 测试程序 | 公共库单元测试 |
 | `environment_tests` | 测试程序 | 环境模型单元测试 |
 | `flight_control_tests` | 测试程序 | 飞控 P6 单元测试 |
@@ -98,6 +100,7 @@ tools/compare_logs/      已实现的协议日志比较工具
 tools/batch_stats/       已实现的摘要聚合工具
 tools/map_preprocess/    已实现的裸 ASCII/ESRI ASCII Grid 到内部地形瓦片预处理工具
 tools/batch_runner/      已实现的批次清单运行入口
+tools/plot/              已实现的 Python 绘图工具
 
 configs/baseline/        场景、飞控、运行时和故障基线配置
 tests/                   跨进程闭环测试

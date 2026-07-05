@@ -15,9 +15,11 @@
    - 看实际源码结构、主数据流、当前实现状态和缺口。
 4. `docs/flight_sim_software_comparison.md`
    - 理解本项目和成熟飞行仿真软件的边界差距。
-5. `docs/design.md`
+5. `docs/tools.md`
+   - 需要处理日志、回放、批量统计、地图预处理或 Monte Carlo 批跑时读。
+6. `docs/design.md`
    - 改模型、协议、主循环或飞控链路前再深入读。
-6. `docs/implementation_plan.md`
+7. `docs/implementation_plan.md`
    - 继续实现计划项时读，确认阶段验收标准。
 
 ## 2. 一句话理解系统
@@ -197,6 +199,7 @@ runs/baseline_dev_001/
 | 自动驾驶仪/命令管理 | `flight_control_sim/src/autopilot.c`, `command_manager.c` |
 | 多实例 | `tools/instance_manager/src/main.c` |
 | 回放/比较/批量 | `tools/replay`, `tools/compare_logs`, `tools/batch_stats`, `tools/batch_runner` |
+| 绘图/报告 | `tools/plot` |
 
 ## 9. 常见修改流程
 
