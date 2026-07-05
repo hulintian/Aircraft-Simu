@@ -23,6 +23,11 @@ common/               # 共享协议、数学库、日志、配置、诊断工�
 
 本项目只面向软件仿真、教学验证和工程软件架构研究。不接入真实传感器、真实执行机构或真实型号参数，不实现真实装备可直接使用的硬件驱动、总线协议或控制接口。
 
+与 JSBSim、FlightGear、X-Plane、Microsoft Flight Simulator、MathWorks Aerospace Blockset、
+NASA Trick 和 Ansys STK 等成熟平台的能力差距，见
+[flight_sim_software_comparison.md](flight_sim_software_comparison.md)。该对比文档用于界定本项目
+当前能宣称的能力、不能宣称的能力，以及后续工程增强优先级。
+
 ## 2. 设计原则
 
 ### 2.1 工业级工程原则
@@ -536,7 +541,7 @@ MapDatabase
 核心能力：
 
 ```text
-1. 根据经纬度加载地形瓦片。
+1. 从 `map.tile_path`、`map.tile_paths[]` 或 `map.tile_index_path` 加载地形瓦片。
 2. 查询指定经纬度的地形高程。
 3. 插值 DEM 网格。
 4. 计算离地高度 AGL。
@@ -593,6 +598,26 @@ $$
   -> environment_sim 运行时按需加载
 ```
 
+当前 `tools/map_preprocess` 支持三类输入：
+
+```text
+raw-grid
+  裸高程矩阵，宽高和经纬度范围由命令行给出。
+
+esri-ascii
+  ESRI ASCII Grid，经纬度范围由 ncols/nrows/xllcorner/yllcorner/cellsize 推导。
+  样本网格会从 ESRI 的北到南行序转换为内部的 lat_min 到 lat_max 行序。
+  NODATA 样本默认拒绝；显式配置 `--nodata-fill` 时才使用指定高度填补。
+
+srtm-hgt
+  SRTM HGT big-endian int16 高程文件，网格尺寸由文件大小推导，经纬度范围由
+  `N30E120.hgt` 这类文件名推导为 1 度瓦片。样本网格会从 HGT 的北到南行序转换为
+  内部的 lat_min 到 lat_max 行序；void 值 `-32768` 需要显式 `--nodata-fill`。
+```
+
+工具可通过 `--index-output tile_index.bin` 同时写出二进制空间索引，索引项包含瓦片
+经纬度边界和内部瓦片路径，用于运行时加载前筛选候选瓦片。
+
 内部瓦片建议包含：
 
 ```c
@@ -629,8 +654,12 @@ SimStatus terrain_get_height(
 预处理输出：
 
 ```text
+tile_index.txt
+  -> 文本瓦片索引，每行一个内部瓦片路径，支持空行和 # 注释
+
 tile_index.bin
-  -> 全部瓦片的经纬度范围、文件偏移、分辨率、CRC
+  -> 固定小端二进制空间索引，包含 magic、version、entry_count、
+     每个瓦片的 lat/lon 边界和路径
 
 tile_*.bin
   -> 高程网格、地表分类、有效性掩码
@@ -638,6 +667,13 @@ tile_*.bin
 map_manifest.json
   -> 原始数据来源、生成时间、坐标基准、分辨率、工具版本
 ```
+
+当前运行时支持 `map.tile_index_path` 指向上述文本索引或二进制空间索引，并把索引文件路径和展开后的
+瓦片路径列表写入 `run_manifest.json`。`map.terrain.cache_tile_count` 控制单实例固定槽位
+LRU 缓存容量；查询路径会按覆盖关系懒加载内部瓦片，二进制索引在加载前用边界筛选候选项，
+索引内相对瓦片路径按索引文件所在目录解析，容量满时淘汰最久未使用槽位。
+`summary.json` 记录缓存路径数、容量、当前加载数、累计加载数和淘汰数。
+当前闭环回归已使用合成山脊瓦片覆盖 LOS 遮挡链路；后续真实 DEM 数据集基准仍需补充磁盘缓存目录和真实 DEM LOS 闭环场景。
 
 瓦片索引项建议：
 
@@ -794,6 +830,19 @@ $$
 
 气动、推力、重力、执行机构等模型只通过该接口汇总，不在积分器内部硬编码。
 
+质量和惯量必须作为动力学状态的一部分被校验，而不是作为静态常量假设：
+
+```text
+mass > 0
+propellant_mass >= 0
+inertia_b symmetric positive definite
+quat_norm(q_bi) ~= 1
+```
+
+当前实现允许按总质量比例近似缩放惯量；后续引入推进剂分布或质心迁移时，
+必须把质心位置、惯量张量和质量流量作为同一质量模型的输出，避免推进、
+气动和积分器分别维护不一致的质量状态。
+
 ### 6.12 模型分层
 
 环境模型按以下顺序计算：
@@ -833,7 +882,72 @@ sensor_models
   -> 从真值状态生成测量帧
 ```
 
-### 6.13 数值积分器
+### 6.13 气动模型分层与包线管理
+
+气动模型按保真度分层，所有层级对积分器输出同一接口：
+
+```c
+typedef struct AeroInput {
+    double mach;
+    double alpha_rad;
+    double beta_rad;
+    double height_m;
+    double reynolds;
+    double actuator_rad[SIM_MAX_ACTUATORS];
+    Vec3 velocity_b_mps;
+} AeroInput;
+
+typedef struct AeroOutput {
+    Vec3 force_b_n;
+    Vec3 moment_b_nm;
+    uint32_t model_flags;
+    double uncertainty_scale;
+} AeroOutput;
+```
+
+气动模型层级：
+
+```text
+AERO_SIMPLE
+  当前低阶阻力/控制力/控制力矩模型。用于闭环调试、单元测试和无数据基线。
+
+AERO_TABLE
+  Mach / AoA / beta / 舵偏 / 高度或 Reynolds 数表格插值模型。
+  这是 P8 之后优先接入的工程主模型。
+
+AERO_SURROGATE
+  当前已接入固定文本格式的线性只读代理推理；后续复杂代理模型仍必须离线训练。
+  在线只允许只读推理，不允许在主循环训练或动态修改权重。
+```
+
+所有非 `AERO_SIMPLE` 模型必须声明适用包线：
+
+```text
+mach_min / mach_max
+alpha_min_rad / alpha_max_rad
+beta_min_rad / beta_max_rad
+height_min_m / height_max_m
+actuator_min_rad / actuator_max_rad
+```
+
+当输入超出包线时，模型不能静默外推。必须按配置执行以下策略之一：
+
+```text
+ERROR
+  拒绝本步仿真并记录错误。
+
+CLAMP_AND_WARN
+  钳位到包线边界，置 `AERO_FLAG_EXTRAPOLATED` 并写事件日志。
+
+HOLD_LAST_VALID
+  使用上一帧有效气动输出，置降级标志。
+```
+
+气动数据库文件应是只读资源，可由多个实例共享，但运行期不得写入。表格插值和代理
+模型推理必须是确定性的；同一配置、同一随机种子和同一输入轨迹应产生逐帧一致的
+气动力和力矩。
+
+### 6.14 数值积分器
 
 积分器需要统一接口：
 
@@ -861,6 +975,25 @@ $$
 $$
 
 其中 $\Phi$ 由选择的积分器和动力学模型共同决定。
+
+积分器必须提供诊断输出，至少包括：
+
+```text
+quat_norm_error
+dcm_orthogonality_error
+mass_positive
+inertia_positive_definite
+max_force_norm
+max_moment_norm
+aero_model_flags
+model_degradation_flags
+integrator_type
+dt_s
+```
+
+这些诊断不参与控制闭环，但必须进入轨迹或诊断日志，用于回归、批量统计和数值健康
+审计。固定场景下应支持 Euler/RK2/RK4 对照测试；RK4 是默认工业基线，Euler 仅用于
+调试和误差趋势对照。
 
 ## 7. 执行机构模型
 
@@ -1549,7 +1682,7 @@ ABORT_BY_OPERATOR
   },
   "map": {
     "database_path": "data/maps/internal_tiles",
-    "tile_index": "data/maps/tile_index.bin",
+    "tile_index_path": "data/maps/tile_index.bin",
     "enable_terrain": true,
     "enable_los_occlusion": true,
     "missing_tile_policy": "ERROR",
@@ -1583,11 +1716,24 @@ ABORT_BY_OPERATOR
   },
   "aerodynamics": {
     "enabled": true,
+    "model": "SIMPLE",
     "reference_area_m2": 0.01,
     "reference_length_m": 1.0,
     "drag_coefficient": 0.1,
     "control_force_coefficient": 0.0,
-    "control_moment_coefficient": 0.0
+    "control_moment_coefficient": 0.0,
+    "database": {
+      "path": "data/aero/example_table.csv",
+      "inputs": ["mach", "alpha_rad", "beta_rad", "pitch_fin_rad", "yaw_fin_rad"],
+      "outputs": ["cx", "cy", "cz", "cl", "cm", "cn"],
+      "extrapolation_policy": "CLAMP_AND_WARN"
+    },
+    "envelope": {
+      "mach": [0.0, 5.0],
+      "alpha_rad": [-0.35, 0.35],
+      "beta_rad": [-0.35, 0.35],
+      "height_m": [0.0, 30000.0]
+    }
   },
   "target": {
     "model": "SCRIPTED",
@@ -1807,10 +1953,24 @@ config_file_list
 config_crc32
 random_seed
 run_mode
+aero_table_path
+aero_table_file_version
+aero_table_extrapolation_policy_source
+aero_table_height_min_m / aero_table_height_max_m
+aero_table_actuator_min_rad / aero_table_actuator_max_rad
+terrain_missing_policy
+terrain_tile_paths
 start_time_wall_clock
 env_port
 fc_port
 ```
+
+当前实现的 `run_manifest.json` 已记录软件/协议版本、配置路径、端口、步长、
+实例随机种子、气动表启用状态、气动表路径、内部气动表文件格式版本、
+气动表包络外策略来源/覆盖值、可选气动表高度/舵偏包线元数据、
+地形启用状态、LOS 遮挡开关、缺瓦片策略、
+平坦填充高度和加载的地形瓦片路径列表；可选 surrogate 模型路径、模型版本和训练数据版本
+也会进入 manifest。`git_commit` 和完整配置 CRC 仍属于后续可复现性增强项。
 
 ## 13. 日志与回放
 
@@ -1827,6 +1987,7 @@ runs/<campaign_id>/
     sensor_log.bin
     command_log.bin
     fc_internal_log.bin
+    trajectory_diagnostics.csv
     event_log.txt
     summary.json
   instance_0001/
@@ -1848,6 +2009,9 @@ command_log.bin
 fc_internal_log.bin
   飞控内部状态、制导输出、保护动作
 
+trajectory_diagnostics.csv
+  数值健康、模型包线、积分器和气动模型状态
+
 event_log.txt
   人可读事件日志
 
@@ -1856,6 +2020,29 @@ summary.json
 ```
 
 `campaign_summary.json` 由 `instance_manager` 汇总生成，记录全部实例的运行状态、脱靶量统计、故障统计和失败原因。
+
+诊断日志至少记录：
+
+```text
+sim_time
+quat_norm_error
+dcm_orthogonality_error
+mass_kg
+propellant_mass_kg
+inertia_min_eigenvalue
+aero_model_flags
+aero_uncertainty_scale
+integrator_type
+dt_s
+max_force_norm
+max_moment_norm
+```
+
+`aero_model_flags` 用于标记气动表外推、钳位、上一帧保持、代理模型失效或缺失数据。
+`model_degradation_flags` 汇总气动告警、地形查询告警、质量/惯量无效和姿态数值误差，
+并以 `model_degradation_flags_or` 进入 `summary.json`、`campaign_summary.json` 和
+`batch_stats`。
+该字段必须进入单实例摘要和批量统计，避免模型越界在回归中被命中结果掩盖。
 
 ### 13.2 关键指标
 
@@ -1914,12 +2101,70 @@ $$
 4. 对比两次环境真值差异。
 ```
 
+P8 工具链按职责拆分：
+
+```text
+tools/replay
+  输入 sensor_log.bin、flight_control.json、instance_id。
+  重新驱动飞控静态库或 flight_control_sim，生成 replayed_command_log.bin。
+
+tools/compare_logs
+  输入两个 command_log.bin 或 truth_log.bin。
+  按帧校验序号、时间戳、模式、状态位和浮点字段差异。
+  输出首个发散帧、最大差异和阈值判定。
+
+tools/batch_stats
+  输入多个 summary.json 或 campaign_summary.json。
+  输出命中率、脱靶量均值/标准差、失败原因分布、故障影响统计、
+  数值诊断采样数、最大四元数范数误差、最大 DCM 正交性误差、最小质量、
+  最小惯量、模型降级 flags 按位或、气动 flags 按位或、气动外推采样数和
+  wall-clock 性能统计。
+
+tools/batch_runner
+  输入手写运行清单并顺序调用 instance_manager，或从 runtime 模板确定性展开 Monte Carlo
+  样本清单。模板占位符包括 `${sample_index}`、`${random_seed}`、
+  `${sample_output_dir}`、`${uniform:stream:min:max}` 形式的确定性均匀扰动，
+  `${lhs_uniform:stream:min:max}` 形式的确定性 LHS 均匀分层扰动，
+  `${halton_uniform:base:min:max}` 形式的确定性 Halton 低差异均匀扰动，
+  `${normal:stream:mean:stddev}` 形式的确定性正态扰动、
+  `${lognormal:stream:mu:sigma}` 形式的确定性对数正态扰动、
+  `${truncated_normal:stream:mean:stddev:min:max}` 形式的确定性截断正态扰动、
+  `${choice:stream:option|option}` 形式的确定性离散选择，以及
+  `${correlated_normal:stream:base_stream:mean:stddev:rho}` 形式的确定性相关正态扰动。
+```
+
+回放比较不是简单逐字节比较。浮点字段使用绝对/相对阈值，协议字段、状态位、
+实例号、序号和模式字段必须精确一致。比较结果至少包含：
+
+```text
+frame_count_left
+frame_count_right
+first_divergent_frame
+max_abs_error
+max_rel_error
+status_bit_mismatch_count
+mode_mismatch_count
+verdict
+```
+
+固定随机种子回归应同时保留两类基准：
+
+```text
+byte_exact_baseline
+  适用于协议日志、固定平台和确定性模块。
+
+tolerance_baseline
+  适用于跨平台浮点、气动表/代理模型和长时间积分。
+```
+
 ## 14. 故障注入
 
 ### 14.1 传感器故障
 
 ```text
 SENSOR_FAULT_BIAS
+SENSOR_FAULT_DRIFT
+SENSOR_FAULT_RAMP_BIAS
 SENSOR_FAULT_NOISE_INCREASE
 SENSOR_FAULT_DROPOUT
 SENSOR_FAULT_STUCK
@@ -1981,6 +2226,9 @@ L4 批量 Monte Carlo
 
 L5 回归测试
   固定场景、固定随机种子、固定输出基准
+
+L6 数值与包线审计
+  积分器误差趋势、四元数/惯量不变量、气动模型包线和外推报警
 ```
 
 ### 15.2 单元测试要求
@@ -2014,12 +2262,17 @@ NaN 输入被拒绝
 
 ```text
 六自由度状态积分接口正确
+四元数范数保持在容差内
+DCM 正交性保持在容差内
+质量为正、惯量正定
 执行机构一阶响应正确
 传感器延迟正确
 导引头相对量正确
 目标机动模型正确
 故障注入按时触发
 命中/脱靶判定正确
+气动模型边界输入有限且方向合理
+气动表外推按策略报警或拒绝
 ```
 
 ### 15.3 回归判据
@@ -2048,6 +2301,52 @@ $$
 \le
 \epsilon_u
 $$
+
+数值健康判据：
+
+$$
+\left|
+\left\|\mathbf q_{BI}\right\| - 1
+\right|
+\le
+\epsilon_q
+$$
+
+$$
+\left\|
+\mathbf C\mathbf C^\mathsf{T} - \mathbf I
+\right\|_F
+\le
+\epsilon_C
+$$
+
+其中 $\epsilon_q$ 和 $\epsilon_C$ 由回归配置给出。若质量非正、惯量非正定、
+气动模型包线错误、协议状态位不一致或实例输出目录冲突，回归必须失败，不允许只按
+命中结果判定通过。
+
+### 15.4 新增模型的验证门槛
+
+新增气动表或代理模型必须先通过离线测试，再接入闭环主链路。当前线性代理模型已覆盖
+固定格式加载、缺项拒绝、Mach/alpha/beta 线性推理和气动力主路径单测：
+
+```text
+1. 配置和数据文件校验：维度、单位、单调网格、缺失值、CRC 或版本。
+2. 插值/推理测试：网格点精确、单元内部连续、边界有限，或代理输出有限且可解释。
+3. 包线测试：低于/高于范围时执行 ERROR、CLAMP_AND_WARN 或 HOLD_LAST_VALID。
+4. 方向测试：阻力方向与相对速度相反，控制面偏转产生的力矩符号可解释。
+5. 闭环回归：同一随机种子下命令日志和摘要满足阈值。
+```
+
+新增回放或批量统计工具必须覆盖：
+
+```text
+1. 正常日志。
+2. 截断日志。
+3. CRC 错误日志。
+4. 实例号不匹配日志。
+5. 帧数不一致日志。
+6. 首帧和中间帧发散定位。
+```
 
 容差由测试配置指定。
 
@@ -2363,13 +2662,31 @@ scenario/runtime
   -> SensorFrame
 ```
 
-当前代码已经接入该主链路，但仍保留两项工程边界：
+当前代码已经接入该主链路，但仍保留以下工程边界：
 
 - 飞控输出仍解释为 ECEF 加速度级虚拟指令，再换算为等效机体系控制力。
-- 气动模型当前为可配置低阶模型，不是气动表插值模型。
+- 气动模型默认 baseline 为可配置低阶模型；配置 `aerodynamics.table_path`
+  时可加载版本化 v1 气动表进入统一力模型。v1 表执行 Mach/AoA/beta 插值，
+  高度/舵偏当前作为包线元数据进入 manifest，完整多维插值仍属于后续 v2 表格式。
+- 数值诊断、模型降级 flags 和气动 flags 已写入 `trajectory_diagnostics.csv`，并聚合到
+  `summary.json`、`campaign_summary.json` 和 `batch_stats`。
 
 因此当前环境程序可用于闭环结构、数值积分、坐标系统、传感器接口和多实例验证；
-在气动表、控制面分配、真实 DEM 和完整故障链路完成前，不把它描述为高保真型号仿真。
+在控制面分配、真实 DEM 数据基准、完整故障链路和真实气动数据基准完成前，不把它描述为高保真型号仿真。
+
+下一阶段环境设计基线为：
+
+```text
+低阶模型可运行
+  -> 表格气动可校验
+  -> 包线越界可报警
+  -> 数值不变量可审计
+  -> 批量统计可回归
+```
+
+气动表和代理模型都必须保持只读、确定性和实例隔离。代理模型不作为 P5/P6 正确性
+前置条件；当前已接入最小线性只读推理，复杂代理模型仍属于 P8 之后的模型保真度扩展，
+必须先通过表格模型同等级的包线和回放验证。
 
 ### 21.3 传感器设计基线
 
@@ -2423,9 +2740,10 @@ $$
 - 大地坐标、高度和 AGL：当前作为派生地理测量直接写入帧。
 
 基础 `faults.json` 已接入环境主链路，可按仿真时间触发传感器偏置、
-传感器强制无效/丢包、虚拟执行机构卡滞和命令缩放，并记录开始/恢复事件。
-单实例和成功批次会汇总故障触发次数和影响步数。尚未完成的是更完整的故障类型库、
-真实 DEM 遮挡闭环场景和更多工程级故障恢复模式。
+线性漂移、斜坡恢复偏置、传感器强制无效/丢包、锁步安全整帧通信丢失、
+锁步安全通信帧延迟、锁步安全上一帧重放乱序、通信恢复保持窗口、虚拟执行机构卡滞和命令缩放，
+并记录开始/恢复事件。单实例和成功批次会汇总故障触发次数和影响步数。
+尚未完成的是非锁步乱序恢复等更完整故障类型库、真实 DEM 遮挡闭环场景和长时间恢复策略；合成山脊瓦片闭环已覆盖 LOS 遮挡保护链路。
 
 ### 21.4 飞控程序设计基线
 
@@ -2562,16 +2880,20 @@ P5 完成判据：
 - 故障按仿真时间触发，能作用于传感器有效位、测量值或执行机构。当前基础能力已实现。
 - 触发、持续、恢复和拒绝原因写入 `event_log.txt`。当前开始/恢复事件已实现。
 - `summary.json` 和成功实例的 `campaign_summary.json` 汇总故障统计。当前基础能力已实现。
-- 闭环测试覆盖延迟预热、丢包、至少一种脚本故障和固定种子双跑一致性。当前基础能力已实现。
+- 闭环测试覆盖延迟预热、丢包、通信帧延迟、上一帧重放乱序、至少一种脚本故障和固定种子双跑一致性。当前基础能力已实现。
+- 环境诊断日志覆盖四元数范数、DCM 正交性、质量/惯量有效性和气动包线状态。
+- 气动表模型接入时，必须覆盖插值、边界、外推策略、文件校验和闭环回归。
 
 P6 完成判据：
 
 - 飞控模块形成可测试静态库。当前已实现。
-- PNG 有独立单元测试，覆盖 LOS 方向、限幅和异常输入。当前已实现基础覆盖。
+- PNG 有独立单元测试，覆盖 LOS 方向、加速度限幅、负闭合速度和 NaN 距离拒绝。
+  当前已实现基础覆盖。
 - 加速度变化率限制接入主链路。当前已实现。
 - 状态机、命令保持、传感器超时和 NaN/Inf 保护有单元测试或闭环回归。当前已实现基础覆盖。
-- 姿态/角速度自动驾驶仪、执行机构/舵面控制分配和多速率任务执行当前已进入主链路。
-- 飞控内部持久化日志和更完整控制律验证完成后，P6 才可标记为完全完成。
+- 姿态/角速度自动驾驶仪、执行机构/舵面控制分配和多速率任务执行当前已进入主链路；
+  单测覆盖内环开启分配路径、内环关闭的加速度透传路径和连续帧限幅/速率/舵偏边界。
+- 高保真控制品质基准和更完整控制律验证完成后，P6 才可标记为完全完成。
 
 P7 完成判据：
 
@@ -2588,5 +2910,18 @@ P8 完成判据：
 
 - `sensor_log.bin` 可回放驱动飞控。
 - `command_log.bin` 可转换为可读格式。当前 `tools/log_convert` 已支持 `sensor_log.bin` 和 `command_log.bin` 转 CSV。
+- `compare_logs` 可定位首个发散帧，并输出浮点阈值、模式和状态位差异。
 - 批量运行能输出脱靶量统计、成功率、失败原因分布和配置快照。
 - 回放结果在固定种子下可重复。
+- 批量统计必须聚合故障影响、气动包线越界、数值不变量异常和子进程失败原因。
+  当前已聚合故障影响、基础数值不变量、模型降级 flags 和气动 flags。
+- 可选压力回归通过 `MISSILE_ENABLE_LONG_TESTS=ON` 启用，当前覆盖 6 实例、
+  并发上限 3 的闭环运行和 wall-clock 汇总字段；真实大规模长时资源压测仍属于外部环境扩展。
+- 回归配置必须区分逐字节基准和容差基准。
+
+P8 之后模型保真度扩展判据：
+
+- `AERO_TABLE` 具备版本化数据格式、CRC/单位校验、插值测试、外推报警和可选闭环接入。
+- `AERO_SURROGATE` 只允许离线训练、在线只读推理，并在 `run_manifest.json`
+  中记录模型版本、训练数据版本和适用包线。
+- 真实 DEM 加载链必须有缺瓦片错误路径、真实 DEM LOS 遮挡闭环场景和地图预处理工具回归；当前已具备 SRTM HGT 预处理回归和合成山脊 LOS 遮挡闭环回归。

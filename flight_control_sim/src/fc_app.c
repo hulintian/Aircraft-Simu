@@ -21,10 +21,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #define FC_PACKET_BUFFER_SIZE 1024u
+#define FC_INTERNAL_LOG_WIRE_SIZE 92u
 
 typedef struct FcRuntimeConfig {
     /** @brief 环境进程 UDP 基础端口。 */
@@ -33,6 +35,12 @@ typedef struct FcRuntimeConfig {
     unsigned int fc_base_port;
     /** @brief 环境目标 IPv4 地址。 */
     char host[64];
+    /** @brief 本次任务输出根目录。 */
+    char output_dir[256];
+    /** @brief 是否输出飞控内部二进制日志。 */
+    int binary_logs;
+    /** @brief 日志刷新周期，单位帧。 */
+    unsigned int flush_every_steps;
 } FcRuntimeConfig;
 
 /** @brief 从飞控配置中读取安全保护参数。 */
@@ -146,7 +154,22 @@ static SimStatus load_runtime_config(const ConfigTree *runtime, FcRuntimeConfig 
         return status;
     }
     status = config_get_string(runtime, "network.host", out->host, sizeof(out->host));
-    return status;
+    if (status != SIM_OK) {
+        return status;
+    }
+    status = config_get_string(runtime, "logging.output_dir", out->output_dir, sizeof(out->output_dir));
+    if (status != SIM_OK) {
+        out->output_dir[0] = '\0';
+    }
+    status = config_get_bool(runtime, "logging.binary_logs", &out->binary_logs);
+    if (status != SIM_OK) {
+        out->binary_logs = 1;
+    }
+    status = config_get_uint32(runtime, "logging.flush_every_steps", &out->flush_every_steps);
+    if (status != SIM_OK || out->flush_every_steps == 0u) {
+        out->flush_every_steps = 100u;
+    }
+    return SIM_OK;
 }
 
 /** @brief 从飞控配置中读取 PNG 参数。 */
@@ -299,6 +322,112 @@ static SimStatus send_ready_heartbeat(
     return sent == (ssize_t)packet_size ? SIM_OK : SIM_ERR_IO;
 }
 
+/** @brief 写入小端 32 位无符号整数。 */
+static void write_u32_le(unsigned char *out, uint32_t value)
+{
+    out[0] = (unsigned char)(value & UINT32_C(0xff));
+    out[1] = (unsigned char)((value >> 8u) & UINT32_C(0xff));
+    out[2] = (unsigned char)((value >> 16u) & UINT32_C(0xff));
+    out[3] = (unsigned char)((value >> 24u) & UINT32_C(0xff));
+}
+
+/** @brief 写入小端双精度浮点。 */
+static void write_f64_le(unsigned char *out, double value)
+{
+    uint64_t bits;
+    unsigned int index;
+
+    (void)memcpy(&bits, &value, sizeof(bits));
+    for (index = 0u; index < 8u; ++index) {
+        out[index] = (unsigned char)((bits >> (8u * index)) & UINT64_C(0xff));
+    }
+}
+
+/** @brief 创建飞控内部日志实例目录。 */
+static SimStatus make_fc_instance_dir(
+    const char *base_dir,
+    uint32_t instance_id,
+    char *instance_dir,
+    size_t instance_dir_size)
+{
+    int written;
+
+    if (base_dir == 0 || base_dir[0] == '\0' || instance_dir == 0 || instance_dir_size == 0u) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    (void)mkdir("runs", 0777);
+    if (mkdir(base_dir, 0777) != 0 && errno != EEXIST) {
+        return SIM_ERR_IO;
+    }
+    written = snprintf(instance_dir, instance_dir_size, "%s/instance_%04u", base_dir, instance_id);
+    if (written < 0 || (size_t)written >= instance_dir_size) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    if (mkdir(instance_dir, 0777) != 0 && errno != EEXIST) {
+        return SIM_ERR_IO;
+    }
+    return SIM_OK;
+}
+
+/** @brief 打开飞控内部持久化日志。 */
+static FILE *open_internal_log(const FcRuntimeConfig *runtime, uint32_t instance_id)
+{
+    char instance_dir[512];
+    char path[1024];
+
+    if (runtime == 0 || runtime->binary_logs == 0 || runtime->output_dir[0] == '\0') {
+        return 0;
+    }
+    if (make_fc_instance_dir(runtime->output_dir, instance_id, instance_dir, sizeof(instance_dir)) != SIM_OK) {
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/fc_internal_log.bin", instance_dir);
+    return fopen(path, "wb");
+}
+
+/** @brief 写入一帧飞控内部状态日志。 */
+static SimStatus write_internal_log(FILE *file, const ControlCommand *command)
+{
+    unsigned char record[FC_INTERNAL_LOG_WIRE_SIZE];
+    size_t offset = 0u;
+
+    if (file == 0) {
+        return SIM_OK;
+    }
+    if (command == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    write_u32_le(&record[offset], command->seq);
+    offset += 4u;
+    write_f64_le(&record[offset], command->sim_time);
+    offset += 8u;
+    write_u32_le(&record[offset], command->command_mode);
+    offset += 4u;
+    write_u32_le(&record[offset], command->command_status);
+    offset += 4u;
+    write_f64_le(&record[offset], command->accel_cmd_ecef.x);
+    offset += 8u;
+    write_f64_le(&record[offset], command->accel_cmd_ecef.y);
+    offset += 8u;
+    write_f64_le(&record[offset], command->accel_cmd_ecef.z);
+    offset += 8u;
+    write_f64_le(&record[offset], command->attitude_cmd.x);
+    offset += 8u;
+    write_f64_le(&record[offset], command->attitude_cmd.y);
+    offset += 8u;
+    write_f64_le(&record[offset], command->attitude_cmd.z);
+    offset += 8u;
+    write_f64_le(&record[offset], command->body_rate_cmd.x);
+    offset += 8u;
+    write_f64_le(&record[offset], command->body_rate_cmd.y);
+    offset += 8u;
+    write_f64_le(&record[offset], command->body_rate_cmd.z);
+    offset += 8u;
+    return offset == sizeof(record) && fwrite(record, 1u, sizeof(record), file) == sizeof(record) ?
+        SIM_OK :
+        SIM_ERR_IO;
+}
+
 /** @brief 运行飞控仿真主循环。 */
 SimStatus fc_app_run(const FcContext *ctx)
 {
@@ -313,6 +442,8 @@ SimStatus fc_app_run(const FcContext *ctx)
     unsigned int fc_port;
     unsigned int env_port;
     FcMode last_reported_mode = FC_POWER_ON;
+    FILE *internal_log = 0;
+    uint32_t logged_frames = 0u;
 
     if (ctx == 0 || ctx->flight_control_path == 0 || ctx->runtime_path == 0) {
         return SIM_ERR_INVALID_ARG;
@@ -393,6 +524,7 @@ SimStatus fc_app_run(const FcContext *ctx)
         config_free(&runtime_tree);
         return status;
     }
+    internal_log = open_internal_log(&runtime_cfg, ctx->instance_id);
 
     fc_port = runtime_cfg.fc_base_port + (2u * ctx->instance_id);
     env_port = runtime_cfg.env_base_port + (2u * ctx->instance_id);
@@ -466,6 +598,18 @@ SimStatus fc_app_run(const FcContext *ctx)
                 fc_mode_to_string((FcMode)command.command_mode),
                 command.command_status);
         }
+        status = write_internal_log(internal_log, &command);
+        if (status != SIM_OK) {
+            (void)fprintf(stderr, "flight_control_sim: internal log failed: %s\n",
+                sim_status_to_string(status));
+            break;
+        }
+        ++logged_frames;
+        if (internal_log != 0 &&
+            runtime_cfg.flush_every_steps > 0u &&
+            (logged_frames % runtime_cfg.flush_every_steps) == 0u) {
+            (void)fflush(internal_log);
+        }
         from.sin_port = htons((uint16_t)env_port);
         status = send_control_command(sock, &from, ctx->instance_id, &command);
         if (status != SIM_OK) {
@@ -475,6 +619,9 @@ SimStatus fc_app_run(const FcContext *ctx)
 
     if (sock >= 0) {
         (void)close(sock);
+    }
+    if (internal_log != 0) {
+        (void)fclose(internal_log);
     }
     config_free(&fc_tree);
     config_free(&runtime_tree);

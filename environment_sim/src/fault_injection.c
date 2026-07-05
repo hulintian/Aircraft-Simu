@@ -165,7 +165,11 @@ static SimStatus parse_target(const char *text, FaultTarget *target)
     if (text == 0 || target == 0) {
         return SIM_ERR_INVALID_ARG;
     }
-    if (strcmp(text, "sensor.seeker") == 0) {
+    if (strcmp(text, "sensor.frame") == 0 ||
+        strcmp(text, "sensor.packet") == 0 ||
+        strcmp(text, "communication.sensor_frame") == 0) {
+        *target = FAULT_TARGET_SENSOR_FRAME;
+    } else if (strcmp(text, "sensor.seeker") == 0) {
         *target = FAULT_TARGET_SENSOR_SEEKER;
     } else if (strcmp(text, "sensor.seeker.range") == 0) {
         *target = FAULT_TARGET_SENSOR_SEEKER_RANGE;
@@ -209,6 +213,10 @@ static SimStatus parse_type(const char *text, FaultType *type)
         *type = FAULT_TYPE_BIAS;
     } else if (strcmp(text, "DROPOUT") == 0) {
         *type = FAULT_TYPE_DROPOUT;
+    } else if (strcmp(text, "COMMUNICATION_LOSS") == 0 ||
+        strcmp(text, "COMM_DROPOUT") == 0 ||
+        strcmp(text, "FRAME_DROPOUT") == 0) {
+        *type = FAULT_TYPE_DROPOUT;
     } else if (strcmp(text, "FORCE_INVALID") == 0 ||
         strcmp(text, "INVALID") == 0) {
         *type = FAULT_TYPE_FORCE_INVALID;
@@ -216,6 +224,24 @@ static SimStatus parse_type(const char *text, FaultType *type)
         *type = FAULT_TYPE_STUCK;
     } else if (strcmp(text, "SCALE") == 0) {
         *type = FAULT_TYPE_SCALE;
+    } else if (strcmp(text, "DRIFT") == 0) {
+        *type = FAULT_TYPE_DRIFT;
+    } else if (strcmp(text, "RAMP_BIAS") == 0 ||
+        strcmp(text, "RAMP") == 0) {
+        *type = FAULT_TYPE_RAMP_BIAS;
+    } else if (strcmp(text, "HOLD_VALUE") == 0 ||
+        strcmp(text, "CONSTANT") == 0 ||
+        strcmp(text, "STUCK_VALUE") == 0) {
+        *type = FAULT_TYPE_HOLD_VALUE;
+    } else if (strcmp(text, "COMMUNICATION_DELAY") == 0 ||
+        strcmp(text, "COMM_DELAY") == 0 ||
+        strcmp(text, "FRAME_DELAY") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_DELAY;
+    } else if (strcmp(text, "COMMUNICATION_REORDER") == 0 ||
+        strcmp(text, "COMM_REORDER") == 0 ||
+        strcmp(text, "FRAME_REORDER") == 0 ||
+        strcmp(text, "PACKET_REORDER") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_REORDER;
     } else {
         return SIM_ERR_CONFIG;
     }
@@ -226,6 +252,11 @@ static SimStatus parse_type(const char *text, FaultType *type)
 static uint32_t target_valid_mask(FaultTarget target)
 {
     switch (target) {
+    case FAULT_TARGET_SENSOR_FRAME:
+        return SIM_SENSOR_VALID_SEEKER |
+            SIM_SENSOR_VALID_IMU_GYRO |
+            SIM_SENSOR_VALID_ACCEL |
+            SIM_SENSOR_VALID_SPEED;
     case FAULT_TARGET_SENSOR_SEEKER:
     case FAULT_TARGET_SENSOR_SEEKER_RANGE:
     case FAULT_TARGET_SENSOR_SEEKER_LOS_UNIT:
@@ -247,6 +278,11 @@ static uint32_t target_valid_mask(FaultTarget target)
 static uint32_t target_fault_mask(FaultTarget target)
 {
     switch (target) {
+    case FAULT_TARGET_SENSOR_FRAME:
+        return SIM_SENSOR_FAULT_SEEKER_DROPOUT |
+            SIM_SENSOR_FAULT_IMU_DROPOUT |
+            SIM_SENSOR_FAULT_ACCEL_DROPOUT |
+            SIM_SENSOR_FAULT_SPEED_DROPOUT;
     case FAULT_TARGET_SENSOR_SEEKER:
     case FAULT_TARGET_SENSOR_SEEKER_RANGE:
     case FAULT_TARGET_SENSOR_SEEKER_LOS_UNIT:
@@ -297,11 +333,33 @@ static int fault_type_matches_target(const FaultDefinition *fault)
         fault->type == FAULT_TYPE_FORCE_INVALID) {
         return target_valid_mask(fault->target) != 0u;
     }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_DELAY) {
+        return fault->target == FAULT_TARGET_SENSOR_FRAME;
+    }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_REORDER) {
+        return fault->target == FAULT_TARGET_SENSOR_FRAME;
+    }
     if (fault->type == FAULT_TYPE_STUCK ||
         fault->type == FAULT_TYPE_SCALE) {
         return target_actuator_index(fault->target, &actuator_index);
     }
-    if (fault->type != FAULT_TYPE_BIAS) {
+    if (fault->type == FAULT_TYPE_HOLD_VALUE) {
+        switch (fault->target) {
+        case FAULT_TARGET_SENSOR_SEEKER_RANGE:
+        case FAULT_TARGET_SENSOR_SEEKER_LOS_UNIT:
+        case FAULT_TARGET_SENSOR_SEEKER_LOS_RATE:
+        case FAULT_TARGET_SENSOR_SEEKER_CLOSING_VELOCITY:
+        case FAULT_TARGET_SENSOR_IMU_GYRO:
+        case FAULT_TARGET_SENSOR_ACCEL:
+        case FAULT_TARGET_SENSOR_SPEED:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    if (fault->type != FAULT_TYPE_BIAS &&
+        fault->type != FAULT_TYPE_DRIFT &&
+        fault->type != FAULT_TYPE_RAMP_BIAS) {
         return 0;
     }
     switch (fault->target) {
@@ -318,12 +376,28 @@ static int fault_type_matches_target(const FaultDefinition *fault)
     }
 }
 
+/** @brief 判断故障是否属于通信层传感器帧故障。 */
+static int fault_is_sensor_frame_communication(const FaultDefinition *fault)
+{
+    if (fault == 0 || fault->target != FAULT_TARGET_SENSOR_FRAME) {
+        return 0;
+    }
+    return fault->type == FAULT_TYPE_DROPOUT ||
+        fault->type == FAULT_TYPE_FORCE_INVALID ||
+        fault->type == FAULT_TYPE_COMMUNICATION_DELAY ||
+        fault->type == FAULT_TYPE_COMMUNICATION_REORDER;
+}
+
 /** @brief 将单条激活故障累加到本步效果。 */
-static SimStatus accumulate_fault(const FaultDefinition *fault, FaultStepEffects *effects)
+static SimStatus accumulate_fault(
+    const FaultDefinition *fault,
+    double sim_time_s,
+    FaultStepEffects *effects)
 {
     size_t actuator_index;
+    double value_scale = 1.0;
 
-    if (fault == 0 || effects == 0) {
+    if (fault == 0 || effects == 0 || !isfinite(sim_time_s)) {
         return SIM_ERR_INVALID_ARG;
     }
     ++effects->active_fault_count;
@@ -331,6 +405,17 @@ static SimStatus accumulate_fault(const FaultDefinition *fault, FaultStepEffects
         fault->type == FAULT_TYPE_FORCE_INVALID) {
         effects->sensor_valid_clear_mask |= target_valid_mask(fault->target);
         effects->sensor_fault_set_mask |= target_fault_mask(fault->target);
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_DELAY) {
+        effects->communication_delay_enabled = 1;
+        if (fault->delay_steps > effects->communication_delay_steps) {
+            effects->communication_delay_steps = fault->delay_steps;
+        }
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_REORDER) {
+        effects->communication_reorder_enabled = 1;
         return SIM_OK;
     }
     if (fault->type == FAULT_TYPE_STUCK) {
@@ -347,36 +432,111 @@ static SimStatus accumulate_fault(const FaultDefinition *fault, FaultStepEffects
         effects->actuator_command_scale[actuator_index] *= fault->scale;
         return SIM_OK;
     }
-    if (fault->type != FAULT_TYPE_BIAS) {
+    if (fault->type == FAULT_TYPE_HOLD_VALUE) {
+        switch (fault->target) {
+        case FAULT_TARGET_SENSOR_SEEKER_RANGE:
+            effects->seeker_range_hold_enabled = 1;
+            effects->seeker_range_hold_m = fault->scalar_value;
+            break;
+        case FAULT_TARGET_SENSOR_SEEKER_LOS_UNIT:
+            effects->seeker_los_unit_hold_enabled = 1;
+            effects->seeker_los_unit_hold = fault->vector_value;
+            break;
+        case FAULT_TARGET_SENSOR_SEEKER_LOS_RATE:
+            effects->seeker_los_rate_hold_enabled = 1;
+            effects->seeker_los_rate_hold_radps = fault->vector_value;
+            break;
+        case FAULT_TARGET_SENSOR_SEEKER_CLOSING_VELOCITY:
+            effects->seeker_closing_velocity_hold_enabled = 1;
+            effects->seeker_closing_velocity_hold_mps = fault->scalar_value;
+            break;
+        case FAULT_TARGET_SENSOR_IMU_GYRO:
+            effects->gyro_hold_enabled = 1;
+            effects->gyro_hold_b_radps = fault->vector_value;
+            break;
+        case FAULT_TARGET_SENSOR_ACCEL:
+            effects->accel_hold_enabled = 1;
+            effects->accel_hold_ecef_mps2 = fault->vector_value;
+            break;
+        case FAULT_TARGET_SENSOR_SPEED:
+            effects->speed_hold_enabled = 1;
+            effects->speed_hold_ecef_mps = fault->vector_value;
+            break;
+        default:
+            return SIM_ERR_CONFIG;
+        }
+        effects->sensor_fault_set_mask |= target_fault_mask(fault->target);
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_DRIFT) {
+        value_scale = sim_time_s - fault->start_time_s;
+        if (value_scale < 0.0) {
+            value_scale = 0.0;
+        }
+    } else if (fault->type == FAULT_TYPE_RAMP_BIAS) {
+        const double window_end_s = fault->start_time_s + fault->duration_s;
+
+        if (sim_time_s < window_end_s) {
+            if (fault->ramp_in_s > 0.0) {
+                value_scale = (sim_time_s - fault->start_time_s) / fault->ramp_in_s;
+                if (value_scale > 1.0) {
+                    value_scale = 1.0;
+                }
+                if (value_scale < 0.0) {
+                    value_scale = 0.0;
+                }
+            }
+        } else if (fault->recovery_ramp_s > 0.0) {
+            value_scale = 1.0 - ((sim_time_s - window_end_s) / fault->recovery_ramp_s);
+            if (value_scale > 1.0) {
+                value_scale = 1.0;
+            }
+            if (value_scale < 0.0) {
+                value_scale = 0.0;
+            }
+        } else {
+            value_scale = 0.0;
+        }
+    } else if (fault->type != FAULT_TYPE_BIAS) {
         return SIM_ERR_CONFIG;
     }
 
     switch (fault->target) {
     case FAULT_TARGET_SENSOR_SEEKER_RANGE:
-        effects->seeker_range_bias_m += fault->scalar_value;
+        effects->seeker_range_bias_m += fault->scalar_value * value_scale;
         break;
     case FAULT_TARGET_SENSOR_SEEKER_LOS_UNIT:
         effects->seeker_los_unit_bias =
-            vec3_add(effects->seeker_los_unit_bias, fault->vector_value);
+            vec3_add(
+                effects->seeker_los_unit_bias,
+                vec3_scale(fault->vector_value, value_scale));
         break;
     case FAULT_TARGET_SENSOR_SEEKER_LOS_RATE:
         effects->seeker_los_rate_bias_radps =
-            vec3_add(effects->seeker_los_rate_bias_radps, fault->vector_value);
+            vec3_add(
+                effects->seeker_los_rate_bias_radps,
+                vec3_scale(fault->vector_value, value_scale));
         break;
     case FAULT_TARGET_SENSOR_SEEKER_CLOSING_VELOCITY:
-        effects->seeker_closing_velocity_bias_mps += fault->scalar_value;
+        effects->seeker_closing_velocity_bias_mps += fault->scalar_value * value_scale;
         break;
     case FAULT_TARGET_SENSOR_IMU_GYRO:
         effects->gyro_bias_b_radps =
-            vec3_add(effects->gyro_bias_b_radps, fault->vector_value);
+            vec3_add(
+                effects->gyro_bias_b_radps,
+                vec3_scale(fault->vector_value, value_scale));
         break;
     case FAULT_TARGET_SENSOR_ACCEL:
         effects->accel_bias_ecef_mps2 =
-            vec3_add(effects->accel_bias_ecef_mps2, fault->vector_value);
+            vec3_add(
+                effects->accel_bias_ecef_mps2,
+                vec3_scale(fault->vector_value, value_scale));
         break;
     case FAULT_TARGET_SENSOR_SPEED:
         effects->speed_bias_ecef_mps =
-            vec3_add(effects->speed_bias_ecef_mps, fault->vector_value);
+            vec3_add(
+                effects->speed_bias_ecef_mps,
+                vec3_scale(fault->vector_value, value_scale));
         break;
     default:
         return SIM_ERR_CONFIG;
@@ -388,12 +548,20 @@ static SimStatus accumulate_fault(const FaultDefinition *fault, FaultStepEffects
 static int fault_is_active(const FaultDefinition *fault, double sim_time_s)
 {
     const double epsilon = 1.0e-12;
+    double end_time_s;
 
     if (fault == 0 || fault->enabled == 0) {
         return 0;
     }
+    end_time_s = fault->start_time_s + fault->duration_s;
+    if (fault->type == FAULT_TYPE_RAMP_BIAS) {
+        end_time_s += fault->recovery_ramp_s;
+    }
+    if (fault_is_sensor_frame_communication(fault) != 0) {
+        end_time_s += fault->recovery_hold_s;
+    }
     return sim_time_s + epsilon >= fault->start_time_s &&
-        sim_time_s < fault->start_time_s + fault->duration_s - epsilon;
+        sim_time_s < end_time_s - epsilon;
 }
 
 void fault_injection_init_empty(FaultInjection *faults)
@@ -488,6 +656,33 @@ SimStatus fault_injection_load_config(const ConfigTree *config, FaultInjection *
         if (status != SIM_OK || found == 0) {
             return status == SIM_OK ? SIM_ERR_CONFIG : status;
         }
+        status = get_optional_double(config, index, "ramp_in_s", &fault->ramp_in_s, &found);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (found == 0) {
+            fault->ramp_in_s = 0.0;
+        }
+        status = get_optional_double(config, index, "recovery_ramp_s", &fault->recovery_ramp_s, &found);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (found == 0) {
+            fault->recovery_ramp_s = 0.0;
+        }
+        status = get_optional_double(config, index, "recovery_hold_s", &fault->recovery_hold_s, &found);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (found == 0) {
+            status = get_optional_double(config, index, "recovery_timeout_s", &fault->recovery_hold_s, &found);
+            if (status != SIM_OK) {
+                return status;
+            }
+        }
+        if (found == 0) {
+            fault->recovery_hold_s = 0.0;
+        }
         status = get_optional_double(config, index, "value", &scalar, &found);
         if (status != SIM_OK) {
             return status;
@@ -506,12 +701,26 @@ SimStatus fault_injection_load_config(const ConfigTree *config, FaultInjection *
         if (found == 0) {
             fault->scale = fault->scalar_value;
         }
+        if (fault->type == FAULT_TYPE_COMMUNICATION_DELAY) {
+            if (fault->scalar_value < 1.0 ||
+                fault->scalar_value > (double)ENV_MAX_COMMUNICATION_DELAY_STEPS ||
+                floor(fault->scalar_value) != fault->scalar_value) {
+                return SIM_ERR_OUT_OF_RANGE;
+            }
+            fault->delay_steps = (unsigned int)fault->scalar_value;
+        }
         if (!isfinite(fault->start_time_s) || fault->start_time_s < 0.0 ||
             !isfinite(fault->duration_s) || fault->duration_s <= 0.0 ||
+            !isfinite(fault->ramp_in_s) || fault->ramp_in_s < 0.0 ||
+            !isfinite(fault->recovery_ramp_s) || fault->recovery_ramp_s < 0.0 ||
+            !isfinite(fault->recovery_hold_s) || fault->recovery_hold_s < 0.0 ||
             !isfinite(fault->scalar_value) ||
             !vec3_isfinite(fault->vector_value) ||
             !isfinite(fault->scale)) {
             return SIM_ERR_OUT_OF_RANGE;
+        }
+        if (fault->recovery_hold_s > 0.0 && fault_is_sensor_frame_communication(fault) == 0) {
+            return SIM_ERR_CONFIG;
         }
         if (!fault_type_matches_target(fault)) {
             return SIM_ERR_CONFIG;
@@ -568,7 +777,7 @@ SimStatus fault_injection_update(
             fault->was_active = active;
         }
         if (active != 0) {
-            SimStatus status = accumulate_fault(fault, effects);
+            SimStatus status = accumulate_fault(fault, sim_time_s, effects);
 
             if (status != SIM_OK) {
                 return status;
@@ -602,6 +811,34 @@ void fault_injection_apply_sensor(const FaultStepEffects *effects, SensorFrame *
         vec3_add(sensor->missile_accel_ecef_meas, effects->accel_bias_ecef_mps2);
     sensor->missile_vel_ecef_meas =
         vec3_add(sensor->missile_vel_ecef_meas, effects->speed_bias_ecef_mps);
+    if (effects->seeker_range_hold_enabled != 0) {
+        sensor->target_range_meas = effects->seeker_range_hold_m;
+    }
+    if (effects->seeker_los_unit_hold_enabled != 0) {
+        sensor->target_los_unit_ecef_meas = effects->seeker_los_unit_hold;
+        if (vec3_norm(sensor->target_los_unit_ecef_meas) > 0.0) {
+            Vec3 normalized;
+
+            if (vec3_normalize(sensor->target_los_unit_ecef_meas, &normalized) == SIM_OK) {
+                sensor->target_los_unit_ecef_meas = normalized;
+            }
+        }
+    }
+    if (effects->seeker_los_rate_hold_enabled != 0) {
+        sensor->target_los_rate_ecef_meas = effects->seeker_los_rate_hold_radps;
+    }
+    if (effects->seeker_closing_velocity_hold_enabled != 0) {
+        sensor->target_closing_velocity_meas = effects->seeker_closing_velocity_hold_mps;
+    }
+    if (effects->gyro_hold_enabled != 0) {
+        sensor->missile_gyro_b_meas = effects->gyro_hold_b_radps;
+    }
+    if (effects->accel_hold_enabled != 0) {
+        sensor->missile_accel_ecef_meas = effects->accel_hold_ecef_mps2;
+    }
+    if (effects->speed_hold_enabled != 0) {
+        sensor->missile_vel_ecef_meas = effects->speed_hold_ecef_mps;
+    }
     sensor->sensor_valid_flags &= ~effects->sensor_valid_clear_mask;
     sensor->sensor_fault_flags |= effects->sensor_fault_set_mask;
 }

@@ -5,7 +5,9 @@
 #include "common/config.h"
 #include "common/random.h"
 #include "env/actuator_model.h"
+#include "env/aero_database.h"
 #include "env/aero_model.h"
+#include "env/aero_surrogate.h"
 #include "env/atmosphere_model.h"
 #include "env/earth_model.h"
 #include "env/environment_force_model.h"
@@ -187,6 +189,97 @@ static int test_tile_file_round_trip(void)
     return failures;
 }
 
+/** @brief 写出缓存测试用的 2x2 常高瓦片。 */
+static int write_constant_tile_file(
+    const char *path,
+    double lat_min,
+    double lat_max,
+    double lon_min,
+    double lon_max,
+    int16_t raw_height)
+{
+    int16_t samples[4];
+    TerrainTileHeader header;
+    TerrainTile tile;
+    size_t index;
+
+    if (path == 0) {
+        return -1;
+    }
+    for (index = 0u; index < 4u; ++index) {
+        samples[index] = raw_height;
+    }
+    header.magic = TERRAIN_TILE_MAGIC;
+    header.version = TERRAIN_TILE_VERSION;
+    header.grid_width = 2u;
+    header.grid_height = 2u;
+    header.lat_min = lat_min;
+    header.lat_max = lat_max;
+    header.lon_min = lon_min;
+    header.lon_max = lon_max;
+    header.height_scale = 1.0;
+    header.height_offset = 0.0;
+    header.data_crc32 = 0u;
+    if (map_tile_bind(&tile, &header, samples, 4u) != SIM_OK) {
+        return -1;
+    }
+    return map_tile_write_file(path, &tile) == SIM_OK ? 0 : -1;
+}
+
+/** @brief 验证地形瓦片按查询懒加载，并在容量不足时 LRU 淘汰。 */
+static int test_terrain_tile_cache(void)
+{
+    char paths[3][TERRAIN_TILE_CACHE_PATH_SIZE];
+    TerrainTileIndexEntry entries[3];
+    TerrainTileCache cache;
+    TerrainModel terrain;
+    double height = 0.0;
+    int failures = 0;
+    size_t index;
+
+    (void)snprintf(paths[0], sizeof(paths[0]), "/tmp/missile_cache_tile_a_%ld.bin", (long)getpid());
+    (void)snprintf(paths[1], sizeof(paths[1]), "/tmp/missile_cache_tile_b_%ld.bin", (long)getpid());
+    (void)snprintf(paths[2], sizeof(paths[2]), "/tmp/missile_cache_tile_c_%ld.bin", (long)getpid());
+    (void)memset(entries, 0, sizeof(entries));
+    for (index = 0u; index < 3u; ++index) {
+        (void)snprintf(entries[index].path, sizeof(entries[index].path), "%s", paths[index]);
+        entries[index].lat_min = (double)(index * 2u);
+        entries[index].lat_max = entries[index].lat_min + 1.0;
+        entries[index].lon_min = 0.0;
+        entries[index].lon_max = 1.0;
+        entries[index].has_bounds = 1;
+    }
+    failures += expect(
+        write_constant_tile_file(paths[0], 0.0, 1.0, 0.0, 1.0, 10) == 0 &&
+            write_constant_tile_file(paths[1], 2.0, 3.0, 0.0, 1.0, 20) == 0 &&
+            write_constant_tile_file(paths[2], 4.0, 5.0, 0.0, 1.0, 30) == 0,
+        "terrain_cache_write_tiles");
+    failures += expect(
+        terrain_tile_cache_init_from_index(&cache, entries, 3u, 2u) == SIM_OK,
+        "terrain_cache_init");
+    failures += expect(
+        terrain_model_init_with_cache(&terrain, &cache, MAP_MISSING_ERROR, 0.0) == SIM_OK,
+        "terrain_cache_model_init");
+    failures += expect(terrain_get_height(&terrain, 0.5, 0.5, &height) == SIM_OK, "terrain_cache_a");
+    failures += expect_near(height, 10.0, 1.0e-12, "terrain_cache_a_height");
+    failures += expect(terrain_get_height(&terrain, 2.5, 0.5, &height) == SIM_OK, "terrain_cache_b");
+    failures += expect_near(height, 20.0, 1.0e-12, "terrain_cache_b_height");
+    failures += expect(cache.loaded_count == 2u && cache.load_count == 2u, "terrain_cache_loaded_two");
+    failures += expect(terrain_get_height(&terrain, 4.5, 0.5, &height) == SIM_OK, "terrain_cache_c");
+    failures += expect_near(height, 30.0, 1.0e-12, "terrain_cache_c_height");
+    failures += expect(cache.load_count == 3u, "terrain_cache_bounds_skip_unrelated_loads");
+    failures += expect(cache.loaded_count == 2u, "terrain_cache_capacity_respected");
+    failures += expect(cache.eviction_count >= 1u, "terrain_cache_evicted");
+    failures += expect(terrain_get_height(&terrain, 0.5, 0.5, &height) == SIM_OK, "terrain_cache_reload_a");
+    failures += expect_near(height, 10.0, 1.0e-12, "terrain_cache_reload_a_height");
+    failures += expect(cache.load_count >= 4u, "terrain_cache_reloaded");
+    terrain_tile_cache_unload(&cache);
+    (void)unlink(paths[0]);
+    (void)unlink(paths[1]);
+    (void)unlink(paths[2]);
+    return failures;
+}
+
 /** @brief 验证球形曲率下短程可见和长程地表遮挡。 */
 static int test_line_of_sight(void)
 {
@@ -268,7 +361,7 @@ static int test_force_models(void)
         1, 1000.0, 2.0, 5.0, { 1.0, 0.0, 0.0 }
     };
     AeroModel aero = {
-        1, 0.1, 1.0, 0.5, 0.2, 0.1
+        1, 0.1, 1.0, 0.5, 0.2, 0.1, 0, 0
     };
     Vec3 gravity_accel;
     Vec3 propulsion_force;
@@ -306,14 +399,239 @@ static int test_force_models(void)
         aero_model_evaluate(
             &aero,
             air.density_kgpm3,
+            100.0 / air.speed_of_sound_mps,
             vec3_make(100.0, 0.0, 0.0),
             0.1,
             -0.1,
             &aero_force,
-            &aero_moment) == SIM_OK,
+            &aero_moment,
+            0) == SIM_OK,
         "aero_evaluate");
     failures += expect(aero_force.x < 0.0, "aero_drag_direction");
     failures += expect(aero_moment.y > 0.0 && aero_moment.z < 0.0, "aero_moment_direction");
+    return failures;
+}
+
+/** @brief 验证气动数据库插值和包络外策略。 */
+static int test_aero_database(void)
+{
+    const AeroTableSample samples[2] = {
+        { 0.0, 0.0, 0.0, 0.1, 0.01, -0.01, 0.001, 0.002, 0.003 },
+        { 1.0, 0.0, 0.0, 0.3, 0.03, -0.03, 0.003, 0.004, 0.005 }
+    };
+    AeroDatabase database;
+    AeroTableSample out;
+    uint32_t flags = 0u;
+    int failures = 0;
+
+    failures += expect(
+        aero_database_init(
+            &database,
+            samples,
+            2u,
+            AERO_DB_EXTRAPOLATION_ERROR) == SIM_OK,
+        "aero_database_init");
+    failures += expect(
+        aero_database_lookup(&database, 1.0, 0.0, 0.0, &out, &flags) == SIM_OK,
+        "aero_database_exact_lookup");
+    failures += expect_near(out.cx, 0.3, 0.0, "aero_database_exact_cx");
+    failures += expect(flags == 0u, "aero_database_exact_flags");
+    failures += expect(
+        aero_database_lookup(&database, 0.5, 0.0, 0.0, &out, &flags) == SIM_OK,
+        "aero_database_interpolate_lookup");
+    failures += expect_near(out.cx, 0.2, 1.0e-12, "aero_database_interpolate_cx");
+    failures += expect_near(out.cm, 0.003, 1.0e-12, "aero_database_interpolate_cm");
+    failures += expect(
+        aero_database_lookup(&database, 2.0, 0.0, 0.0, &out, &flags) ==
+            SIM_ERR_OUT_OF_RANGE,
+        "aero_database_rejects_out_of_range");
+
+    failures += expect(
+        aero_database_init(
+            &database,
+            samples,
+            2u,
+            AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN) == SIM_OK &&
+            aero_database_lookup(&database, 2.0, 0.0, 0.0, &out, &flags) == SIM_OK,
+        "aero_database_clamp_lookup");
+    failures += expect_near(out.cx, 0.3, 0.0, "aero_database_clamp_cx");
+    failures += expect(
+        (flags & AERO_DB_FLAG_EXTRAPOLATED) != 0u,
+        "aero_database_clamp_flag");
+
+    failures += expect(
+        aero_database_init(
+            &database,
+            samples,
+            2u,
+            AERO_DB_EXTRAPOLATION_HOLD_LAST_VALID) == SIM_OK &&
+            aero_database_lookup(&database, 0.5, 0.0, 0.0, &out, &flags) == SIM_OK &&
+            aero_database_lookup(&database, 2.0, 0.0, 0.0, &out, &flags) == SIM_OK,
+        "aero_database_hold_last_lookup");
+    failures += expect_near(out.cx, 0.2, 1.0e-12, "aero_database_hold_last_cx");
+    failures += expect(
+        (flags & AERO_DB_FLAG_EXTRAPOLATED) != 0u,
+        "aero_database_hold_last_flag");
+    return failures;
+}
+
+/** @brief 验证气动表文件格式、CRC 和表格气动力主计算路径。 */
+static int test_aero_database_file_and_model(void)
+{
+    char path[128];
+    char corrupt_path[128];
+    const AeroTableSample samples[2] = {
+        { 0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0 },
+        { 1.0, 0.0, 0.0, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    };
+    const AeroTableSample unsorted[2] = {
+        { 1.0, 0.0, 0.0, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0 },
+        { 0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    };
+    AeroDatabase database;
+    AeroModel aero;
+    Vec3 force;
+    Vec3 moment;
+    uint32_t model_flags = 0u;
+    FILE *file;
+    int failures = 0;
+
+    (void)snprintf(path, sizeof(path), "/tmp/missile_aero_%ld.bin", (long)getpid());
+    (void)snprintf(
+        corrupt_path,
+        sizeof(corrupt_path),
+        "/tmp/missile_aero_corrupt_%ld.bin",
+        (long)getpid());
+    failures += expect(
+        aero_database_write_file(
+            path,
+            samples,
+            2u,
+            AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN) == SIM_OK,
+        "aero_database_file_write");
+    failures += expect(
+        aero_database_load_file(path, &database) == SIM_OK,
+        "aero_database_file_load");
+    aero = (AeroModel){ 1, 0.1, 1.0, 0.5, 0.0, 0.0, &database, 0 };
+    failures += expect(
+        aero_model_evaluate(
+            &aero,
+            1.0,
+            0.5,
+            vec3_make(100.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            &force,
+            &moment,
+            &model_flags) == SIM_OK,
+        "aero_database_model_evaluate");
+    failures += expect_near(force.x, -100.0, 1.0e-9, "aero_database_model_force_x");
+    failures += expect_near(moment.y, 0.0, 1.0e-12, "aero_database_model_moment_y");
+    failures += expect(model_flags == 0u, "aero_database_model_flags_exact");
+    aero_database_unload(&database);
+
+    failures += expect(
+        aero_database_write_file(
+            corrupt_path,
+            unsorted,
+            2u,
+            AERO_DB_EXTRAPOLATION_ERROR) == SIM_ERR_CONFIG,
+        "aero_database_reject_unsorted");
+    file = fopen(path, "r+b");
+    if (file != 0) {
+        int ch;
+        (void)fseek(file, (long)AERO_DATABASE_HEADER_WIRE_SIZE, SEEK_SET);
+        ch = fgetc(file);
+        if (ch != EOF) {
+            (void)fseek(file, (long)AERO_DATABASE_HEADER_WIRE_SIZE, SEEK_SET);
+            (void)fputc(ch ^ 0x01, file);
+        }
+        (void)fclose(file);
+    }
+    failures += expect(
+        aero_database_load_file(path, &database) == SIM_ERR_CONFIG,
+        "aero_database_reject_crc");
+    (void)unlink(path);
+    (void)unlink(corrupt_path);
+    return failures;
+}
+
+/** @brief 验证线性气动代理模型加载、推理和气动力主计算路径。 */
+static int test_aero_surrogate_file_and_model(void)
+{
+    char path[128];
+    char bad_path[128];
+    AeroSurrogateModel surrogate;
+    AeroSurrogateCoefficients coefficients;
+    AeroModel aero;
+    Vec3 force;
+    Vec3 moment;
+    FILE *file;
+    uint32_t model_flags = 0u;
+    int failures = 0;
+
+    (void)snprintf(path, sizeof(path), "/tmp/missile_aero_surrogate_%ld.txt", (long)getpid());
+    (void)snprintf(
+        bad_path,
+        sizeof(bad_path),
+        "/tmp/missile_aero_surrogate_bad_%ld.txt",
+        (long)getpid());
+    file = fopen(path, "wb");
+    if (file == 0) {
+        return 1;
+    }
+    (void)fprintf(file, "MISSILE_AERO_SURROGATE_LINEAR_V1\n");
+    (void)fprintf(file, "cx -0.1 -0.2 0.0 0.0\n");
+    (void)fprintf(file, "cy 0.0 0.0 0.0 1.0\n");
+    (void)fprintf(file, "cz 0.0 0.0 2.0 0.0\n");
+    (void)fprintf(file, "cl 0.0 0.0 0.0 0.0\n");
+    (void)fprintf(file, "cm 0.01 0.0 0.0 0.0\n");
+    (void)fprintf(file, "cn -0.02 0.0 0.0 0.0\n");
+    (void)fclose(file);
+
+    failures += expect(
+        aero_surrogate_load_file(path, &surrogate) == SIM_OK,
+        "aero_surrogate_load");
+    failures += expect(
+        aero_surrogate_evaluate(&surrogate, 0.5, 0.1, 0.2, &coefficients) == SIM_OK,
+        "aero_surrogate_evaluate");
+    failures += expect_near(coefficients.cx, -0.2, 1.0e-12, "aero_surrogate_cx");
+    failures += expect_near(coefficients.cy, 0.2, 1.0e-12, "aero_surrogate_cy");
+    failures += expect_near(coefficients.cz, 0.2, 1.0e-12, "aero_surrogate_cz");
+    failures += expect_near(coefficients.cm, 0.01, 1.0e-12, "aero_surrogate_cm");
+    failures += expect_near(coefficients.cn, -0.02, 1.0e-12, "aero_surrogate_cn");
+
+    aero = (AeroModel){ 1, 0.1, 1.0, 0.5, 0.0, 0.0, 0, &surrogate };
+    failures += expect(
+        aero_model_evaluate(
+            &aero,
+            1.0,
+            0.5,
+            vec3_make(100.0, 0.0, 0.0),
+            0.0,
+            0.0,
+            &force,
+            &moment,
+            &model_flags) == SIM_OK,
+        "aero_surrogate_model_evaluate");
+    failures += expect_near(force.x, -100.0, 1.0e-9, "aero_surrogate_model_force_x");
+    failures += expect_near(moment.y, 5.0, 1.0e-9, "aero_surrogate_model_moment_y");
+    failures += expect_near(moment.z, -10.0, 1.0e-9, "aero_surrogate_model_moment_z");
+    failures += expect(model_flags == 0u, "aero_surrogate_model_flags");
+
+    file = fopen(bad_path, "wb");
+    if (file != 0) {
+        (void)fprintf(file, "MISSILE_AERO_SURROGATE_LINEAR_V1\n");
+        (void)fprintf(file, "cx -0.1 -0.2 0.0 0.0\n");
+        (void)fclose(file);
+        failures += expect(
+            aero_surrogate_load_file(bad_path, &surrogate) == SIM_ERR_CONFIG,
+            "aero_surrogate_reject_incomplete");
+    } else {
+        failures += 1;
+    }
+    (void)unlink(path);
+    (void)unlink(bad_path);
     return failures;
 }
 
@@ -403,6 +721,60 @@ static int test_environment_force_model(void)
         output.plant_input.moment_b_nm.y > 0.0 &&
             output.plant_input.moment_b_nm.z < 0.0,
         "environment_force_moment");
+    return failures;
+}
+
+/** @brief 验证统一环境力模型可消费气动表数据库。 */
+static int test_environment_force_model_aero_table(void)
+{
+    const AeroTableSample samples[1] = {
+        { 0.0, 0.0, 0.0, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    };
+    AeroDatabase database;
+    PlantState6Dof plant;
+    EnvironmentForceModel model;
+    EnvironmentForceInput input;
+    EnvironmentForceOutput output;
+    double expected_drag;
+    int failures = 0;
+
+    (void)memset(&plant, 0, sizeof(plant));
+    plant.pos_ecef = vec3_make(6378137.0, 0.0, 0.0);
+    plant.vel_ecef = vec3_make(100.0, 0.0, 0.0);
+    plant.q_bi = quat_identity();
+    plant.mass = 100.0;
+    plant.inertia_b = matrix3_identity();
+
+    (void)memset(&model, 0, sizeof(model));
+    model.gravity = gravity_model_wgs84();
+    model.atmosphere = atmosphere_model_isa();
+    model.aerodynamics.enabled = 1;
+    model.aerodynamics.reference_area_m2 = 0.1;
+    model.aerodynamics.reference_length_m = 1.0;
+    model.enable_earth_rotation = 1;
+    model.earth_rotation_rate_radps = ENV_WGS84_EARTH_ROTATION_RADPS;
+    failures += expect(
+        aero_database_init(
+            &database,
+            samples,
+            1u,
+            AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN) == SIM_OK,
+        "environment_force_aero_table_init");
+    model.aerodynamics.database = &database;
+
+    (void)memset(&input, 0, sizeof(input));
+    input.plant = &plant;
+    input.height_m = 0.0;
+    input.dt_s = 1.0;
+    failures += expect(
+        environment_force_model_evaluate(&model, &input, &output) == SIM_OK,
+        "environment_force_aero_table_evaluate");
+    expected_drag = 0.5 * output.atmosphere.density_kgpm3 * 100.0 * 100.0 * 0.1 * -0.2;
+    failures += expect_near(
+        output.aerodynamic_force_b_n.x,
+        expected_drag,
+        1.0e-9,
+        "environment_force_aero_table_force");
     return failures;
 }
 
@@ -739,6 +1111,36 @@ static int test_fault_injection(void)
         "\"type\":\"DROPOUT\""
         "},"
         "{"
+        "\"id\":\"accel_hold\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"sensor.accelerometer\","
+        "\"type\":\"HOLD_VALUE\","
+        "\"value_xyz\":[1.0,2.0,3.0]"
+        "},"
+        "{"
+        "\"id\":\"frame_comm_loss\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"sensor.frame\","
+        "\"type\":\"COMMUNICATION_LOSS\""
+        "},"
+        "{"
+        "\"id\":\"frame_comm_delay\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"sensor.frame\","
+        "\"type\":\"COMMUNICATION_DELAY\","
+        "\"value\":2"
+        "},"
+        "{"
+        "\"id\":\"frame_comm_reorder\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"sensor.frame\","
+        "\"type\":\"COMMUNICATION_REORDER\""
+        "},"
+        "{"
         "\"id\":\"x_stuck\","
         "\"time_s\":1.0,"
         "\"duration_s\":2.0,"
@@ -767,7 +1169,7 @@ static int test_fault_injection(void)
 
     failures += expect(
         fault_injection_load_config(&config, &faults) == SIM_OK &&
-            faults.fault_count == 4u,
+            faults.fault_count == 8u,
         "fault_load");
     failures += expect(
         fault_injection_update(
@@ -788,8 +1190,8 @@ static int test_fault_injection(void)
             transitions,
             ENV_MAX_FAULT_TRANSITIONS,
             &transition_count) == SIM_OK &&
-            effects.active_fault_count == 4u &&
-            transition_count == 4u,
+            effects.active_fault_count == 8u &&
+            transition_count == 8u,
         "fault_active_step");
     failures += expect(
         transitions[0].active != 0 &&
@@ -797,9 +1199,13 @@ static int test_fault_injection(void)
         "fault_start_transition");
 
     (void)memset(&sensor, 0, sizeof(sensor));
-    sensor.sensor_valid_flags = SIM_SENSOR_VALID_SEEKER | SIM_SENSOR_VALID_SPEED;
+    sensor.sensor_valid_flags = SIM_SENSOR_VALID_SEEKER |
+        SIM_SENSOR_VALID_IMU_GYRO |
+        SIM_SENSOR_VALID_ACCEL |
+        SIM_SENSOR_VALID_SPEED;
     sensor.target_los_unit_ecef_meas = vec3_make(1.0, 0.0, 0.0);
     sensor.target_los_rate_ecef_meas = vec3_make(0.0, 0.0, 1.0);
+    sensor.missile_accel_ecef_meas = vec3_make(9.0, 9.0, 9.0);
     sensor.missile_vel_ecef_meas = vec3_make(100.0, 0.0, 0.0);
     fault_injection_apply_sensor(&effects, &sensor);
     failures += expect_near(
@@ -811,6 +1217,31 @@ static int test_fault_injection(void)
         (sensor.sensor_valid_flags & SIM_SENSOR_VALID_SPEED) == 0u &&
             (sensor.sensor_fault_flags & SIM_SENSOR_FAULT_SPEED_DROPOUT) != 0u,
         "fault_sensor_dropout");
+    failures += expect(sensor.sensor_valid_flags == 0u, "fault_frame_comm_loss_valid_clear");
+    failures += expect(
+        (sensor.sensor_fault_flags &
+            (SIM_SENSOR_FAULT_SEEKER_DROPOUT |
+                SIM_SENSOR_FAULT_IMU_DROPOUT |
+                SIM_SENSOR_FAULT_ACCEL_DROPOUT |
+                SIM_SENSOR_FAULT_SPEED_DROPOUT)) ==
+            (SIM_SENSOR_FAULT_SEEKER_DROPOUT |
+                SIM_SENSOR_FAULT_IMU_DROPOUT |
+                SIM_SENSOR_FAULT_ACCEL_DROPOUT |
+                SIM_SENSOR_FAULT_SPEED_DROPOUT),
+        "fault_frame_comm_loss_flags");
+    failures += expect_near(sensor.missile_accel_ecef_meas.x, 1.0, 1.0e-12, "fault_hold_accel_x");
+    failures += expect_near(sensor.missile_accel_ecef_meas.y, 2.0, 1.0e-12, "fault_hold_accel_y");
+    failures += expect_near(sensor.missile_accel_ecef_meas.z, 3.0, 1.0e-12, "fault_hold_accel_z");
+    failures += expect(
+        (sensor.sensor_fault_flags & SIM_SENSOR_FAULT_ACCEL_DROPOUT) != 0u,
+        "fault_hold_accel_flag");
+    failures += expect(
+        effects.communication_delay_enabled != 0 &&
+            effects.communication_delay_steps == 2u,
+        "fault_comm_delay_effect");
+    failures += expect(
+        effects.communication_reorder_enabled != 0,
+        "fault_comm_reorder_effect");
 
     (void)memset(actuators, 0, sizeof(actuators));
     fault_injection_apply_actuators(&effects, actuators, commands);
@@ -828,7 +1259,7 @@ static int test_fault_injection(void)
             ENV_MAX_FAULT_TRANSITIONS,
             &transition_count) == SIM_OK &&
             effects.active_fault_count == 0u &&
-            transition_count == 4u,
+            transition_count == 8u,
         "fault_recovery_step");
     commands[0] = 10.0;
     commands[1] = 20.0;
@@ -865,9 +1296,30 @@ static int test_fault_injection_rejects_bad_config(void)
         "\"target\":\"sensor.speedometer\","
         "\"type\":\"STUCK\""
         "}]}";
+    char bad_delay_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"target\":\"sensor.frame\","
+        "\"type\":\"COMMUNICATION_DELAY\","
+        "\"value\":17"
+        "}]}";
+    char bad_recovery_hold_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"target\":\"sensor.speedometer\","
+        "\"type\":\"DROPOUT\","
+        "\"recovery_hold_s\":0.5"
+        "}]}";
     ConfigTree bad_target = { bad_target_json, sizeof(bad_target_json) - 1u };
     ConfigTree bad_duration = { bad_duration_json, sizeof(bad_duration_json) - 1u };
     ConfigTree bad_pair = { bad_pair_json, sizeof(bad_pair_json) - 1u };
+    ConfigTree bad_delay = { bad_delay_json, sizeof(bad_delay_json) - 1u };
+    ConfigTree bad_recovery_hold = {
+        bad_recovery_hold_json,
+        sizeof(bad_recovery_hold_json) - 1u
+    };
     FaultInjection faults;
     int failures = 0;
 
@@ -880,6 +1332,232 @@ static int test_fault_injection_rejects_bad_config(void)
     failures += expect(
         fault_injection_load_config(&bad_pair, &faults) == SIM_ERR_CONFIG,
         "fault_reject_bad_type_target_pair");
+    failures += expect(
+        fault_injection_load_config(&bad_delay, &faults) == SIM_ERR_OUT_OF_RANGE,
+        "fault_reject_bad_comm_delay");
+    failures += expect(
+        fault_injection_load_config(&bad_recovery_hold, &faults) == SIM_ERR_CONFIG,
+        "fault_reject_bad_recovery_hold_target");
+    return failures;
+}
+
+/** @brief 验证通信故障支持窗口结束后的超时保持和恢复事件。 */
+static int test_fault_injection_communication_recovery_hold(void)
+{
+    char json[] =
+        "{"
+        "\"schema_version\":1,"
+        "\"faults\":[{"
+        "\"id\":\"frame_loss_hold\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"target\":\"sensor.frame\","
+        "\"type\":\"COMMUNICATION_LOSS\","
+        "\"recovery_hold_s\":0.5"
+        "}]"
+        "}";
+    ConfigTree config = { json, sizeof(json) - 1u };
+    FaultInjection faults;
+    FaultStepEffects effects;
+    FaultTransition transitions[ENV_MAX_FAULT_TRANSITIONS];
+    size_t transition_count = 0u;
+    SensorFrame sensor;
+    int failures = 0;
+
+    failures += expect(
+        fault_injection_load_config(&config, &faults) == SIM_OK &&
+            faults.fault_count == 1u,
+        "fault_comm_recovery_hold_load");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            1.0,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 1u &&
+            transition_count == 1u &&
+            transitions[0].active != 0,
+        "fault_comm_recovery_hold_start");
+    (void)memset(&sensor, 0, sizeof(sensor));
+    sensor.sensor_valid_flags = SIM_SENSOR_VALID_SEEKER |
+        SIM_SENSOR_VALID_IMU_GYRO |
+        SIM_SENSOR_VALID_ACCEL |
+        SIM_SENSOR_VALID_SPEED;
+    fault_injection_apply_sensor(&effects, &sensor);
+    failures += expect(sensor.sensor_valid_flags == 0u, "fault_comm_recovery_hold_effect");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            2.25,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 1u &&
+            transition_count == 0u,
+        "fault_comm_recovery_hold_extended");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            2.6,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 0u &&
+            transition_count == 1u &&
+            transitions[0].active == 0,
+        "fault_comm_recovery_hold_recovered");
+    return failures;
+}
+
+/** @brief 验证传感器漂移故障按激活时间线性增长并在窗口后恢复。 */
+static int test_fault_injection_drift(void)
+{
+    char json[] =
+        "{"
+        "\"schema_version\":1,"
+        "\"faults\":["
+        "{"
+        "\"id\":\"accel_drift\","
+        "\"start_time_s\":1.0,"
+        "\"duration_s\":2.0,"
+        "\"target\":\"sensor.accelerometer\","
+        "\"type\":\"DRIFT\","
+        "\"value_xyz\":[1.0,2.0,3.0]"
+        "}"
+        "]"
+        "}";
+    ConfigTree config = { json, sizeof(json) - 1u };
+    FaultInjection faults;
+    FaultStepEffects effects;
+    SensorFrame sensor;
+    size_t transition_count = 0u;
+    int failures = 0;
+
+    failures += expect(
+        fault_injection_load_config(&config, &faults) == SIM_OK &&
+            faults.fault_count == 1u,
+        "fault_drift_load");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            2.5,
+            &effects,
+            0,
+            0u,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 1u,
+        "fault_drift_update");
+    (void)memset(&sensor, 0, sizeof(sensor));
+    fault_injection_apply_sensor(&effects, &sensor);
+    failures += expect_near(sensor.missile_accel_ecef_meas.x, 1.5, 1.0e-12, "fault_drift_x");
+    failures += expect_near(sensor.missile_accel_ecef_meas.y, 3.0, 1.0e-12, "fault_drift_y");
+    failures += expect_near(sensor.missile_accel_ecef_meas.z, 4.5, 1.0e-12, "fault_drift_z");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            3.0,
+            &effects,
+            0,
+            0u,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 0u,
+        "fault_drift_recovery");
+    return failures;
+}
+
+/** @brief 验证斜坡偏置故障渐入并在窗口后线性恢复。 */
+static int test_fault_injection_ramp_bias(void)
+{
+    char json[] =
+        "{"
+        "\"schema_version\":1,"
+        "\"faults\":["
+        "{"
+        "\"id\":\"speed_ramp\","
+        "\"start_time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"ramp_in_s\":0.5,"
+        "\"recovery_ramp_s\":0.5,"
+        "\"target\":\"sensor.speedometer\","
+        "\"type\":\"RAMP_BIAS\","
+        "\"value_xyz\":[10.0,0.0,0.0]"
+        "}"
+        "]"
+        "}";
+    ConfigTree config = { json, sizeof(json) - 1u };
+    FaultInjection faults;
+    FaultStepEffects effects;
+    FaultTransition transitions[ENV_MAX_FAULT_TRANSITIONS];
+    SensorFrame sensor;
+    size_t transition_count = 0u;
+    int failures = 0;
+
+    failures += expect(
+        fault_injection_load_config(&config, &faults) == SIM_OK &&
+            faults.fault_count == 1u,
+        "fault_ramp_load");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            1.25,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 1u &&
+            transition_count == 1u &&
+            transitions[0].active != 0,
+        "fault_ramp_enter");
+    (void)memset(&sensor, 0, sizeof(sensor));
+    fault_injection_apply_sensor(&effects, &sensor);
+    failures += expect_near(sensor.missile_vel_ecef_meas.x, 5.0, 1.0e-12, "fault_ramp_half_in");
+
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            1.75,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 1u &&
+            transition_count == 0u,
+        "fault_ramp_full_update");
+    (void)memset(&sensor, 0, sizeof(sensor));
+    fault_injection_apply_sensor(&effects, &sensor);
+    failures += expect_near(sensor.missile_vel_ecef_meas.x, 10.0, 1.0e-12, "fault_ramp_full");
+
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            2.25,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 1u &&
+            transition_count == 0u,
+        "fault_ramp_recovery_update");
+    (void)memset(&sensor, 0, sizeof(sensor));
+    fault_injection_apply_sensor(&effects, &sensor);
+    failures += expect_near(sensor.missile_vel_ecef_meas.x, 5.0, 1.0e-12, "fault_ramp_recovery_half");
+
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            2.5,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 0u &&
+            transition_count == 1u &&
+            transitions[0].active == 0,
+        "fault_ramp_recovered");
     return failures;
 }
 
@@ -892,15 +1570,23 @@ int main(void)
     failures += test_local_frames();
     failures += test_terrain();
     failures += test_tile_file_round_trip();
+    failures += test_terrain_tile_cache();
     failures += test_line_of_sight();
     failures += test_actuator();
     failures += test_force_models();
+    failures += test_aero_database();
+    failures += test_aero_database_file_and_model();
+    failures += test_aero_surrogate_file_and_model();
     failures += test_environment_force_model();
+    failures += test_environment_force_model_aero_table();
     failures += test_missile_plant();
     failures += test_sensor_noise();
     failures += test_vector_sensor_pipeline();
     failures += test_seeker_sensor_pipeline();
     failures += test_fault_injection();
     failures += test_fault_injection_rejects_bad_config();
+    failures += test_fault_injection_communication_recovery_hold();
+    failures += test_fault_injection_drift();
+    failures += test_fault_injection_ramp_bias();
     return failures == 0 ? 0 : 1;
 }

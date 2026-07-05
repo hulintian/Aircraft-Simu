@@ -10,11 +10,14 @@
 #include "common/build_info.h"
 #include "common/logger.h"
 #include "common/math_constants.h"
+#include "common/matrix3.h"
 #include "common/packet.h"
 #include "common/protocol.h"
+#include "common/quaternion.h"
 #include "common/status.h"
 #include "common/vec3.h"
 #include "env/actuator_model.h"
+#include "env/aero_surrogate.h"
 #include "env/earth_model.h"
 #include "env/environment_force_model.h"
 #include "env/fault_injection.h"
@@ -28,6 +31,7 @@
 #include "env/terrain_model.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -39,6 +43,14 @@
 #include <unistd.h>
 
 #define ENV_PACKET_BUFFER_SIZE 1024u
+#define ENV_MAX_TERRAIN_TILES 16u
+#define ENV_COMM_DELAY_BUFFER_CAPACITY (ENV_MAX_COMMUNICATION_DELAY_STEPS + 1u)
+#define ENV_MODEL_DEGRADATION_AERO_FLAGS UINT32_C(0x00000001)
+#define ENV_MODEL_DEGRADATION_TERRAIN_WARNING UINT32_C(0x00000002)
+#define ENV_MODEL_DEGRADATION_MASS_INVALID UINT32_C(0x00000004)
+#define ENV_MODEL_DEGRADATION_INERTIA_INVALID UINT32_C(0x00000008)
+#define ENV_MODEL_DEGRADATION_ATTITUDE_ERROR UINT32_C(0x00000010)
+#define ENV_MODEL_DEGRADATION_DCM_ERROR UINT32_C(0x00000020)
 typedef struct EnvRuntimeConfig {
     /** @brief 环境进程 UDP 基础端口。 */
     unsigned int env_base_port;
@@ -85,6 +97,34 @@ typedef struct EnvScenarioConfig {
     int enable_earth_rotation;
     /** @brief 环境力、力矩和重力模型配置快照。 */
     EnvironmentForceModel force_model;
+    /** @brief 是否配置了内部气动表文件。 */
+    int aero_table_path_enabled;
+    /** @brief 内部气动表文件路径。 */
+    char aero_table_path[512];
+    /** @brief 是否用配置覆盖气动表文件中的包络外策略。 */
+    int aero_table_policy_override_enabled;
+    /** @brief 配置覆盖的气动表包络外策略。 */
+    AeroDatabaseExtrapolationPolicy aero_table_policy_override;
+    /** @brief 是否配置气动表高度包线元数据。 */
+    int aero_table_height_envelope_enabled;
+    /** @brief 气动表高度包线下界，单位米。 */
+    double aero_table_height_min_m;
+    /** @brief 气动表高度包线上界，单位米。 */
+    double aero_table_height_max_m;
+    /** @brief 是否配置气动表舵偏包线元数据。 */
+    int aero_table_actuator_envelope_enabled;
+    /** @brief 气动表舵偏包线下界，单位 rad。 */
+    double aero_table_actuator_min_rad;
+    /** @brief 气动表舵偏包线上界，单位 rad。 */
+    double aero_table_actuator_max_rad;
+    /** @brief 是否配置代理气动模型资源路径。 */
+    int aero_surrogate_model_path_enabled;
+    /** @brief 代理气动模型资源路径。 */
+    char aero_surrogate_model_path[512];
+    /** @brief 代理气动模型版本字符串。 */
+    char aero_surrogate_model_version[128];
+    /** @brief 代理模型训练数据版本字符串。 */
+    char aero_surrogate_training_data_version[128];
     /** @brief IMU 三轴陀螺仪配置。 */
     ImuSensorConfig imu_config;
     /** @brief ECEF 三轴加速度计配置。 */
@@ -101,6 +141,18 @@ typedef struct EnvScenarioConfig {
     TerrainMissingPolicy terrain_missing_policy;
     /** @brief 平坦填充策略的椭球高，单位米。 */
     double terrain_flat_fill_height_m;
+    /** @brief 本实例允许加载的地形瓦片容量。 */
+    size_t terrain_cache_tile_count;
+    /** @brief 是否配置地形瓦片索引文件。 */
+    int terrain_tile_index_path_enabled;
+    /** @brief 地形瓦片索引文件路径。 */
+    char terrain_tile_index_path[512];
+    /** @brief 配置的内部地形瓦片文件数量。 */
+    size_t terrain_tile_path_count;
+    /** @brief 内部地形瓦片文件路径数组。 */
+    char terrain_tile_paths[ENV_MAX_TERRAIN_TILES][512];
+    /** @brief 内部地形瓦片索引元数据数组。 */
+    TerrainTileIndexEntry terrain_tile_index_entries[ENV_MAX_TERRAIN_TILES];
     /** @brief 导弹初始纬度、经度和椭球高，单位度、度、米。 */
     double missile_lla[3];
     /** @brief 导弹初始 ECEF 速度，单位 m/s。 */
@@ -146,6 +198,8 @@ typedef struct EnvTruthState {
     double min_range;
     /** @brief 达到最小距离的仿真时间，单位秒。 */
     double time_of_closest;
+    /** @brief 最近一次力模型计算返回的气动诊断标志。 */
+    uint32_t aero_model_flags;
 } EnvTruthState;
 
 /** @brief 单个仿真实例拥有的全部传感器运行状态。 */
@@ -174,6 +228,37 @@ typedef struct FaultRunStats {
     /** @brief 同一仿真步内最大并发激活故障数量。 */
     size_t max_concurrent_active;
 } FaultRunStats;
+
+typedef struct CommunicationDelayLine {
+    SensorFrame frames[ENV_COMM_DELAY_BUFFER_CAPACITY];
+    size_t head;
+    size_t count;
+} CommunicationDelayLine;
+
+typedef struct CommunicationReorderState {
+    SensorFrame previous;
+    int has_previous;
+} CommunicationReorderState;
+
+/** @brief 单实例数值诊断聚合，用于 summary.json 和批量统计。 */
+typedef struct DiagnosticRunStats {
+    /** @brief 最大四元数范数误差。 */
+    double max_quat_norm_error;
+    /** @brief 最大 DCM 正交性 Frobenius 误差。 */
+    double max_dcm_orthogonality_error;
+    /** @brief 仿真期间最小总质量，单位 kg。 */
+    double min_mass_kg;
+    /** @brief 仿真期间最小惯量对角线元素，单位 kg*m^2。 */
+    double min_inertia_diag_kgm2;
+    /** @brief 本次运行中所有气动模型诊断标志的按位或。 */
+    uint32_t aero_model_flags_or;
+    /** @brief 发生气动表包线外处理的诊断采样数。 */
+    size_t aero_extrapolated_sample_count;
+    /** @brief 本次运行中所有模型降级分类标志的按位或。 */
+    uint32_t model_degradation_flags_or;
+    /** @brief 已采样诊断行数。 */
+    size_t sample_count;
+} DiagnosticRunStats;
 
 /** @brief 从运行时配置读取网络和输出目录。 */
 static SimStatus load_runtime_config(const ConfigTree *runtime, EnvRuntimeConfig *out)
@@ -400,12 +485,341 @@ static SimStatus load_seeker_config(
     return sensor_seeker_validate(out, simulation_dt_s);
 }
 
+/** @brief 追加一个内部地形瓦片路径到场景配置快照。 */
+static SimStatus append_terrain_tile_path(EnvScenarioConfig *out, const char *path)
+{
+    int written;
+
+    if (out == 0 || path == 0 || path[0] == '\0') {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (out->terrain_tile_path_count >= ENV_MAX_TERRAIN_TILES) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    written = snprintf(
+        out->terrain_tile_paths[out->terrain_tile_path_count],
+        sizeof(out->terrain_tile_paths[out->terrain_tile_path_count]),
+        "%s",
+        path);
+    if (written < 0 ||
+        (size_t)written >= sizeof(out->terrain_tile_paths[out->terrain_tile_path_count])) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    (void)memset(
+        &out->terrain_tile_index_entries[out->terrain_tile_path_count],
+        0,
+        sizeof(out->terrain_tile_index_entries[out->terrain_tile_path_count]));
+    written = snprintf(
+        out->terrain_tile_index_entries[out->terrain_tile_path_count].path,
+        sizeof(out->terrain_tile_index_entries[out->terrain_tile_path_count].path),
+        "%s",
+        path);
+    if (written < 0 ||
+        (size_t)written >= sizeof(out->terrain_tile_index_entries[out->terrain_tile_path_count].path)) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    ++out->terrain_tile_path_count;
+    return SIM_OK;
+}
+
+/** @brief 追加一个带空间边界的内部地形瓦片索引项。 */
+static SimStatus append_terrain_tile_index_entry(
+    EnvScenarioConfig *out,
+    const TerrainTileIndexEntry *entry)
+{
+    SimStatus status;
+
+    if (out == 0 || entry == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = append_terrain_tile_path(out, entry->path);
+    if (status != SIM_OK) {
+        return status;
+    }
+    out->terrain_tile_index_entries[out->terrain_tile_path_count - 1u] = *entry;
+    return SIM_OK;
+}
+
+/** @brief 判断资源路径是否已经是绝对路径。 */
+static int path_is_absolute(const char *path)
+{
+    return path != 0 &&
+        (path[0] == '/' ||
+            (isalpha((unsigned char)path[0]) != 0 && path[1] == ':' &&
+                (path[2] == '/' || path[2] == '\\')));
+}
+
+/** @brief 将索引内的相对瓦片路径解析到索引文件所在目录。 */
+static SimStatus resolve_index_relative_path(
+    const char *index_path,
+    const char *entry_path,
+    char *out,
+    size_t out_size)
+{
+    const char *last_separator = 0;
+    const char *cursor;
+    char entry_copy[512];
+    size_t directory_size;
+    int written;
+
+    if (index_path == 0 || entry_path == 0 || out == 0 || out_size == 0u ||
+        entry_path[0] == '\0') {
+        return SIM_ERR_INVALID_ARG;
+    }
+    written = snprintf(entry_copy, sizeof(entry_copy), "%s", entry_path);
+    if (written < 0 || (size_t)written >= sizeof(entry_copy)) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    if (path_is_absolute(entry_copy) != 0) {
+        written = snprintf(out, out_size, "%s", entry_copy);
+        return written >= 0 && (size_t)written < out_size ? SIM_OK : SIM_ERR_OUT_OF_RANGE;
+    }
+    for (cursor = index_path; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/' || *cursor == '\\') {
+            last_separator = cursor;
+        }
+    }
+    if (last_separator == 0) {
+        written = snprintf(out, out_size, "%s", entry_copy);
+        return written >= 0 && (size_t)written < out_size ? SIM_OK : SIM_ERR_OUT_OF_RANGE;
+    }
+    directory_size = (size_t)(last_separator - index_path);
+    if (directory_size == 0u) {
+        written = snprintf(out, out_size, "/%s", entry_copy);
+    } else {
+        if (directory_size >= out_size) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        (void)memcpy(out, index_path, directory_size);
+        out[directory_size] = '\0';
+        written = snprintf(out + directory_size, out_size - directory_size, "/%s", entry_copy);
+    }
+    return written >= 0 && directory_size + (size_t)written < out_size ?
+        SIM_OK :
+        SIM_ERR_OUT_OF_RANGE;
+}
+
+/** @brief 从文件读取小端 16 位无符号整数。 */
+static SimStatus read_file_u16_le(FILE *file, uint16_t *out)
+{
+    unsigned char bytes[2];
+
+    if (file == 0 || out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (fread(bytes, 1u, sizeof(bytes), file) != sizeof(bytes)) {
+        return SIM_ERR_CONFIG;
+    }
+    *out = (uint16_t)bytes[0] | (uint16_t)((uint16_t)bytes[1] << 8u);
+    return SIM_OK;
+}
+
+/** @brief 从文件读取小端 32 位无符号整数。 */
+static SimStatus read_file_u32_le(FILE *file, uint32_t *out)
+{
+    unsigned char bytes[4];
+    size_t index;
+    uint32_t value = 0u;
+
+    if (file == 0 || out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (fread(bytes, 1u, sizeof(bytes), file) != sizeof(bytes)) {
+        return SIM_ERR_CONFIG;
+    }
+    for (index = 0u; index < sizeof(bytes); ++index) {
+        value |= (uint32_t)bytes[index] << (8u * index);
+    }
+    *out = value;
+    return SIM_OK;
+}
+
+/** @brief 从文件读取小端 IEEE-754 双精度值。 */
+static SimStatus read_file_double_le(FILE *file, double *out)
+{
+    unsigned char bytes[8];
+    uint64_t bits = 0u;
+    size_t index;
+
+    if (file == 0 || out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (fread(bytes, 1u, sizeof(bytes), file) != sizeof(bytes)) {
+        return SIM_ERR_CONFIG;
+    }
+    for (index = 0u; index < sizeof(bytes); ++index) {
+        bits |= (uint64_t)bytes[index] << (8u * index);
+    }
+    (void)memcpy(out, &bits, sizeof(bits));
+    return SIM_OK;
+}
+
+/** @brief 从纯文本索引读取内部地形瓦片路径。 */
+static SimStatus load_terrain_tile_text_index(EnvScenarioConfig *out, const char *index_path)
+{
+    FILE *file;
+    char line[512];
+
+    if (out == 0 || index_path == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    file = fopen(index_path, "r");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    while (fgets(line, sizeof(line), file) != 0) {
+        char *start = line;
+        char *end;
+        SimStatus status;
+
+        if (strchr(line, '\n') == 0 && !feof(file)) {
+            (void)fclose(file);
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        while (*start != '\0' && isspace((unsigned char)*start) != 0) {
+            ++start;
+        }
+        if (*start == '\0' || *start == '#') {
+            continue;
+        }
+        end = start + strlen(start);
+        while (end > start && isspace((unsigned char)end[-1]) != 0) {
+            --end;
+        }
+        *end = '\0';
+        {
+            char resolved_path[512];
+
+            status = resolve_index_relative_path(
+                index_path,
+                start,
+                resolved_path,
+                sizeof(resolved_path));
+            if (status == SIM_OK) {
+                status = append_terrain_tile_path(out, resolved_path);
+            }
+        }
+        if (status != SIM_OK) {
+            (void)fclose(file);
+            return status;
+        }
+    }
+    return fclose(file) == 0 ? SIM_OK : SIM_ERR_IO;
+}
+
+/** @brief 从固定小端二进制空间索引读取内部地形瓦片路径和边界。 */
+static SimStatus load_terrain_tile_binary_index(EnvScenarioConfig *out, const char *index_path)
+{
+    FILE *file;
+    uint32_t magic = 0u;
+    uint16_t version = 0u;
+    uint16_t entry_count = 0u;
+    uint16_t index;
+    SimStatus status;
+
+    if (out == 0 || index_path == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    file = fopen(index_path, "rb");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    status = read_file_u32_le(file, &magic);
+    if (status == SIM_OK) {
+        status = read_file_u16_le(file, &version);
+    }
+    if (status == SIM_OK) {
+        status = read_file_u16_le(file, &entry_count);
+    }
+    if (status != SIM_OK) {
+        (void)fclose(file);
+        return status;
+    }
+    if (magic != TERRAIN_TILE_INDEX_MAGIC ||
+        version != TERRAIN_TILE_INDEX_VERSION ||
+        entry_count > ENV_MAX_TERRAIN_TILES) {
+        (void)fclose(file);
+        return SIM_ERR_CONFIG;
+    }
+    for (index = 0u; index < entry_count; ++index) {
+        TerrainTileIndexEntry entry;
+        uint16_t path_size = 0u;
+
+        (void)memset(&entry, 0, sizeof(entry));
+        status = read_file_double_le(file, &entry.lat_min);
+        if (status == SIM_OK) {
+            status = read_file_double_le(file, &entry.lat_max);
+        }
+        if (status == SIM_OK) {
+            status = read_file_double_le(file, &entry.lon_min);
+        }
+        if (status == SIM_OK) {
+            status = read_file_double_le(file, &entry.lon_max);
+        }
+        if (status == SIM_OK) {
+            status = read_file_u16_le(file, &path_size);
+        }
+        if (status != SIM_OK) {
+            (void)fclose(file);
+            return status;
+        }
+        if (path_size == 0u || path_size >= sizeof(entry.path)) {
+            (void)fclose(file);
+            return SIM_ERR_CONFIG;
+        }
+        if (fread(entry.path, 1u, path_size, file) != path_size) {
+            (void)fclose(file);
+            return SIM_ERR_CONFIG;
+        }
+        entry.path[path_size] = '\0';
+        status = resolve_index_relative_path(
+            index_path,
+            entry.path,
+            entry.path,
+            sizeof(entry.path));
+        if (status != SIM_OK) {
+            (void)fclose(file);
+            return status;
+        }
+        entry.has_bounds = 1;
+        status = append_terrain_tile_index_entry(out, &entry);
+        if (status != SIM_OK) {
+            (void)fclose(file);
+            return status;
+        }
+    }
+    return fclose(file) == 0 ? SIM_OK : SIM_ERR_IO;
+}
+
+/** @brief 自动识别文本或二进制地形瓦片索引。 */
+static SimStatus load_terrain_tile_index(EnvScenarioConfig *out, const char *index_path)
+{
+    FILE *file;
+    uint32_t magic = 0u;
+    SimStatus status;
+
+    if (out == 0 || index_path == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    file = fopen(index_path, "rb");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    status = read_file_u32_le(file, &magic);
+    (void)fclose(file);
+    if (status == SIM_OK && magic == TERRAIN_TILE_INDEX_MAGIC) {
+        return load_terrain_tile_binary_index(out, index_path);
+    }
+    return load_terrain_tile_text_index(out, index_path);
+}
+
 /** @brief 从场景配置读取动力学和初始条件。 */
 static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioConfig *out)
 {
     double vector_values[3];
     char integrator[16];
     char missing_policy[32];
+    char aero_policy[32];
     SimStatus status;
 
     if (scenario == 0 || out == 0) {
@@ -598,6 +1012,125 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
     if (status != SIM_OK) {
         out->force_model.aerodynamics.control_moment_coefficient = 0.0;
     }
+    status = config_get_string(
+        scenario,
+        "aerodynamics.table_path",
+        out->aero_table_path,
+        sizeof(out->aero_table_path));
+    if (status == SIM_OK) {
+        out->aero_table_path_enabled = 1;
+    } else if (status == SIM_ERR_OUT_OF_RANGE) {
+        return status;
+    }
+    status = config_get_string(
+        scenario,
+        "aerodynamics.table_extrapolation_policy",
+        aero_policy,
+        sizeof(aero_policy));
+    if (status == SIM_OK) {
+        if (strcmp(aero_policy, "ERROR") == 0) {
+            out->aero_table_policy_override = AERO_DB_EXTRAPOLATION_ERROR;
+        } else if (strcmp(aero_policy, "CLAMP_AND_WARN") == 0) {
+            out->aero_table_policy_override = AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN;
+        } else if (strcmp(aero_policy, "HOLD_LAST_VALID") == 0) {
+            out->aero_table_policy_override = AERO_DB_EXTRAPOLATION_HOLD_LAST_VALID;
+        } else {
+            return SIM_ERR_CONFIG;
+        }
+        out->aero_table_policy_override_enabled = 1;
+    } else if (status == SIM_ERR_OUT_OF_RANGE) {
+        return status;
+    }
+    {
+        double minimum = 0.0;
+        double maximum = 0.0;
+        int min_found = 0;
+        int max_found = 0;
+
+        status = config_get_double(scenario, "aerodynamics.table_height_min_m", &minimum);
+        if (status == SIM_OK) {
+            min_found = 1;
+        } else if (status == SIM_ERR_OUT_OF_RANGE) {
+            return status;
+        }
+        status = config_get_double(scenario, "aerodynamics.table_height_max_m", &maximum);
+        if (status == SIM_OK) {
+            max_found = 1;
+        } else if (status == SIM_ERR_OUT_OF_RANGE) {
+            return status;
+        }
+        if (min_found != max_found) {
+            return SIM_ERR_CONFIG;
+        }
+        if (min_found != 0) {
+            if (!isfinite(minimum) || !isfinite(maximum) || maximum < minimum) {
+                return SIM_ERR_OUT_OF_RANGE;
+            }
+            out->aero_table_height_envelope_enabled = 1;
+            out->aero_table_height_min_m = minimum;
+            out->aero_table_height_max_m = maximum;
+        }
+
+        min_found = 0;
+        max_found = 0;
+        status = config_get_double(scenario, "aerodynamics.table_actuator_min_rad", &minimum);
+        if (status == SIM_OK) {
+            min_found = 1;
+        } else if (status == SIM_ERR_OUT_OF_RANGE) {
+            return status;
+        }
+        status = config_get_double(scenario, "aerodynamics.table_actuator_max_rad", &maximum);
+        if (status == SIM_OK) {
+            max_found = 1;
+        } else if (status == SIM_ERR_OUT_OF_RANGE) {
+            return status;
+        }
+        if (min_found != max_found) {
+            return SIM_ERR_CONFIG;
+        }
+        if (min_found != 0) {
+            if (!isfinite(minimum) || !isfinite(maximum) || maximum < minimum) {
+                return SIM_ERR_OUT_OF_RANGE;
+            }
+            out->aero_table_actuator_envelope_enabled = 1;
+            out->aero_table_actuator_min_rad = minimum;
+            out->aero_table_actuator_max_rad = maximum;
+        }
+    }
+    status = config_get_string(
+        scenario,
+        "aerodynamics.surrogate_model_path",
+        out->aero_surrogate_model_path,
+        sizeof(out->aero_surrogate_model_path));
+    if (status == SIM_OK) {
+        out->aero_surrogate_model_path_enabled = 1;
+        (void)snprintf(
+            out->aero_surrogate_model_version,
+            sizeof(out->aero_surrogate_model_version),
+            "UNSPECIFIED");
+        (void)snprintf(
+            out->aero_surrogate_training_data_version,
+            sizeof(out->aero_surrogate_training_data_version),
+            "UNSPECIFIED");
+        status = config_get_string(
+            scenario,
+            "aerodynamics.surrogate_model_version",
+            out->aero_surrogate_model_version,
+            sizeof(out->aero_surrogate_model_version));
+        if (status == SIM_ERR_OUT_OF_RANGE) {
+            return status;
+        }
+        status = config_get_string(
+            scenario,
+            "aerodynamics.surrogate_training_data_version",
+            out->aero_surrogate_training_data_version,
+            sizeof(out->aero_surrogate_training_data_version));
+        if (status == SIM_ERR_OUT_OF_RANGE) {
+            return status;
+        }
+    } else if (status == SIM_ERR_OUT_OF_RANGE) {
+        return status;
+    }
     out->force_model.enable_earth_rotation = out->enable_earth_rotation;
     out->force_model.earth_rotation_rate_radps =
         ENV_WGS84_EARTH_ROTATION_RADPS;
@@ -667,6 +1200,80 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
         &out->terrain_flat_fill_height_m);
     if (status != SIM_OK) {
         out->terrain_flat_fill_height_m = 0.0;
+    }
+    {
+        unsigned int cache_tile_count = ENV_MAX_TERRAIN_TILES;
+
+        status = config_get_uint32(
+            scenario,
+            "map.terrain.cache_tile_count",
+            &cache_tile_count);
+        if (status != SIM_OK) {
+            cache_tile_count = ENV_MAX_TERRAIN_TILES;
+        }
+        if (cache_tile_count == 0u || cache_tile_count > ENV_MAX_TERRAIN_TILES) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        out->terrain_cache_tile_count = (size_t)cache_tile_count;
+    }
+    status = config_get_string(
+        scenario,
+        "map.tile_path",
+        out->terrain_tile_paths[out->terrain_tile_path_count],
+        sizeof(out->terrain_tile_paths[out->terrain_tile_path_count]));
+    if (status == SIM_OK) {
+        ++out->terrain_tile_path_count;
+    } else if (status == SIM_ERR_OUT_OF_RANGE) {
+        return status;
+    }
+    {
+        size_t tile_path_count = 0u;
+
+        status = config_get_array_count(scenario, "map.tile_paths", &tile_path_count);
+        if (status == SIM_OK) {
+            size_t index;
+
+            if (tile_path_count > ENV_MAX_TERRAIN_TILES ||
+                out->terrain_tile_path_count + tile_path_count > ENV_MAX_TERRAIN_TILES) {
+                return SIM_ERR_OUT_OF_RANGE;
+            }
+            for (index = 0u; index < tile_path_count; ++index) {
+                char tile_path_key[64];
+                char tile_path[512];
+
+                (void)snprintf(
+                    tile_path_key,
+                    sizeof(tile_path_key),
+                    "map.tile_paths[%zu]",
+                    index);
+                status = config_get_string(
+                    scenario,
+                    tile_path_key,
+                    tile_path,
+                    sizeof(tile_path));
+                if (status != SIM_OK) {
+                    return status;
+                }
+                status = append_terrain_tile_path(out, tile_path);
+                if (status != SIM_OK) {
+                    return status;
+                }
+            }
+        }
+    }
+    status = config_get_string(
+        scenario,
+        "map.tile_index_path",
+        out->terrain_tile_index_path,
+        sizeof(out->terrain_tile_index_path));
+    if (status == SIM_OK) {
+        out->terrain_tile_index_path_enabled = 1;
+        status = load_terrain_tile_index(out, out->terrain_tile_index_path);
+        if (status != SIM_OK) {
+            return status;
+        }
+    } else if (status == SIM_ERR_OUT_OF_RANGE) {
+        return status;
     }
     status = config_get_double_array(scenario, "missile.initial_lla_deg_m", out->missile_lla, 3u);
     if (status != SIM_OK) {
@@ -758,6 +1365,118 @@ static SimStatus send_sensor_frame(
     if (sent != (ssize_t)packet_size) {
         return SIM_ERR_IO;
     }
+    return SIM_OK;
+}
+
+/** @brief 清空通信层传感器帧延迟线。 */
+static void communication_delay_reset(CommunicationDelayLine *delay)
+{
+    if (delay != 0) {
+        (void)memset(delay, 0, sizeof(*delay));
+    }
+}
+
+/** @brief 向固定容量延迟线追加一帧。 */
+static SimStatus communication_delay_push(CommunicationDelayLine *delay, const SensorFrame *sensor)
+{
+    size_t tail;
+
+    if (delay == 0 || sensor == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (delay->count >= ENV_COMM_DELAY_BUFFER_CAPACITY) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    tail = (delay->head + delay->count) % ENV_COMM_DELAY_BUFFER_CAPACITY;
+    delay->frames[tail] = *sensor;
+    ++delay->count;
+    return SIM_OK;
+}
+
+/** @brief 从固定容量延迟线弹出最旧一帧。 */
+static SimStatus communication_delay_pop(CommunicationDelayLine *delay, SensorFrame *sensor)
+{
+    if (delay == 0 || sensor == 0 || delay->count == 0u) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    *sensor = delay->frames[delay->head];
+    delay->head = (delay->head + 1u) % ENV_COMM_DELAY_BUFFER_CAPACITY;
+    --delay->count;
+    return SIM_OK;
+}
+
+/** @brief 应用锁步安全的通信层帧延迟故障。 */
+static SimStatus apply_communication_delay(
+    CommunicationDelayLine *delay,
+    const FaultStepEffects *effects,
+    SensorFrame *sensor)
+{
+    SensorFrame current;
+
+    if (delay == 0 || effects == 0 || sensor == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (effects->communication_delay_enabled == 0) {
+        communication_delay_reset(delay);
+        return SIM_OK;
+    }
+    if (effects->communication_delay_steps == 0u ||
+        effects->communication_delay_steps > ENV_MAX_COMMUNICATION_DELAY_STEPS) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    current = *sensor;
+    if (communication_delay_push(delay, &current) != SIM_OK) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    if (delay->count > (size_t)effects->communication_delay_steps) {
+        return communication_delay_pop(delay, sensor);
+    }
+    sensor->sensor_valid_flags &= ~(
+        SIM_SENSOR_VALID_SEEKER |
+        SIM_SENSOR_VALID_IMU_GYRO |
+        SIM_SENSOR_VALID_ACCEL |
+        SIM_SENSOR_VALID_SPEED);
+    sensor->sensor_fault_flags |= SIM_SENSOR_FAULT_DELAY_WARMUP;
+    return SIM_OK;
+}
+
+/** @brief 重置通信乱序/上一帧重放状态。 */
+static void communication_reorder_reset(CommunicationReorderState *state)
+{
+    if (state != 0) {
+        (void)memset(state, 0, sizeof(*state));
+    }
+}
+
+/** @brief 应用锁步安全的通信乱序故障。 */
+static SimStatus apply_communication_reorder(
+    CommunicationReorderState *state,
+    const FaultStepEffects *effects,
+    SensorFrame *sensor)
+{
+    SensorFrame current;
+
+    if (state == 0 || effects == 0 || sensor == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (effects->communication_reorder_enabled == 0) {
+        communication_reorder_reset(state);
+        return SIM_OK;
+    }
+    current = *sensor;
+    if (state->has_previous != 0) {
+        *sensor = state->previous;
+        state->previous = current;
+        return SIM_OK;
+    }
+    state->previous = current;
+    state->has_previous = 1;
+    sensor->sensor_valid_flags &= ~(
+        SIM_SENSOR_VALID_SEEKER |
+        SIM_SENSOR_VALID_IMU_GYRO |
+        SIM_SENSOR_VALID_ACCEL |
+        SIM_SENSOR_VALID_SPEED);
+    sensor->sensor_fault_flags |= SIM_SENSOR_FAULT_DELAY_WARMUP;
     return SIM_OK;
 }
 
@@ -1001,6 +1720,7 @@ static SimStatus update_truth(
     if (status != SIM_OK) {
         return status;
     }
+    state->aero_model_flags = force_output.aerodynamic_model_flags;
     status = missile_plant_step(
         &state->missile_plant,
         &force_output.plant_input,
@@ -1091,6 +1811,36 @@ static SimStatus make_run_dirs(const char *base_dir, uint32_t instance_id, char 
     return SIM_OK;
 }
 
+/** @brief 将地形缺瓦片策略转为清单中的稳定字符串。 */
+static const char *terrain_missing_policy_name(TerrainMissingPolicy policy)
+{
+    switch (policy) {
+    case MAP_MISSING_ERROR:
+        return "ERROR";
+    case MAP_MISSING_FLAT_FILL:
+        return "FLAT_FILL";
+    case MAP_MISSING_NEAREST:
+        return "NEAREST";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+/** @brief 将气动表包络外策略转为清单中的稳定字符串。 */
+static const char *aero_extrapolation_policy_name(AeroDatabaseExtrapolationPolicy policy)
+{
+    switch (policy) {
+    case AERO_DB_EXTRAPOLATION_ERROR:
+        return "ERROR";
+    case AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN:
+        return "CLAMP_AND_WARN";
+    case AERO_DB_EXTRAPOLATION_HOLD_LAST_VALID:
+        return "HOLD_LAST_VALID";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 /** @brief 写出可复现实例所需的软件、配置、端口和时间参数。 */
 static SimStatus write_run_manifest(
     const char *instance_dir,
@@ -1103,6 +1853,7 @@ static SimStatus write_run_manifest(
 {
     char path[1024];
     FILE *file;
+    size_t tile_index;
 
     (void)snprintf(path, sizeof(path), "%s/run_manifest.json", instance_dir);
     file = fopen(path, "wb");
@@ -1149,12 +1900,104 @@ static SimStatus write_run_manifest(
         scenario->force_model.aerodynamics.enabled != 0 ? "true" : "false");
     (void)fprintf(
         file,
+        "  \"aero_table_enabled\": %s,\n",
+        scenario->aero_table_path_enabled != 0 ? "true" : "false");
+    if (scenario->aero_table_path_enabled != 0) {
+        (void)fprintf(file, "  \"aero_table_path\": \"%s\",\n", scenario->aero_table_path);
+        (void)fprintf(file, "  \"aero_table_file_version\": %u,\n", AERO_DATABASE_VERSION);
+        (void)fprintf(
+            file,
+            "  \"aero_table_extrapolation_policy_source\": \"%s\",\n",
+            scenario->aero_table_policy_override_enabled != 0 ? "CONFIG_OVERRIDE" : "FILE_HEADER");
+        if (scenario->aero_table_policy_override_enabled != 0) {
+            (void)fprintf(
+                file,
+                "  \"aero_table_extrapolation_policy\": \"%s\",\n",
+                aero_extrapolation_policy_name(scenario->aero_table_policy_override));
+        }
+        (void)fprintf(
+            file,
+            "  \"aero_table_height_envelope_enabled\": %s,\n",
+            scenario->aero_table_height_envelope_enabled != 0 ? "true" : "false");
+        if (scenario->aero_table_height_envelope_enabled != 0) {
+            (void)fprintf(
+                file,
+                "  \"aero_table_height_min_m\": %.17g,\n",
+                scenario->aero_table_height_min_m);
+            (void)fprintf(
+                file,
+                "  \"aero_table_height_max_m\": %.17g,\n",
+                scenario->aero_table_height_max_m);
+        }
+        (void)fprintf(
+            file,
+            "  \"aero_table_actuator_envelope_enabled\": %s,\n",
+            scenario->aero_table_actuator_envelope_enabled != 0 ? "true" : "false");
+        if (scenario->aero_table_actuator_envelope_enabled != 0) {
+            (void)fprintf(
+                file,
+                "  \"aero_table_actuator_min_rad\": %.17g,\n",
+                scenario->aero_table_actuator_min_rad);
+            (void)fprintf(
+                file,
+                "  \"aero_table_actuator_max_rad\": %.17g,\n",
+                scenario->aero_table_actuator_max_rad);
+        }
+    }
+    (void)fprintf(
+        file,
+        "  \"aero_surrogate_enabled\": %s,\n",
+        scenario->aero_surrogate_model_path_enabled != 0 ? "true" : "false");
+    if (scenario->aero_surrogate_model_path_enabled != 0) {
+        (void)fprintf(file, "  \"aero_surrogate_model_path\": \"%s\",\n", scenario->aero_surrogate_model_path);
+        (void)fprintf(
+            file,
+            "  \"aero_surrogate_model_version\": \"%s\",\n",
+            scenario->aero_surrogate_model_version);
+        (void)fprintf(
+            file,
+            "  \"aero_surrogate_training_data_version\": \"%s\",\n",
+            scenario->aero_surrogate_training_data_version);
+    }
+    (void)fprintf(
+        file,
         "  \"propulsion_enabled\": %s,\n",
         scenario->force_model.propulsion.enabled != 0 ? "true" : "false");
     (void)fprintf(
         file,
         "  \"earth_rotation_enabled\": %s,\n",
         scenario->force_model.enable_earth_rotation != 0 ? "true" : "false");
+    (void)fprintf(
+        file,
+        "  \"terrain_enabled\": %s,\n",
+        scenario->terrain_enabled != 0 ? "true" : "false");
+    (void)fprintf(
+        file,
+        "  \"terrain_los_occlusion_enabled\": %s,\n",
+        scenario->los_occlusion_enabled != 0 ? "true" : "false");
+    (void)fprintf(
+        file,
+        "  \"terrain_missing_policy\": \"%s\",\n",
+        terrain_missing_policy_name(scenario->terrain_missing_policy));
+    (void)fprintf(file, "  \"terrain_flat_fill_height_m\": %.17g,\n", scenario->terrain_flat_fill_height_m);
+    (void)fprintf(file, "  \"terrain_cache_tile_count\": %zu,\n", scenario->terrain_cache_tile_count);
+    (void)fprintf(
+        file,
+        "  \"terrain_tile_index_path_enabled\": %s,\n",
+        scenario->terrain_tile_index_path_enabled != 0 ? "true" : "false");
+    if (scenario->terrain_tile_index_path_enabled != 0) {
+        (void)fprintf(file, "  \"terrain_tile_index_path\": \"%s\",\n", scenario->terrain_tile_index_path);
+    }
+    (void)fprintf(file, "  \"terrain_tile_path_count\": %zu,\n", scenario->terrain_tile_path_count);
+    (void)fprintf(file, "  \"terrain_tile_paths\": [");
+    for (tile_index = 0u; tile_index < scenario->terrain_tile_path_count; ++tile_index) {
+        (void)fprintf(
+            file,
+            "%s\"%s\"",
+            tile_index == 0u ? "" : ", ",
+            scenario->terrain_tile_paths[tile_index]);
+    }
+    (void)fprintf(file, "],\n");
     (void)fprintf(file, "  \"binary_logs\": %s,\n", runtime->binary_logs != 0 ? "true" : "false");
     (void)fprintf(file, "  \"event_log\": %s\n", runtime->event_log != 0 ? "true" : "false");
     (void)fprintf(file, "}\n");
@@ -1235,7 +2078,9 @@ static int fault_effects_affect_sensor(const FaultStepEffects *effects)
         effects->seeker_closing_velocity_bias_mps != 0.0 ||
         vec3_norm(effects->gyro_bias_b_radps) > 0.0 ||
         vec3_norm(effects->accel_bias_ecef_mps2) > 0.0 ||
-        vec3_norm(effects->speed_bias_ecef_mps) > 0.0;
+        vec3_norm(effects->speed_bias_ecef_mps) > 0.0 ||
+        effects->communication_delay_enabled != 0 ||
+        effects->communication_reorder_enabled != 0;
 }
 
 /** @brief 判断当前步故障效果是否改变了虚拟执行机构命令或状态。 */
@@ -1262,7 +2107,9 @@ static void write_summary(
     const EnvTruthState *state,
     uint32_t steps,
     const char *exit_reason,
-    const FaultRunStats *fault_stats)
+    const FaultRunStats *fault_stats,
+    const TerrainTileCache *terrain_cache,
+    const DiagnosticRunStats *diagnostic_stats)
 {
     char path[1024];
     FILE *file;
@@ -1305,7 +2152,7 @@ static void write_summary(
             (unsigned long)fault_stats->actuator_affected_step_count);
         (void)fprintf(
             file,
-            "  \"fault_max_concurrent_active\": %lu\n",
+            "  \"fault_max_concurrent_active\": %lu,\n",
             (unsigned long)fault_stats->max_concurrent_active);
     } else {
         (void)fprintf(file, "  \"fault_configured_count\": 0,\n");
@@ -1314,7 +2161,78 @@ static void write_summary(
         (void)fprintf(file, "  \"fault_active_step_count\": 0,\n");
         (void)fprintf(file, "  \"fault_sensor_affected_step_count\": 0,\n");
         (void)fprintf(file, "  \"fault_actuator_affected_step_count\": 0,\n");
-        (void)fprintf(file, "  \"fault_max_concurrent_active\": 0\n");
+        (void)fprintf(file, "  \"fault_max_concurrent_active\": 0,\n");
+    }
+    if (terrain_cache != 0) {
+        (void)fprintf(
+            file,
+            "  \"terrain_cache_path_count\": %lu,\n",
+            (unsigned long)terrain_cache->path_count);
+        (void)fprintf(
+            file,
+            "  \"terrain_cache_capacity\": %lu,\n",
+            (unsigned long)terrain_cache->capacity);
+        (void)fprintf(
+            file,
+            "  \"terrain_cache_loaded_count\": %lu,\n",
+            (unsigned long)terrain_cache->loaded_count);
+        (void)fprintf(
+            file,
+            "  \"terrain_cache_load_count\": %llu,\n",
+            (unsigned long long)terrain_cache->load_count);
+        (void)fprintf(
+            file,
+            "  \"terrain_cache_eviction_count\": %llu,\n",
+            (unsigned long long)terrain_cache->eviction_count);
+    } else {
+        (void)fprintf(file, "  \"terrain_cache_path_count\": 0,\n");
+        (void)fprintf(file, "  \"terrain_cache_capacity\": 0,\n");
+        (void)fprintf(file, "  \"terrain_cache_loaded_count\": 0,\n");
+        (void)fprintf(file, "  \"terrain_cache_load_count\": 0,\n");
+        (void)fprintf(file, "  \"terrain_cache_eviction_count\": 0,\n");
+    }
+    if (diagnostic_stats != 0 && diagnostic_stats->sample_count > 0u) {
+        (void)fprintf(
+            file,
+            "  \"diagnostic_sample_count\": %lu,\n",
+            (unsigned long)diagnostic_stats->sample_count);
+        (void)fprintf(
+            file,
+            "  \"max_quat_norm_error\": %.12e,\n",
+            diagnostic_stats->max_quat_norm_error);
+        (void)fprintf(
+            file,
+            "  \"max_dcm_orthogonality_error\": %.12e,\n",
+            diagnostic_stats->max_dcm_orthogonality_error);
+        (void)fprintf(
+            file,
+            "  \"min_mass_kg\": %.9f,\n",
+            diagnostic_stats->min_mass_kg);
+        (void)fprintf(
+            file,
+            "  \"min_inertia_diag_kgm2\": %.9f,\n",
+            diagnostic_stats->min_inertia_diag_kgm2);
+        (void)fprintf(
+            file,
+            "  \"aero_model_flags_or\": %u,\n",
+            diagnostic_stats->aero_model_flags_or);
+        (void)fprintf(
+            file,
+            "  \"model_degradation_flags_or\": %u,\n",
+            diagnostic_stats->model_degradation_flags_or);
+        (void)fprintf(
+            file,
+            "  \"aero_extrapolated_sample_count\": %lu\n",
+            (unsigned long)diagnostic_stats->aero_extrapolated_sample_count);
+    } else {
+        (void)fprintf(file, "  \"diagnostic_sample_count\": 0,\n");
+        (void)fprintf(file, "  \"max_quat_norm_error\": 0.000000000000e+00,\n");
+        (void)fprintf(file, "  \"max_dcm_orthogonality_error\": 0.000000000000e+00,\n");
+        (void)fprintf(file, "  \"min_mass_kg\": 0.000000000,\n");
+        (void)fprintf(file, "  \"min_inertia_diag_kgm2\": 0.000000000,\n");
+        (void)fprintf(file, "  \"aero_model_flags_or\": 0,\n");
+        (void)fprintf(file, "  \"model_degradation_flags_or\": 0,\n");
+        (void)fprintf(file, "  \"aero_extrapolated_sample_count\": 0\n");
     }
     (void)fprintf(file, "}\n");
     (void)fclose(file);
@@ -1388,6 +2306,205 @@ static void write_trajectory_row(FILE *file, const EnvTruthState *state)
         closing_velocity);
 }
 
+/** @brief 写入数值诊断 CSV 表头。 */
+static void write_diagnostics_header(FILE *file)
+{
+    (void)fprintf(
+        file,
+        "time_s,quat_norm_error,dcm_orthogonality_error,mass_kg,"
+        "propellant_mass_kg,inertia_min_diag_kgm2,aero_model_flags,"
+        "model_degradation_flags,aero_uncertainty_scale,integrator_type,dt_s,"
+        "force_norm_n,moment_norm_nm\n");
+}
+
+/** @brief 计算姿态 DCM 正交性 Frobenius 误差。 */
+static double dcm_orthogonality_error(Quat attitude)
+{
+    Matrix3 dcm;
+    Matrix3 product;
+    double sum = 0.0;
+    size_t row;
+    size_t column;
+
+    if (quat_to_dcm(attitude, &dcm) != SIM_OK) {
+        return HUGE_VAL;
+    }
+    product = matrix3_multiply(dcm, matrix3_transpose(dcm));
+    for (row = 0u; row < 3u; ++row) {
+        for (column = 0u; column < 3u; ++column) {
+            const double expected = row == column ? 1.0 : 0.0;
+            const double error = product.m[row][column] - expected;
+
+            sum += error * error;
+        }
+    }
+    return sqrt(sum);
+}
+
+/** @brief 计算当前状态的诊断标量。 */
+static void compute_diagnostics(
+    const EnvTruthState *state,
+    double *quat_norm_error,
+    double *dcm_error,
+    double *inertia_min)
+{
+    const Quat q = state->missile_plant.q_bi;
+    const double q_norm = sqrt((q.w * q.w) + (q.x * q.x) + (q.y * q.y) + (q.z * q.z));
+    double min_diag = state->missile_plant.inertia_b.m[0][0];
+
+    if (state->missile_plant.inertia_b.m[1][1] < min_diag) {
+        min_diag = state->missile_plant.inertia_b.m[1][1];
+    }
+    if (state->missile_plant.inertia_b.m[2][2] < min_diag) {
+        min_diag = state->missile_plant.inertia_b.m[2][2];
+    }
+    if (quat_norm_error != 0) {
+        *quat_norm_error = fabs(q_norm - 1.0);
+    }
+    if (dcm_error != 0) {
+        *dcm_error = dcm_orthogonality_error(q);
+    }
+    if (inertia_min != 0) {
+        *inertia_min = min_diag;
+    }
+}
+
+/** @brief 将当前诊断标量分类为模型降级 flags。 */
+static uint32_t classify_model_degradation(
+    const EnvTruthState *state,
+    const TerrainModel *terrain,
+    double quat_error,
+    double dcm_error,
+    double inertia_min)
+{
+    uint32_t flags = 0u;
+
+    if (state == 0) {
+        return ENV_MODEL_DEGRADATION_MASS_INVALID |
+            ENV_MODEL_DEGRADATION_INERTIA_INVALID;
+    }
+    if (state->aero_model_flags != 0u) {
+        flags |= ENV_MODEL_DEGRADATION_AERO_FLAGS;
+    }
+    if (terrain != 0 && terrain->warning_flags != 0u) {
+        flags |= ENV_MODEL_DEGRADATION_TERRAIN_WARNING;
+    }
+    if (!isfinite(state->missile_mass.mass_kg) || state->missile_mass.mass_kg <= 0.0) {
+        flags |= ENV_MODEL_DEGRADATION_MASS_INVALID;
+    }
+    if (!isfinite(inertia_min) || inertia_min <= 0.0) {
+        flags |= ENV_MODEL_DEGRADATION_INERTIA_INVALID;
+    }
+    if (!isfinite(quat_error) || quat_error > 1.0e-6) {
+        flags |= ENV_MODEL_DEGRADATION_ATTITUDE_ERROR;
+    }
+    if (!isfinite(dcm_error) || dcm_error > 1.0e-6) {
+        flags |= ENV_MODEL_DEGRADATION_DCM_ERROR;
+    }
+    return flags;
+}
+
+/** @brief 将当前状态累加进本次运行的数值诊断统计。 */
+static void update_diagnostic_stats(
+    DiagnosticRunStats *stats,
+    const EnvTruthState *state,
+    const TerrainModel *terrain)
+{
+    double quat_error;
+    double dcm_error;
+    double inertia_min;
+    uint32_t degradation_flags;
+
+    if (stats == 0 || state == 0) {
+        return;
+    }
+    compute_diagnostics(state, &quat_error, &dcm_error, &inertia_min);
+    degradation_flags = classify_model_degradation(
+        state,
+        terrain,
+        quat_error,
+        dcm_error,
+        inertia_min);
+    if (stats->sample_count == 0u || quat_error > stats->max_quat_norm_error) {
+        stats->max_quat_norm_error = quat_error;
+    }
+    if (stats->sample_count == 0u || dcm_error > stats->max_dcm_orthogonality_error) {
+        stats->max_dcm_orthogonality_error = dcm_error;
+    }
+    if (stats->sample_count == 0u || state->missile_mass.mass_kg < stats->min_mass_kg) {
+        stats->min_mass_kg = state->missile_mass.mass_kg;
+    }
+    if (stats->sample_count == 0u || inertia_min < stats->min_inertia_diag_kgm2) {
+        stats->min_inertia_diag_kgm2 = inertia_min;
+    }
+    stats->aero_model_flags_or |= state->aero_model_flags;
+    if ((state->aero_model_flags & AERO_DB_FLAG_EXTRAPOLATED) != 0u) {
+        ++stats->aero_extrapolated_sample_count;
+    }
+    stats->model_degradation_flags_or |= degradation_flags;
+    ++stats->sample_count;
+}
+
+/** @brief 写入一行数值诊断。 */
+static void write_diagnostics_row(
+    FILE *file,
+    const EnvTruthState *state,
+    const EnvScenarioConfig *scenario,
+    const TerrainModel *terrain)
+{
+    double quat_error;
+    double dcm_error;
+    double inertia_min;
+    uint32_t degradation_flags;
+
+    compute_diagnostics(state, &quat_error, &dcm_error, &inertia_min);
+    degradation_flags = classify_model_degradation(
+        state,
+        terrain,
+        quat_error,
+        dcm_error,
+        inertia_min);
+    (void)fprintf(
+        file,
+        "%.6f,%.12e,%.12e,%.9f,%.9f,%.9f,%u,%u,%.9f,%d,%.9f,%.9f,%.9f\n",
+        state->time,
+        quat_error,
+        dcm_error,
+        state->missile_mass.mass_kg,
+        state->missile_mass.propellant_mass_kg,
+        inertia_min,
+        state->aero_model_flags,
+        degradation_flags,
+        0.0,
+        (int)scenario->integrator,
+        scenario->dt,
+        vec3_norm(state->missile_plant.force_b),
+        vec3_norm(state->missile_plant.moment_b));
+}
+
+/** @brief 释放已加载的地形瓦片数组。 */
+static void unload_terrain_tiles(TerrainTile *tiles, size_t tile_count)
+{
+    size_t index;
+
+    if (tiles == 0) {
+        return;
+    }
+    for (index = 0u; index < tile_count; ++index) {
+        map_tile_unload(&tiles[index]);
+    }
+}
+
+/** @brief 释放预加载瓦片和懒加载缓存中的瓦片。 */
+static void unload_terrain_resources(
+    TerrainTile *tiles,
+    size_t tile_count,
+    TerrainTileCache *cache)
+{
+    unload_terrain_tiles(tiles, tile_count);
+    terrain_tile_cache_unload(cache);
+}
+
 SimStatus env_app_run(const EnvContext *ctx)
 {
     ConfigTree scenario_tree;
@@ -1397,9 +2514,18 @@ SimStatus env_app_run(const EnvContext *ctx)
     EnvTruthState state;
     EnvSensorState sensors;
     FaultInjection faults;
+    CommunicationDelayLine communication_delay;
+    CommunicationReorderState communication_reorder;
     FaultRunStats fault_stats;
+    DiagnosticRunStats diagnostic_stats;
     EarthModel earth;
     TerrainModel terrain;
+    TerrainTile terrain_tiles[ENV_MAX_TERRAIN_TILES];
+    TerrainTileCache terrain_cache;
+    size_t terrain_tile_count = 0u;
+    AeroDatabase aero_database;
+    AeroSurrogateModel aero_surrogate;
+    int aero_database_loaded = 0;
     Logger logger;
     SimStatus status;
     int sock = -1;
@@ -1411,6 +2537,7 @@ SimStatus env_app_run(const EnvContext *ctx)
     FILE *sensor_log = 0;
     FILE *command_log = 0;
     FILE *trajectory_log = 0;
+    FILE *diagnostics_log = 0;
     FILE *event_log = 0;
     uint32_t seq = 0u;
     int hit = 0;
@@ -1425,6 +2552,13 @@ SimStatus env_app_run(const EnvContext *ctx)
     memset(&scenario_tree, 0, sizeof(scenario_tree));
     memset(&runtime_tree, 0, sizeof(runtime_tree));
     memset(&fault_stats, 0, sizeof(fault_stats));
+    memset(&diagnostic_stats, 0, sizeof(diagnostic_stats));
+    memset(terrain_tiles, 0, sizeof(terrain_tiles));
+    memset(&terrain_cache, 0, sizeof(terrain_cache));
+    memset(&aero_database, 0, sizeof(aero_database));
+    memset(&aero_surrogate, 0, sizeof(aero_surrogate));
+    communication_delay_reset(&communication_delay);
+    communication_reorder_reset(&communication_reorder);
     status = logger_open_stdout(&logger);
     if (status != SIM_OK) {
         return status;
@@ -1657,13 +2791,20 @@ SimStatus env_app_run(const EnvContext *ctx)
     }
 
     earth = earth_model_wgs84();
-    status = terrain_model_init(
-        &terrain,
-        0,
-        0u,
-        scenario.terrain_missing_policy,
-        scenario.terrain_flat_fill_height_m);
+    status = terrain_tile_cache_init_from_index(
+        &terrain_cache,
+        scenario.terrain_tile_index_entries,
+        scenario.terrain_tile_path_count,
+        scenario.terrain_cache_tile_count);
+    if (status == SIM_OK) {
+        status = terrain_model_init_with_cache(
+            &terrain,
+            &terrain_cache,
+            scenario.terrain_missing_policy,
+            scenario.terrain_flat_fill_height_m);
+    }
     if (status != SIM_OK) {
+        unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
         (void)fclose(trajectory_log);
         if (sensor_log != 0) {
             (void)fclose(sensor_log);
@@ -1706,6 +2847,7 @@ SimStatus env_app_run(const EnvContext *ctx)
             (void)close(sock);
             config_free(&scenario_tree);
             config_free(&runtime_tree);
+            unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
             return status;
         }
         state.missile_pos = missile_ecef.position_m;
@@ -1735,6 +2877,7 @@ SimStatus env_app_run(const EnvContext *ctx)
         (void)close(sock);
         config_free(&scenario_tree);
         config_free(&runtime_tree);
+        unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
         return status;
     }
     state.initial_mass_kg = state.missile_mass.mass_kg;
@@ -1755,6 +2898,55 @@ SimStatus env_app_run(const EnvContext *ctx)
             state.acceleration_actuators[index].time_constant = scenario.command_tau_s;
         }
     }
+    if (scenario.aero_table_path_enabled != 0) {
+        status = aero_database_load_file(scenario.aero_table_path, &aero_database);
+        if (status != SIM_OK) {
+            (void)fclose(trajectory_log);
+            if (sensor_log != 0) {
+                (void)fclose(sensor_log);
+            }
+            if (command_log != 0) {
+                (void)fclose(command_log);
+            }
+            if (event_log != 0) {
+                (void)fclose(event_log);
+            }
+            unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+            (void)close(sock);
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            return status;
+        }
+        if (scenario.aero_table_policy_override_enabled != 0) {
+            aero_database.extrapolation_policy = scenario.aero_table_policy_override;
+        }
+        scenario.force_model.aerodynamics.database = &aero_database;
+        aero_database_loaded = 1;
+    }
+    if (scenario.aero_surrogate_model_path_enabled != 0) {
+        status = aero_surrogate_load_file(scenario.aero_surrogate_model_path, &aero_surrogate);
+        if (status != SIM_OK) {
+            (void)fclose(trajectory_log);
+            if (sensor_log != 0) {
+                (void)fclose(sensor_log);
+            }
+            if (command_log != 0) {
+                (void)fclose(command_log);
+            }
+            if (event_log != 0) {
+                (void)fclose(event_log);
+            }
+            if (aero_database_loaded != 0) {
+                aero_database_unload(&aero_database);
+            }
+            unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+            (void)close(sock);
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            return status;
+        }
+        scenario.force_model.aerodynamics.surrogate = &aero_surrogate;
+    }
     status = update_geodetic_state(&state, &earth, &terrain);
     if (status != SIM_OK) {
         exit_reason = "terrain_initialization_failed";
@@ -1762,8 +2954,33 @@ SimStatus env_app_run(const EnvContext *ctx)
     }
     state.min_range = vec3_norm(vec3_sub(state.target_pos, state.missile_pos));
     if (trajectory_log != 0) {
+        (void)snprintf(path, sizeof(path), "%s/trajectory_diagnostics.csv", instance_dir);
+        diagnostics_log = fopen(path, "wb");
+        if (diagnostics_log == 0) {
+            (void)fclose(trajectory_log);
+            if (sensor_log != 0) {
+                (void)fclose(sensor_log);
+            }
+            if (command_log != 0) {
+                (void)fclose(command_log);
+            }
+            if (event_log != 0) {
+                (void)fclose(event_log);
+            }
+            if (aero_database_loaded != 0) {
+                aero_database_unload(&aero_database);
+            }
+            unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+            (void)close(sock);
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            return SIM_ERR_IO;
+        }
         write_trajectory_header(trajectory_log);
         write_trajectory_row(trajectory_log, &state);
+        write_diagnostics_header(diagnostics_log);
+        update_diagnostic_stats(&diagnostic_stats, &state, &terrain);
+        write_diagnostics_row(diagnostics_log, &state, &scenario, &terrain);
     }
 
     (void)logger_info(&logger, "environment_sim UDP loop started");
@@ -1886,6 +3103,18 @@ SimStatus env_app_run(const EnvContext *ctx)
             }
         }
         fault_injection_apply_sensor(&fault_effects, &sensor);
+        status = apply_communication_reorder(&communication_reorder, &fault_effects, &sensor);
+        if (status != SIM_OK) {
+            exit_reason = "communication_reorder_failed";
+            write_event(event_log, state.time, "FAULT_ERROR", sim_status_to_string(status));
+            break;
+        }
+        status = apply_communication_delay(&communication_delay, &fault_effects, &sensor);
+        if (status != SIM_OK) {
+            exit_reason = "communication_delay_failed";
+            write_event(event_log, state.time, "FAULT_ERROR", sim_status_to_string(status));
+            break;
+        }
 
         status = send_sensor_frame(sock, &fc_addr, ctx->instance_id, &sensor);
         if (status != SIM_OK) {
@@ -1935,6 +3164,8 @@ SimStatus env_app_run(const EnvContext *ctx)
         }
         if (trajectory_log != 0) {
             write_trajectory_row(trajectory_log, &state);
+            update_diagnostic_stats(&diagnostic_stats, &state, &terrain);
+            write_diagnostics_row(diagnostics_log, &state, &scenario, &terrain);
         }
         ++seq;
         if (runtime.flush_every_steps > 0u && (seq % runtime.flush_every_steps) == 0u) {
@@ -1945,6 +3176,9 @@ SimStatus env_app_run(const EnvContext *ctx)
                 (void)fflush(command_log);
             }
             (void)fflush(trajectory_log);
+            if (diagnostics_log != 0) {
+                (void)fflush(diagnostics_log);
+            }
             if (event_log != 0) {
                 (void)fflush(event_log);
             }
@@ -1960,14 +3194,29 @@ SimStatus env_app_run(const EnvContext *ctx)
     if (trajectory_log != 0) {
         (void)fclose(trajectory_log);
     }
+    if (diagnostics_log != 0) {
+        (void)fclose(diagnostics_log);
+    }
     write_event(event_log, state.time, "SIMULATION_STOP", exit_reason);
     if (event_log != 0) {
         (void)fclose(event_log);
     }
-    write_summary(instance_dir, hit, &state, seq, exit_reason, &fault_stats);
+    write_summary(
+        instance_dir,
+        hit,
+        &state,
+        seq,
+        exit_reason,
+        &fault_stats,
+        &terrain_cache,
+        &diagnostic_stats);
 
     if (sock >= 0) {
         (void)close(sock);
+    }
+    unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+    if (aero_database_loaded != 0) {
+        aero_database_unload(&aero_database);
     }
     config_free(&scenario_tree);
     config_free(&runtime_tree);

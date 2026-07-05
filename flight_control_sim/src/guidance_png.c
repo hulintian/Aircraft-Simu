@@ -22,6 +22,7 @@ SimStatus guidance_png_update(
     if (!isfinite(cfg->navigation_constant) ||
         !isfinite(cfg->max_accel_mps2) ||
         !isfinite(cfg->max_accel_rate_mps3) ||
+        !isfinite(in->range_m) ||
         !isfinite(in->closing_velocity_mps) ||
         !vec3_isfinite(in->los_unit_ecef) ||
         !vec3_isfinite(in->los_rate_ecef)) {

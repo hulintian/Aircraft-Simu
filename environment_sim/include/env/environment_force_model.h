@@ -67,6 +67,8 @@ typedef struct EnvironmentForceOutput {
     Vec3 aerodynamic_force_b_n;
     /** @brief 气动力矩，单位 N*m。 */
     Vec3 aerodynamic_moment_b_nm;
+    /** @brief 气动模型诊断标志，例如表格外推或钳制。 */
+    uint32_t aerodynamic_model_flags;
     /** @brief 推进力，单位 N。 */
     Vec3 propulsion_force_b_n;
     /** @brief 本步有效推进剂质量流量，单位 kg/s。 */

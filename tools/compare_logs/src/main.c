@@ -1,0 +1,361 @@
+/** @file main.c
+ *  @brief 比较协议二进制日志并输出回归判定。
+ */
+#include "common/packet.h"
+#include "common/status.h"
+#include "common/vec3.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef enum CompareKind {
+    COMPARE_COMMAND = 0,
+    COMPARE_SENSOR = 1
+} CompareKind;
+
+typedef struct CompareOptions {
+    const char *left_path;
+    const char *right_path;
+    const char *output_path;
+    uint32_t instance_id;
+    double abs_tol;
+    double rel_tol;
+    CompareKind kind;
+} CompareOptions;
+
+typedef struct CompareStats {
+    uint32_t frame_count_left;
+    uint32_t frame_count_right;
+    uint32_t first_divergent_frame;
+    uint32_t status_bit_mismatch_count;
+    uint32_t mode_mismatch_count;
+    double max_abs_error;
+    double max_rel_error;
+    int diverged;
+} CompareStats;
+
+static void print_usage(const char *argv0)
+{
+    (void)fprintf(
+        stderr,
+        "usage: %s --type command|sensor --instance-id N --left A.bin --right B.bin "
+        "[--abs-tol X] [--rel-tol X] [--output result.json]\n",
+        argv0);
+}
+
+static SimStatus parse_args(int argc, char **argv, CompareOptions *out)
+{
+    int i;
+
+    if (out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    out->kind = COMPARE_COMMAND;
+    out->abs_tol = 1.0e-9;
+    out->rel_tol = 1.0e-9;
+    for (i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        }
+        if (strcmp(argv[i], "--type") == 0 && (i + 1) < argc) {
+            const char *kind = argv[++i];
+
+            if (strcmp(kind, "command") == 0) {
+                out->kind = COMPARE_COMMAND;
+            } else if (strcmp(kind, "sensor") == 0) {
+                out->kind = COMPARE_SENSOR;
+            } else {
+                return SIM_ERR_CONFIG;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--instance-id") == 0 && (i + 1) < argc) {
+            out->instance_id = (uint32_t)strtoul(argv[++i], 0, 10);
+            continue;
+        }
+        if (strcmp(argv[i], "--left") == 0 && (i + 1) < argc) {
+            out->left_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--right") == 0 && (i + 1) < argc) {
+            out->right_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--output") == 0 && (i + 1) < argc) {
+            out->output_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--abs-tol") == 0 && (i + 1) < argc) {
+            out->abs_tol = strtod(argv[++i], 0);
+            continue;
+        }
+        if (strcmp(argv[i], "--rel-tol") == 0 && (i + 1) < argc) {
+            out->rel_tol = strtod(argv[++i], 0);
+            continue;
+        }
+        return SIM_ERR_CONFIG;
+    }
+    return out->left_path != 0 && out->right_path != 0 ? SIM_OK : SIM_ERR_CONFIG;
+}
+
+static double max_double(double a, double b)
+{
+    return a > b ? a : b;
+}
+
+static int compare_double(
+    double left,
+    double right,
+    const CompareOptions *options,
+    CompareStats *stats)
+{
+    const double abs_error = fabs(left - right);
+    const double scale = max_double(fabs(left), fabs(right));
+    const double rel_error = scale > 0.0 ? abs_error / scale : abs_error;
+    const double allowed = options->abs_tol + (options->rel_tol * scale);
+
+    if (abs_error > stats->max_abs_error) {
+        stats->max_abs_error = abs_error;
+    }
+    if (rel_error > stats->max_rel_error) {
+        stats->max_rel_error = rel_error;
+    }
+    return abs_error <= allowed;
+}
+
+static int compare_vec3(
+    Vec3 left,
+    Vec3 right,
+    const CompareOptions *options,
+    CompareStats *stats)
+{
+    int ok = 1;
+
+    ok = compare_double(left.x, right.x, options, stats) && ok;
+    ok = compare_double(left.y, right.y, options, stats) && ok;
+    ok = compare_double(left.z, right.z, options, stats) && ok;
+    return ok;
+}
+
+static int compare_command(
+    const ControlCommand *left,
+    const ControlCommand *right,
+    const CompareOptions *options,
+    CompareStats *stats)
+{
+    size_t index;
+    int ok = 1;
+
+    if (left->seq != right->seq) {
+        ok = 0;
+    }
+    ok = compare_double(left->sim_time, right->sim_time, options, stats) && ok;
+    ok = compare_vec3(left->accel_cmd_ecef, right->accel_cmd_ecef, options, stats) && ok;
+    ok = compare_vec3(left->attitude_cmd, right->attitude_cmd, options, stats) && ok;
+    ok = compare_vec3(left->body_rate_cmd, right->body_rate_cmd, options, stats) && ok;
+    for (index = 0u; index < SIM_MAX_ACTUATORS; ++index) {
+        ok = compare_double(left->actuator_cmd[index], right->actuator_cmd[index], options, stats) && ok;
+    }
+    if (left->command_mode != right->command_mode) {
+        ++stats->mode_mismatch_count;
+        ok = 0;
+    }
+    if (left->command_status != right->command_status) {
+        ++stats->status_bit_mismatch_count;
+        ok = 0;
+    }
+    return ok;
+}
+
+static int compare_sensor(
+    const SensorFrame *left,
+    const SensorFrame *right,
+    const CompareOptions *options,
+    CompareStats *stats)
+{
+    int ok = 1;
+
+    if (left->seq != right->seq) {
+        ok = 0;
+    }
+    ok = compare_double(left->sim_time, right->sim_time, options, stats) && ok;
+    ok = compare_double(left->dt, right->dt, options, stats) && ok;
+    ok = compare_vec3(left->missile_vel_ecef_meas, right->missile_vel_ecef_meas, options, stats) && ok;
+    ok = compare_vec3(left->missile_accel_ecef_meas, right->missile_accel_ecef_meas, options, stats) && ok;
+    ok = compare_vec3(left->missile_gyro_b_meas, right->missile_gyro_b_meas, options, stats) && ok;
+    ok = compare_double(left->missile_lat_rad_meas, right->missile_lat_rad_meas, options, stats) && ok;
+    ok = compare_double(left->missile_lon_rad_meas, right->missile_lon_rad_meas, options, stats) && ok;
+    ok = compare_double(left->missile_height_m_meas, right->missile_height_m_meas, options, stats) && ok;
+    ok = compare_double(left->missile_height_agl_m_meas, right->missile_height_agl_m_meas, options, stats) && ok;
+    ok = compare_double(left->target_range_meas, right->target_range_meas, options, stats) && ok;
+    ok = compare_vec3(left->target_los_unit_ecef_meas, right->target_los_unit_ecef_meas, options, stats) && ok;
+    ok = compare_vec3(left->target_los_rate_ecef_meas, right->target_los_rate_ecef_meas, options, stats) && ok;
+    ok = compare_double(
+             left->target_closing_velocity_meas,
+             right->target_closing_velocity_meas,
+             options,
+             stats) &&
+        ok;
+    if (left->sensor_valid_flags != right->sensor_valid_flags ||
+        left->sensor_fault_flags != right->sensor_fault_flags) {
+        ++stats->status_bit_mismatch_count;
+        ok = 0;
+    }
+    return ok;
+}
+
+static SimStatus compare_logs(const CompareOptions *options, CompareStats *stats)
+{
+    FILE *left;
+    FILE *right;
+    SimStatus status = SIM_OK;
+    const size_t packet_size = options->kind == COMPARE_COMMAND ?
+        SIM_CONTROL_PACKET_WIRE_SIZE :
+        SIM_SENSOR_PACKET_WIRE_SIZE;
+    unsigned char left_packet[SIM_SENSOR_PACKET_WIRE_SIZE];
+    unsigned char right_packet[SIM_SENSOR_PACKET_WIRE_SIZE];
+
+    (void)memset(stats, 0, sizeof(*stats));
+    stats->first_divergent_frame = UINT32_MAX;
+    left = fopen(options->left_path, "rb");
+    if (left == 0) {
+        return SIM_ERR_IO;
+    }
+    right = fopen(options->right_path, "rb");
+    if (right == 0) {
+        (void)fclose(left);
+        return SIM_ERR_IO;
+    }
+    for (;;) {
+        const size_t left_got = fread(left_packet, 1u, packet_size, left);
+        const size_t right_got = fread(right_packet, 1u, packet_size, right);
+        int frames_match = 1;
+
+        if (left_got == 0u && right_got == 0u) {
+            if (ferror(left) != 0 || ferror(right) != 0) {
+                status = SIM_ERR_IO;
+            }
+            break;
+        }
+        if (left_got == packet_size) {
+            ++stats->frame_count_left;
+        }
+        if (right_got == packet_size) {
+            ++stats->frame_count_right;
+        }
+        if (left_got != packet_size || right_got != packet_size) {
+            stats->diverged = 1;
+            if (stats->first_divergent_frame == UINT32_MAX) {
+                stats->first_divergent_frame = max_double(
+                    (double)stats->frame_count_left,
+                    (double)stats->frame_count_right) > 0.0 ?
+                    (uint32_t)max_double(
+                        (double)stats->frame_count_left,
+                        (double)stats->frame_count_right) :
+                    0u;
+            }
+            status = SIM_ERR_BAD_PACKET;
+            break;
+        }
+        if (options->kind == COMPARE_COMMAND) {
+            ControlCommand left_command;
+            ControlCommand right_command;
+
+            status = packet_decode_control_command(
+                left_packet,
+                packet_size,
+                options->instance_id,
+                &left_command);
+            if (status == SIM_OK) {
+                status = packet_decode_control_command(
+                    right_packet,
+                    packet_size,
+                    options->instance_id,
+                    &right_command);
+            }
+            if (status == SIM_OK) {
+                frames_match = compare_command(&left_command, &right_command, options, stats);
+            }
+        } else {
+            SensorFrame left_sensor;
+            SensorFrame right_sensor;
+
+            status = packet_decode_sensor_frame(
+                left_packet,
+                packet_size,
+                options->instance_id,
+                &left_sensor);
+            if (status == SIM_OK) {
+                status = packet_decode_sensor_frame(
+                    right_packet,
+                    packet_size,
+                    options->instance_id,
+                    &right_sensor);
+            }
+            if (status == SIM_OK) {
+                frames_match = compare_sensor(&left_sensor, &right_sensor, options, stats);
+            }
+        }
+        if (status != SIM_OK || frames_match == 0) {
+            stats->diverged = 1;
+            if (stats->first_divergent_frame == UINT32_MAX) {
+                stats->first_divergent_frame = stats->frame_count_left;
+            }
+            if (status != SIM_OK) {
+                break;
+            }
+        }
+    }
+    (void)fclose(left);
+    (void)fclose(right);
+    if (stats->first_divergent_frame == UINT32_MAX) {
+        stats->first_divergent_frame = 0u;
+    }
+    return status == SIM_ERR_BAD_PACKET ? SIM_OK : status;
+}
+
+static int write_result(const CompareOptions *options, const CompareStats *stats, SimStatus status)
+{
+    FILE *out = stdout;
+    const int pass = status == SIM_OK && stats->diverged == 0;
+
+    if (options->output_path != 0) {
+        out = fopen(options->output_path, "wb");
+        if (out == 0) {
+            return -1;
+        }
+    }
+    (void)fprintf(out, "{\n");
+    (void)fprintf(out, "  \"verdict\": \"%s\",\n", pass ? "PASS" : "FAIL");
+    (void)fprintf(out, "  \"status\": \"%s\",\n", sim_status_to_string(status));
+    (void)fprintf(out, "  \"frame_count_left\": %u,\n", stats->frame_count_left);
+    (void)fprintf(out, "  \"frame_count_right\": %u,\n", stats->frame_count_right);
+    (void)fprintf(out, "  \"first_divergent_frame\": %u,\n", stats->first_divergent_frame);
+    (void)fprintf(out, "  \"max_abs_error\": %.17g,\n", stats->max_abs_error);
+    (void)fprintf(out, "  \"max_rel_error\": %.17g,\n", stats->max_rel_error);
+    (void)fprintf(out, "  \"status_bit_mismatch_count\": %u,\n", stats->status_bit_mismatch_count);
+    (void)fprintf(out, "  \"mode_mismatch_count\": %u\n", stats->mode_mismatch_count);
+    (void)fprintf(out, "}\n");
+    if (options->output_path != 0 && fclose(out) != 0) {
+        return -1;
+    }
+    return pass ? 0 : 1;
+}
+
+int main(int argc, char **argv)
+{
+    CompareOptions options;
+    CompareStats stats;
+    SimStatus status = parse_args(argc, argv, &options);
+
+    if (status != SIM_OK) {
+        print_usage(argv[0]);
+        return 2;
+    }
+    status = compare_logs(&options, &stats);
+    return write_result(&options, &stats, status) == 0 ? 0 : 1;
+}

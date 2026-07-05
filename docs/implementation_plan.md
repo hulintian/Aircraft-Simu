@@ -1,5 +1,10 @@
 # 飞控与环境闭环仿真系统实现计划
 
+> 本文是阶段实现计划和验收基线，不是当前完成度清单，也不是新成员的第一入口。
+> 当前完成度以 `README.md` 和 [project_framework.md](project_framework.md) 为准。
+> 上手构建、运行和常见修改路径见 [onboarding.md](onboarding.md)；与成熟飞行仿真软件的差距
+> 和后续路线见 [flight_sim_software_comparison.md](flight_sim_software_comparison.md)。
+
 ## 1. 实现目标
 
 本实现计划对应 `docs/design.md` 中的工业级设计。目标是按可交付阶段逐步实现：
@@ -421,7 +426,17 @@ enabled
 
 - 传感器强制无效。
 - 传感器附加偏置。
+- 传感器线性漂移。
+- 传感器斜坡恢复偏置。
+- 传感器卡常值 / 常值保持。
 - 传感器整帧丢包窗口。
+- 锁步安全的通信窗口故障：`sensor.frame` / `COMMUNICATION_LOSS` 会清除整帧测量有效位并置位 dropout flags。
+- 锁步安全的通信帧延迟故障：`sensor.frame` / `COMMUNICATION_DELAY` 或
+  `FRAME_DELAY` 会用固定容量延迟线发送滞后 `SensorFrame`，`value` 为 1 到 16 的延迟步数。
+- 锁步安全的通信乱序故障：`sensor.frame` / `COMMUNICATION_REORDER` 或
+  `FRAME_REORDER` 会在首帧预热后按 LOCKSTEP 发送上一帧，覆盖旧帧拒绝和控制保持路径。
+- 通信层 `sensor.frame` 故障支持 `recovery_hold_s` / `recovery_timeout_s`，可在故障窗口结束后
+  继续保持故障效果再恢复，用于覆盖飞控超时后的恢复边界。
 - 执行机构卡死。
 - 执行机构比例缩放。
 
@@ -435,8 +450,8 @@ enabled
 
 后续扩展不再阻塞 P6，但仍应补充：
 
-- 更多真实故障类型，例如卡常值、漂移阶跃、恢复斜坡和通信窗口丢包。
-- 真实 DEM 数据集加载后的 LOS 遮挡闭环场景。
+- 更多真实故障类型，例如非锁步乱序恢复和更贴近操作系统网络栈的真实丢包。
+- 真实 DEM 数据集加载后的 LOS 遮挡闭环场景；当前已用合成山脊瓦片覆盖闭环遮挡链路。
 
 ## 9. P6 飞控任务、制导与保护
 
@@ -538,7 +553,8 @@ SensorFrame
 
 后续扩展仍应补充：
 
-- 飞控内部保护动作的持久化日志和长时间故障恢复策略。
+- 更完整控制律验证和长时间故障恢复策略。当前已补充 PNG 加速度限幅、NaN 距离拒绝、
+  自动驾驶仪内环关闭透传路径和连续帧限幅/速率/舵偏边界单元验证；仍需高保真控制品质基准。
 
 ## 10. P7 多实例管理器
 
@@ -620,6 +636,8 @@ P7 计划内主链路能力已完成；后续只保留更复杂的调度器集�
 ```text
 tools/replay
 tools/log_convert
+tools/compare_logs
+tools/batch_stats
 tools/batch_runner
 tools/plot
 ```
@@ -629,30 +647,117 @@ tools/plot
 - 二进制日志转 CSV。
 - 回放 `sensor_log.bin` 驱动飞控。
 - 对比两次 `ControlCommand`。
-- 汇总多个实例的 `summary.json`。
+- 对比两次真值或控制日志，定位首个发散帧。
+- 汇总多个实例的 `summary.json` 和 `campaign_summary.json`。
 - 输出命中率、脱靶量均值、标准差、失败实例列表。
+- 输出故障影响、气动包线越界、数值诊断异常和失败原因分布。
 
 ### 11.4 验收
 
 - 固定随机种子结果可复现。
 - 相同输入日志重新驱动飞控，输出一致。
 - 回归误差超过阈值时测试失败。
+- 截断日志、CRC 错误、实例号不匹配和帧数不一致必须失败并给出明确原因。
+- 回归支持两类基准：
+  - 逐字节完全一致基准。
+  - 浮点绝对/相对容差基准。
+- `trajectory_diagnostics.csv` 或等价诊断输出覆盖四元数范数、DCM 正交性、
+  质量/惯量有效性、气动模型包线状态和积分器类型。
 
 ### 11.5 当前执行窗口
 
-P8 当前已经完成第一批可验证工具：
+P8 当前已经完成第一批可验证工具和诊断输出：
 
 - 新增 `tools/log_convert`，支持 `--type sensor|command`、`--instance-id`、
   `--input` 和 `--output`。
 - `sensor_log.bin` 与 `command_log.bin` 可按固定线格式解码、校验实例号和 CRC，
   并转换为 CSV。
+- 新增 `tools/replay`，支持使用 `sensor_log.bin` 离线驱动飞控并生成新的
+  `command_log.bin`。
+- 新增 `tools/compare_logs`，支持按逐帧字段比较 `sensor_log.bin` 或
+  `command_log.bin`，可输出首个发散帧和最大误差 JSON。
+- 新增 `tools/batch_stats`，支持汇总多个 `summary.json` 或
+  `campaign_summary.json`，输出命中率、脱靶量统计、失败数、故障影响统计和
+  数值诊断最大/最小值、模型降级 flags 按位或、气动 flags 按位或、气动外推采样数和
+  wall-clock 性能统计。
+- 新增 `tools/batch_runner`，支持按清单顺序调用 `instance_manager --runtime`，
+  并可选调用 `batch_stats` 汇总清单中的统计输入；同时支持从 runtime 模板
+  确定性生成 Monte Carlo 清单，展开 `${sample_index}`、`${random_seed}` 和
+  `${sample_output_dir}` 占位符，并支持 `${uniform:stream:min:max}` 确定性均匀扰动和
+  `${lhs_uniform:stream:min:max}` 确定性 LHS 均匀分层扰动、
+  `${halton_uniform:base:min:max}` 确定性 Halton 低差异均匀扰动、
+  `${normal:stream:mean:stddev}` 确定性正态扰动、
+  `${lognormal:stream:mu:sigma}` 确定性对数正态扰动、
+  `${truncated_normal:stream:mean:stddev:min:max}` 确定性截断正态扰动、
+  `${choice:stream:option|option}` 确定性离散选择，以及
+  `${correlated_normal:stream:base_stream:mean:stddev:rho}` 确定性相关正态扰动。
+- `closed_loop_test` 已接入真实 `sensor_log.bin` 回放和 `command_log.bin`
+  比较，验证固定输入日志可重放出一致控制输出。
+- 顶层 CMake 新增 `MISSILE_ENABLE_COVERAGE`、`MISSILE_ENABLE_SANITIZERS` 和
+  `MISSILE_ENABLE_LONG_TESTS`，coverage 构建已通过 9 个默认 CTest；
+  sanitizer 构建会在配置阶段检查 ASan/UBSan 运行库；长测选项会额外启用
+  `long_campaign_pressure_test`。
+- 环境侧新增 `trajectory_diagnostics.csv`，记录四元数、DCM、质量/惯量、
+  模型降级 flags、气动状态、积分器和合力/力矩诊断；`summary.json`、`campaign_summary.json`
+  和 `batch_stats` 会聚合四元数范数误差、DCM 正交性误差、最小质量、最小惯量、
+  模型降级 flags 按位或、气动 flags 按位或和气动外推采样数。
+- 飞控侧新增 `fc_internal_log.bin`，记录每帧模式、状态和主要控制中间量。
+- 新增 `aero_database` 气动表模块，覆盖版本化固定小端文件、样本 CRC、单位校验、
+  单调性校验、样本插值、包络外错误、钳制告警和保持上一有效值策略。
+- 环境程序支持 `aerodynamics.table_path` 和
+  `aerodynamics.table_extrapolation_policy`，可选气动表已接入统一环境力模型。
+- `run_manifest.json` 会记录气动表启用状态、表文件路径、内部文件格式版本、
+  包络外策略来源/覆盖值、surrogate 模型路径/模型版本/训练数据版本，
+  以及地形启用状态、LOS 遮挡开关、缺瓦片策略和瓦片路径列表。
 - 新增 `log_convert_test`，覆盖 `command_log.bin` 到 CSV 的转换路径。
+- 新增 `p8_tools_test`，覆盖 `replay`、`compare_logs`、`batch_stats`、诊断统计聚合和截断日志失败路径。
+- 新增 `batch_runner_test`，覆盖清单运行入口和 Monte Carlo runtime 模板展开。
+- 新增默认关闭的 `long_campaign_pressure_test`，覆盖 6 个闭环实例、并发上限 3、
+  `completed_count`/`failed_count`、诊断汇总和 wall-clock 性能字段。
 
 后续扩展仍应补充：
 
-- `tools/replay`：使用 `sensor_log.bin` 重新驱动飞控并生成新的 `command_log.bin`。
-- `tools/batch_runner` 或统计工具：汇总多个 `summary.json` 和 `campaign_summary.json`。
-- 固定随机种子回放一致性阈值比较。
+- 真实 DEM 数据集基准、磁盘缓存和真实 DEM LOS 遮挡闭环测试。
+- Monte Carlo 外部采样清单导入、真实大规模长时资源压测、气动表舵偏/高度维度、
+  真实数据基准、复杂代理模型训练/推理和真实 DEM 数据基准。
+
+### 11.6 P8 后模型保真度扩展
+
+P8 完成后再推进以下能力，避免在回放和回归基础不稳时引入高复杂度模型：
+
+```text
+aero_database
+  已完成 Mach / AoA / beta 样本插值、版本化文件格式、CRC/单位校验和配置接入；
+  `run_manifest.json` 已记录表文件路径、内部文件格式版本、策略覆盖信息，以及
+  可选高度/舵偏包线元数据；待扩展 v2 多维表插值和真实数据基准。
+
+aero_surrogate
+  已在 `run_manifest.json` 追踪 surrogate 模型路径、模型版本和训练数据版本；
+  已接入固定文本格式线性只读推理，覆盖缺项拒绝、Mach/alpha/beta 线性推理和气动力主路径；
+  待扩展离线训练、复杂代理模型和真实数据基准。
+
+map_preprocess
+  已完成裸 ASCII 高程网格、ESRI ASCII Grid 和 SRTM HGT 到内部瓦片格式的最小预处理、
+  CRC 生成、二进制空间索引输出和加载测试；SRTM HGT 会从 `N30E120.hgt` 这类文件名推导
+  1 度瓦片边界，按 big-endian int16 读取高程，并要求对 void 值显式 `--nodata-fill`；
+  `map.tile_path` / `map.tile_paths[]` / `map.tile_index_path` 文本/二进制空间索引加载链已进入闭环测试，
+  索引内相对瓦片路径会按索引文件所在目录解析；
+  `--nodata-fill` 显式缺测填补、`map.terrain.cache_tile_count` 固定槽位 LRU 懒加载/淘汰、
+  `summary.json` 地形缓存统计已接入；
+  已接入合成山脊 LOS 遮挡闭环场景；待扩展真实 DEM 数据集基准、磁盘缓存和真实 DEM LOS 场景。
+
+diagnostics
+  已聚合四元数范数误差、DCM 正交性误差、最小质量、最小惯量、
+  模型降级 flags 按位或、气动 flags 按位或和气动外推采样数。
+```
+
+验收要求：
+
+- 气动表文件缺失、单位错误、NaN、非单调网格和 CRC 错误必须拒绝。
+- 包线外输入必须按 `ERROR`、`CLAMP_AND_WARN` 或 `HOLD_LAST_VALID` 策略处理。
+- 气动表必须在 `run_manifest.json` 中记录资源路径、文件格式版本和策略来源；
+  代理模型必须记录模型版本、训练数据版本和适用包线。
+- 真实 DEM 场景必须覆盖缺瓦片错误路径、平坦填充路径和 LOS 遮挡闭环路径。
 
 ## 12. 开发提交建议
 

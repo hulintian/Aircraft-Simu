@@ -9,6 +9,7 @@
 #include "fc/fc_modes.h"
 #include "fc/fc_state.h"
 #include "fc/guidance_png.h"
+#include "fc/safety_monitor.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -111,6 +112,18 @@ static int test_guidance_png_direction(void)
     failures += expect_near(output.accel_cmd_ecef.y, 40.0, 1.0e-12, "png_y_direction");
     failures += expect_near(output.accel_cmd_ecef.z, 0.0, 1.0e-12, "png_z");
 
+    input.closing_velocity_mps = 100.0;
+    input.los_rate_ecef = vec3_make(0.0, 0.0, 10.0);
+    config.max_accel_mps2 = 50.0;
+    failures += expect_int(guidance_png_update(&config, &input, &output) == SIM_OK, "png_limit_ok");
+    failures += expect_near(vec3_norm(output.accel_cmd_ecef), 50.0, 1.0e-12, "png_limit_norm");
+    failures += expect_int(output.accel_cmd_ecef.y > 0.0, "png_limit_direction");
+
+    input.range_m = NAN;
+    failures += expect_int(
+        guidance_png_update(&config, &input, &output) == SIM_ERR_NUMERIC,
+        "png_reject_nan_range");
+    input.range_m = 1000.0;
     input.closing_velocity_mps = -1.0;
     failures += expect_int(
         guidance_png_update(&config, &input, &output) == SIM_ERR_OUT_OF_RANGE,
@@ -155,6 +168,41 @@ static int test_autopilot_attitude_allocation(void)
     failures += expect_int(command.body_rate_cmd.z > 0.0, "autopilot_yaw_rate_cmd");
     failures += expect_near(command.actuator_cmd[0], 0.2, 1.0e-12, "autopilot_pitch_fin_limit");
     failures += expect_near(command.actuator_cmd[1], 0.2, 1.0e-12, "autopilot_yaw_fin_limit");
+    return failures;
+}
+
+/** @brief 验证自动驾驶仪关闭内环时只透传加速度命令。 */
+static int test_autopilot_disabled_inner_loops(void)
+{
+    int failures = 0;
+    Autopilot autopilot;
+    AutopilotConfig config;
+    GuidancePngOutput guidance;
+    AutopilotCommand command;
+
+    (void)memset(&config, 0, sizeof(config));
+    config.enable_attitude_loop = 0;
+    config.enable_control_allocation = 0;
+    config.max_attitude_cmd_rad = 0.35;
+    config.max_body_rate_cmd_radps = 1.0;
+    config.attitude_time_constant_s = 0.25;
+    config.gyro_damping_gain = 0.2;
+    config.fin_accel_effectiveness_mps2_per_rad = 100.0;
+    config.max_fin_deflection_rad = 0.2;
+    guidance.accel_cmd_ecef = vec3_make(1.0, 2.0, 3.0);
+
+    failures += expect_int(autopilot_init(&autopilot, &config) == SIM_OK, "autopilot_disabled_init");
+    failures += expect_int(
+        autopilot_update(&autopilot, 0, &guidance, &command) == SIM_OK,
+        "autopilot_disabled_update");
+    failures += expect_near(command.accel_cmd_ecef.x, 1.0, 1.0e-12, "autopilot_disabled_accel_x");
+    failures += expect_near(command.accel_cmd_ecef.y, 2.0, 1.0e-12, "autopilot_disabled_accel_y");
+    failures += expect_near(command.accel_cmd_ecef.z, 3.0, 1.0e-12, "autopilot_disabled_accel_z");
+    failures += expect_near(vec3_norm(command.attitude_cmd), 0.0, 1.0e-12, "autopilot_disabled_att");
+    failures += expect_near(vec3_norm(command.body_rate_cmd), 0.0, 1.0e-12, "autopilot_disabled_rate");
+    failures += expect_near(command.actuator_cmd[0], 0.0, 1.0e-12, "autopilot_disabled_fin0");
+    failures += expect_near(command.actuator_cmd[1], 0.0, 1.0e-12, "autopilot_disabled_fin1");
+    failures += expect_int(autopilot.accepted_count == 1u, "autopilot_disabled_accepted");
     return failures;
 }
 
@@ -298,6 +346,50 @@ static int test_flight_controller_protection(void)
     return failures;
 }
 
+/** @brief 验证安全监视器在通信恢复后的坏帧计数和接受状态恢复。 */
+static int test_safety_monitor_recovery(void)
+{
+    int failures = 0;
+    FcSafetyConfig config = { 0.1, 0.2, 1, 1, 3u };
+    SafetyMonitor monitor;
+    SafetyAssessment assessment;
+    SensorFrame sensor;
+
+    failures += expect_int(safety_monitor_init(&monitor, &config) == SIM_OK, "safety_recovery_init");
+    sensor = make_sensor(1u, 0.01);
+    failures += expect_int(
+        safety_monitor_check_sensor(&monitor, &sensor, 0, 0u, 0, 0.0, &assessment) == SIM_OK,
+        "safety_recovery_initial_check");
+    failures += expect_int(assessment.accept_frame != 0, "safety_recovery_initial_accept");
+    failures += expect_int(monitor.consecutive_bad_frames == 0u, "safety_recovery_initial_count");
+
+    sensor = make_sensor(2u, 0.02);
+    sensor.sensor_valid_flags &= ~SIM_SENSOR_VALID_SEEKER;
+    failures += expect_int(
+        safety_monitor_check_sensor(&monitor, &sensor, 1, 1u, 1, 0.01, &assessment) == SIM_OK,
+        "safety_recovery_invalid_check");
+    failures += expect_int(assessment.accept_frame != 0, "safety_recovery_invalid_still_usable");
+    failures += expect_int(assessment.request_hold != 0, "safety_recovery_invalid_hold");
+    failures += expect_int(monitor.consecutive_bad_frames == 1u, "safety_recovery_invalid_count");
+
+    sensor = make_sensor(1u, 0.03);
+    failures += expect_int(
+        safety_monitor_check_sensor(&monitor, &sensor, 1, 2u, 1, 0.02, &assessment) == SIM_OK,
+        "safety_recovery_old_check");
+    failures += expect_int(assessment.accept_frame == 0, "safety_recovery_old_reject");
+    failures += expect_int(assessment.request_hold != 0, "safety_recovery_old_hold");
+    failures += expect_int(monitor.consecutive_bad_frames == 2u, "safety_recovery_old_count");
+
+    sensor = make_sensor(3u, 0.04);
+    failures += expect_int(
+        safety_monitor_check_sensor(&monitor, &sensor, 1, 2u, 1, 0.03, &assessment) == SIM_OK,
+        "safety_recovery_valid_check");
+    failures += expect_int(assessment.accept_frame != 0, "safety_recovery_valid_accept");
+    failures += expect_int(assessment.request_hold == 0, "safety_recovery_valid_no_hold");
+    failures += expect_int(monitor.consecutive_bad_frames == 0u, "safety_recovery_valid_count_reset");
+    return failures;
+}
+
 /** @brief 验证控制器按 scheduler.tasks[] 周期复用导航缓存。 */
 static int test_flight_controller_multirate_scheduler(void)
 {
@@ -334,15 +426,69 @@ static int test_flight_controller_multirate_scheduler(void)
     return failures;
 }
 
+/** @brief 验证连续闭环控制输出满足限幅、速率和舵偏边界。 */
+static int test_flight_controller_control_quality_bounds(void)
+{
+    int failures = 0;
+    FlightController controller;
+    FlightControllerConfig config = make_controller_config();
+    ControlCommand command;
+    Vec3 previous_accel = vec3_make(0.0, 0.0, 0.0);
+    int have_previous = 0;
+    uint32_t index;
+
+    failures += expect_int(
+        flight_controller_init(&controller, &config) == SIM_OK,
+        "quality_init");
+    for (index = 1u; index <= 60u; ++index) {
+        SensorFrame sensor = make_sensor(index, 0.01 * (double)index);
+        const double sign = (index % 2u) == 0u ? 1.0 : -1.0;
+        const double phase = (double)(index % 7u);
+        Vec3 delta;
+
+        sensor.target_los_rate_ecef_meas = vec3_make(
+            0.0,
+            sign * (0.02 + (0.01 * phase)),
+            0.20 - (0.004 * (double)index));
+        failures += expect_int(
+            flight_controller_step(&controller, &sensor, &command) == SIM_OK,
+            "quality_step_ok");
+        failures += expect_int(vec3_isfinite(command.accel_cmd_ecef), "quality_accel_finite");
+        failures += expect_int(vec3_isfinite(command.attitude_cmd), "quality_attitude_finite");
+        failures += expect_int(vec3_isfinite(command.body_rate_cmd), "quality_rate_finite");
+        failures += expect_int(
+            vec3_norm(command.accel_cmd_ecef) <= config.guidance.max_accel_mps2 + 1.0e-9,
+            "quality_accel_norm_limit");
+        failures += expect_int(
+            fabs(command.actuator_cmd[0]) <= config.autopilot.max_fin_deflection_rad + 1.0e-12 &&
+                fabs(command.actuator_cmd[1]) <= config.autopilot.max_fin_deflection_rad + 1.0e-12,
+            "quality_fin_limits");
+        if (have_previous != 0) {
+            delta = vec3_sub(command.accel_cmd_ecef, previous_accel);
+            failures += expect_int(
+                vec3_norm(delta) <=
+                    (config.guidance.max_accel_rate_mps3 * sensor.dt) + 1.0e-9,
+                "quality_accel_rate_limit");
+        }
+        previous_accel = command.accel_cmd_ecef;
+        have_previous = 1;
+    }
+    failures += expect_int(controller.autopilot.accepted_count > 0u, "quality_autopilot_active");
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
 
     failures += test_guidance_png_direction();
     failures += test_autopilot_attitude_allocation();
+    failures += test_autopilot_disabled_inner_loops();
     failures += test_command_manager_limits();
     failures += test_mode_state_machine();
     failures += test_flight_controller_protection();
+    failures += test_safety_monitor_recovery();
     failures += test_flight_controller_multirate_scheduler();
+    failures += test_flight_controller_control_quality_bounds();
     return failures == 0 ? 0 : 1;
 }

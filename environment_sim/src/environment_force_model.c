@@ -105,11 +105,14 @@ SimStatus environment_force_model_evaluate(
     status = aero_model_evaluate(
         &model->aerodynamics,
         output->atmosphere.density_kgpm3,
+        output->atmosphere.speed_of_sound_mps > 0.0 ?
+            vec3_norm(air_velocity_body) / output->atmosphere.speed_of_sound_mps : 0.0,
         air_velocity_body,
         input->pitch_actuator_rad,
         input->yaw_actuator_rad,
         &output->aerodynamic_force_b_n,
-        &output->aerodynamic_moment_b_nm);
+        &output->aerodynamic_moment_b_nm,
+        &output->aerodynamic_model_flags);
     if (status != SIM_OK) {
         return status;
     }

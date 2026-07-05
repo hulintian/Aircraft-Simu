@@ -6,7 +6,9 @@ set(ENV_HEADERS
 
 set(ENV_MODEL_HEADERS
     include/env/actuator_model.h
+    include/env/aero_database.h
     include/env/aero_model.h
+    include/env/aero_surrogate.h
     include/env/atmosphere_model.h
     include/env/earth_model.h
     include/env/environment_force_model.h
@@ -28,7 +30,9 @@ set(ENV_MODEL_HEADERS
 
 set(ENV_MODEL_SOURCES
     src/actuator_model.c
+    src/aero_database.c
     src/aero_model.c
+    src/aero_surrogate.c
     src/atmosphere_model.c
     src/earth_model.c
     src/environment_force_model.c

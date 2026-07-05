@@ -393,6 +393,10 @@ int main(int argc, char **argv)
     if (!text_file_contains(path, "\"completed_count\": 2") ||
         !text_file_contains(path, "\"failed_count\": 0") ||
         !text_file_contains(path, "\"schedule\": \"PARALLEL\"") ||
+        !text_file_contains(path, "\"campaign_wall_time_s\":") ||
+        !text_file_contains(path, "\"total_instance_wall_time_s\":") ||
+        !text_file_contains(path, "\"max_instance_wall_time_s\":") ||
+        !text_file_contains(path, "\"wall_time_s\":") ||
         !text_file_contains(path, "\"random_seed\": 9001") ||
         !text_file_contains(path, "\"random_seed\": 9002")) {
         return 1;

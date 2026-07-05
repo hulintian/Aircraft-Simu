@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -87,6 +88,10 @@ typedef struct ManagedInstance {
     int skipped;
     /** @brief 启动前或调度阶段失败原因。 */
     char launch_error[64];
+    /** @brief 管理器观察到的实例启动开始时间，单位秒。 */
+    double wall_time_start_s;
+    /** @brief 管理器观察到的实例完成时间，单位秒。 */
+    double wall_time_end_s;
 } ManagedInstance;
 
 typedef struct InstanceSummary {
@@ -110,6 +115,22 @@ typedef struct InstanceSummary {
     unsigned int fault_sensor_affected_step_count;
     /** @brief 执行机构受故障影响的步数。 */
     unsigned int fault_actuator_affected_step_count;
+    /** @brief 数值诊断采样行数。 */
+    unsigned int diagnostic_sample_count;
+    /** @brief 最大四元数范数误差。 */
+    double max_quat_norm_error;
+    /** @brief 最大 DCM 正交性误差。 */
+    double max_dcm_orthogonality_error;
+    /** @brief 最小质量，单位 kg。 */
+    double min_mass_kg;
+    /** @brief 最小惯量对角线，单位 kg*m^2。 */
+    double min_inertia_diag_kgm2;
+    /** @brief 气动模型诊断 flags 按位或。 */
+    unsigned int aero_model_flags_or;
+    /** @brief 模型降级分类 flags 按位或。 */
+    unsigned int model_degradation_flags_or;
+    /** @brief 气动表包线外处理采样数。 */
+    unsigned int aero_extrapolated_sample_count;
 } InstanceSummary;
 
 typedef struct ManagerConfig {
@@ -141,6 +162,17 @@ typedef struct ManagerConfig {
 static void print_usage(const char *argv0)
 {
     (void)printf("usage: %s [--runtime PATH]\n", argv0);
+}
+
+/** @brief 返回 wall-clock 秒数，用于批次性能统计。 */
+static double wall_seconds_now(void)
+{
+    struct timeval tv;
+
+    if (gettimeofday(&tv, 0) != 0) {
+        return 0.0;
+    }
+    return (double)tv.tv_sec + ((double)tv.tv_usec * 1.0e-6);
 }
 
 /** @brief 将字符串安全写入 JSON 字符串字面量。 */
@@ -626,9 +658,12 @@ static SimStatus launch_instance(
     if (instance == 0 || runtime_path == 0 || cfg == 0) {
         return SIM_ERR_INVALID_ARG;
     }
+    instance->wall_time_start_s = wall_seconds_now();
+    instance->wall_time_end_s = instance->wall_time_start_s;
     status = create_ready_socket(&instance->ready_sock, &instance->ready_port);
     if (status != SIM_OK) {
         (void)snprintf(instance->launch_error, sizeof(instance->launch_error), "ready_socket_failed");
+        instance->wall_time_end_s = wall_seconds_now();
         return status;
     }
     instance->fc_pid = launch_process(cfg, &instance->plan, runtime_path, instance->ready_port, 0);
@@ -636,6 +671,7 @@ static SimStatus launch_instance(
         (void)snprintf(instance->launch_error, sizeof(instance->launch_error), "launch_fc_failed");
         (void)close(instance->ready_sock);
         instance->ready_sock = -1;
+        instance->wall_time_end_s = wall_seconds_now();
         return SIM_ERR_INTERNAL;
     }
     status = wait_for_flight_control_ready(instance);
@@ -652,12 +688,14 @@ static SimStatus launch_instance(
             instance->fc_done = 1;
             instance->fc_status = child_status;
         }
+        instance->wall_time_end_s = wall_seconds_now();
         return status;
     }
     instance->env_pid = launch_process(cfg, &instance->plan, runtime_path, 0u, 1);
     if (instance->env_pid <= 0) {
         (void)snprintf(instance->launch_error, sizeof(instance->launch_error), "launch_env_failed");
         (void)kill(instance->fc_pid, SIGTERM);
+        instance->wall_time_end_s = wall_seconds_now();
         return SIM_ERR_INTERNAL;
     }
     return SIM_OK;
@@ -696,6 +734,8 @@ static void mark_remaining_skipped(
         instances[i].env_done = 1;
         instances[i].fc_status = 1;
         instances[i].env_status = 1;
+        instances[i].wall_time_start_s = wall_seconds_now();
+        instances[i].wall_time_end_s = instances[i].wall_time_start_s;
         (void)snprintf(instances[i].launch_error, sizeof(instances[i].launch_error), "skipped_after_failure");
     }
 }
@@ -742,6 +782,23 @@ static void read_instance_summary(
         &tree,
         "fault_actuator_affected_step_count",
         &out->fault_actuator_affected_step_count);
+    (void)config_get_uint32(&tree, "diagnostic_sample_count", &out->diagnostic_sample_count);
+    (void)config_get_double(&tree, "max_quat_norm_error", &out->max_quat_norm_error);
+    (void)config_get_double(
+        &tree,
+        "max_dcm_orthogonality_error",
+        &out->max_dcm_orthogonality_error);
+    (void)config_get_double(&tree, "min_mass_kg", &out->min_mass_kg);
+    (void)config_get_double(&tree, "min_inertia_diag_kgm2", &out->min_inertia_diag_kgm2);
+    (void)config_get_uint32(&tree, "aero_model_flags_or", &out->aero_model_flags_or);
+    (void)config_get_uint32(
+        &tree,
+        "model_degradation_flags_or",
+        &out->model_degradation_flags_or);
+    (void)config_get_uint32(
+        &tree,
+        "aero_extrapolated_sample_count",
+        &out->aero_extrapolated_sample_count);
     config_free(&tree);
 }
 
@@ -761,7 +818,19 @@ static unsigned int write_campaign_summary(
     unsigned int total_fault_end_count = 0u;
     unsigned int total_fault_sensor_affected_steps = 0u;
     unsigned int total_fault_actuator_affected_steps = 0u;
+    unsigned int total_diagnostic_sample_count = 0u;
+    unsigned int aero_model_flags_or = 0u;
+    unsigned int model_degradation_flags_or = 0u;
+    unsigned int total_aero_extrapolated_sample_count = 0u;
+    double campaign_start_s = DBL_MAX;
+    double campaign_end_s = 0.0;
+    double total_instance_wall_time_s = 0.0;
+    double max_instance_wall_time_s = 0.0;
     double min_miss_distance = DBL_MAX;
+    double max_quat_norm_error = 0.0;
+    double max_dcm_orthogonality_error = 0.0;
+    double min_mass_kg = DBL_MAX;
+    double min_inertia_diag_kgm2 = DBL_MAX;
     InstanceSummary summaries[MAX_INSTANCES];
 
     (void)mkdir("runs", 0777);
@@ -786,6 +855,22 @@ static unsigned int write_campaign_summary(
         if (process_ok(instances[i].env_status) && process_ok(instances[i].fc_status)) {
             read_instance_summary(cfg, &instances[i].plan, &summaries[i]);
         }
+        if (instances[i].wall_time_start_s > 0.0 &&
+            instances[i].wall_time_end_s >= instances[i].wall_time_start_s) {
+            const double instance_wall_time_s =
+                instances[i].wall_time_end_s - instances[i].wall_time_start_s;
+
+            if (instances[i].wall_time_start_s < campaign_start_s) {
+                campaign_start_s = instances[i].wall_time_start_s;
+            }
+            if (instances[i].wall_time_end_s > campaign_end_s) {
+                campaign_end_s = instances[i].wall_time_end_s;
+            }
+            total_instance_wall_time_s += instance_wall_time_s;
+            if (instance_wall_time_s > max_instance_wall_time_s) {
+                max_instance_wall_time_s = instance_wall_time_s;
+            }
+        }
         if (summaries[i].available != 0) {
             ++summary_available;
             if (summaries[i].hit_flag != 0) {
@@ -798,6 +883,24 @@ static unsigned int write_campaign_summary(
             total_fault_end_count += summaries[i].fault_end_count;
             total_fault_sensor_affected_steps += summaries[i].fault_sensor_affected_step_count;
             total_fault_actuator_affected_steps += summaries[i].fault_actuator_affected_step_count;
+            total_diagnostic_sample_count += summaries[i].diagnostic_sample_count;
+            if (summaries[i].max_quat_norm_error > max_quat_norm_error) {
+                max_quat_norm_error = summaries[i].max_quat_norm_error;
+            }
+            if (summaries[i].max_dcm_orthogonality_error > max_dcm_orthogonality_error) {
+                max_dcm_orthogonality_error = summaries[i].max_dcm_orthogonality_error;
+            }
+            if (summaries[i].diagnostic_sample_count > 0u &&
+                summaries[i].min_mass_kg < min_mass_kg) {
+                min_mass_kg = summaries[i].min_mass_kg;
+            }
+            if (summaries[i].diagnostic_sample_count > 0u &&
+                summaries[i].min_inertia_diag_kgm2 < min_inertia_diag_kgm2) {
+                min_inertia_diag_kgm2 = summaries[i].min_inertia_diag_kgm2;
+            }
+            aero_model_flags_or |= summaries[i].aero_model_flags_or;
+            model_degradation_flags_or |= summaries[i].model_degradation_flags_or;
+            total_aero_extrapolated_sample_count += summaries[i].aero_extrapolated_sample_count;
         }
     }
 
@@ -808,6 +911,14 @@ static unsigned int write_campaign_summary(
         file,
         cfg->schedule == MANAGER_SCHEDULE_SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL");
     (void)fprintf(file, ",\n");
+    (void)fprintf(
+        file,
+        "  \"campaign_wall_time_s\": %.6f,\n",
+        campaign_start_s < DBL_MAX && campaign_end_s >= campaign_start_s ?
+            campaign_end_s - campaign_start_s :
+            0.0);
+    (void)fprintf(file, "  \"total_instance_wall_time_s\": %.6f,\n", total_instance_wall_time_s);
+    (void)fprintf(file, "  \"max_instance_wall_time_s\": %.6f,\n", max_instance_wall_time_s);
     (void)fprintf(file, "  \"completed_count\": %u,\n", completed);
     (void)fprintf(file, "  \"failed_count\": %u,\n", failed);
     (void)fprintf(file, "  \"summary_available_count\": %u,\n", summary_available);
@@ -826,6 +937,26 @@ static unsigned int write_campaign_summary(
         file,
         "  \"total_fault_actuator_affected_step_count\": %u,\n",
         total_fault_actuator_affected_steps);
+    (void)fprintf(file, "  \"total_diagnostic_sample_count\": %u,\n", total_diagnostic_sample_count);
+    (void)fprintf(file, "  \"max_quat_norm_error\": %.12e,\n", max_quat_norm_error);
+    (void)fprintf(
+        file,
+        "  \"max_dcm_orthogonality_error\": %.12e,\n",
+        max_dcm_orthogonality_error);
+    (void)fprintf(
+        file,
+        "  \"min_mass_kg\": %.9f,\n",
+        total_diagnostic_sample_count > 0u ? min_mass_kg : 0.0);
+    (void)fprintf(
+        file,
+        "  \"min_inertia_diag_kgm2\": %.9f,\n",
+        total_diagnostic_sample_count > 0u ? min_inertia_diag_kgm2 : 0.0);
+    (void)fprintf(file, "  \"aero_model_flags_or\": %u,\n", aero_model_flags_or);
+    (void)fprintf(file, "  \"model_degradation_flags_or\": %u,\n", model_degradation_flags_or);
+    (void)fprintf(
+        file,
+        "  \"total_aero_extrapolated_sample_count\": %u,\n",
+        total_aero_extrapolated_sample_count);
     (void)fprintf(file, "  \"instances\": [\n");
     for (i = 0u; i < cfg->instance_count; ++i) {
         (void)fprintf(file, "    { \"instance_id\": %u, ", instances[i].plan.instance_id);
@@ -847,10 +978,14 @@ static unsigned int write_campaign_summary(
         (void)fprintf(
             file,
             ", \"env_status\": %d, \"fc_status\": %d, "
+            "\"wall_time_s\": %.6f, "
             "\"summary_available\": %s, \"hit_flag\": %s, "
             "\"miss_distance\": %.6f, \"exit_reason\": ",
             process_ok(instances[i].env_status) ? 0 : 1,
             process_ok(instances[i].fc_status) ? 0 : 1,
+            instances[i].wall_time_end_s >= instances[i].wall_time_start_s ?
+                instances[i].wall_time_end_s - instances[i].wall_time_start_s :
+                0.0,
             summaries[i].available != 0 ? "true" : "false",
             summaries[i].hit_flag != 0 ? "true" : "false",
             summaries[i].miss_distance_m);
@@ -859,11 +994,27 @@ static unsigned int write_campaign_summary(
             file,
             ", \"fault_start_count\": %u, \"fault_end_count\": %u, "
             "\"fault_sensor_affected_step_count\": %u, "
-            "\"fault_actuator_affected_step_count\": %u }%s\n",
+            "\"fault_actuator_affected_step_count\": %u, "
+            "\"diagnostic_sample_count\": %u, "
+            "\"max_quat_norm_error\": %.12e, "
+            "\"max_dcm_orthogonality_error\": %.12e, "
+            "\"min_mass_kg\": %.9f, "
+            "\"min_inertia_diag_kgm2\": %.9f, "
+            "\"aero_model_flags_or\": %u, "
+            "\"model_degradation_flags_or\": %u, "
+            "\"aero_extrapolated_sample_count\": %u }%s\n",
             summaries[i].fault_start_count,
             summaries[i].fault_end_count,
             summaries[i].fault_sensor_affected_step_count,
             summaries[i].fault_actuator_affected_step_count,
+            summaries[i].diagnostic_sample_count,
+            summaries[i].max_quat_norm_error,
+            summaries[i].max_dcm_orthogonality_error,
+            summaries[i].min_mass_kg,
+            summaries[i].min_inertia_diag_kgm2,
+            summaries[i].aero_model_flags_or,
+            summaries[i].model_degradation_flags_or,
+            summaries[i].aero_extrapolated_sample_count,
             i + 1u == cfg->instance_count ? "" : ",");
     }
     (void)fprintf(file, "  ]\n");
@@ -1023,6 +1174,7 @@ int main(int argc, char **argv)
                     slot->fc_status = child_status;
                 }
                 if (slot->env_done != 0 && slot->fc_done != 0) {
+                    slot->wall_time_end_s = wall_seconds_now();
                     --running;
                     ++completed;
                     (void)printf("completed instance %u env_ok=%d fc_ok=%d\n",
