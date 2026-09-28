@@ -25,6 +25,17 @@
 #define SIM_CONTROL_PACKET_WIRE_SIZE (SIM_PACKET_HEADER_WIRE_SIZE + SIM_CONTROL_COMMAND_WIRE_SIZE)
 /** @brief 零载荷心跳报文固定长度。 */
 #define SIM_HEARTBEAT_PACKET_WIRE_SIZE SIM_PACKET_HEADER_WIRE_SIZE
+/** @brief 仿真生命周期控制载荷固定长度。 */
+#define SIM_SIM_CONTROL_PAYLOAD_WIRE_SIZE 4u
+/** @brief 完整仿真生命周期控制报文固定长度。 */
+#define SIM_SIM_CONTROL_PACKET_WIRE_SIZE \
+    (SIM_PACKET_HEADER_WIRE_SIZE + SIM_SIM_CONTROL_PAYLOAD_WIRE_SIZE)
+
+/** @brief 只解码并基础校验线格式包头，供兼容告警和分派使用。 */
+SimStatus packet_peek_header(
+    const unsigned char *data,
+    size_t data_size,
+    PacketHeader *out_header);
 
 /** @brief 校验报文头字段是否符合预期。
  *
@@ -86,5 +97,21 @@ SimStatus packet_decode_heartbeat(
     size_t data_size,
     uint32_t expected_instance_id,
     PacketHeader *out_header);
+/** @brief 编码带 CRC 的仿真生命周期控制报文。 */
+SimStatus packet_encode_sim_control(
+    uint32_t instance_id,
+    uint32_t seq,
+    double sim_time,
+    SimControlAction action,
+    unsigned char *out,
+    size_t out_capacity,
+    size_t *out_size);
+/** @brief 解码并校验仿真生命周期控制报文。 */
+SimStatus packet_decode_sim_control(
+    const unsigned char *data,
+    size_t data_size,
+    uint32_t expected_instance_id,
+    PacketHeader *out_header,
+    SimControlAction *action_out);
 
 #endif

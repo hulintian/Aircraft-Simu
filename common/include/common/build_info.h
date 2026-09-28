@@ -14,6 +14,19 @@
 /** @brief 仿真软件补丁版本号。 */
 #define MISSILE_SIM_VERSION_PATCH 0
 
+#ifndef MISSILE_SIM_GIT_COMMIT
+#define MISSILE_SIM_GIT_COMMIT "unknown"
+#endif
+#ifndef MISSILE_SIM_GIT_DIRTY
+#define MISSILE_SIM_GIT_DIRTY 0
+#endif
+#ifndef MISSILE_SIM_BUILD_TIME
+#define MISSILE_SIM_BUILD_TIME "unknown"
+#endif
+#ifndef MISSILE_SIM_COMPILER
+#define MISSILE_SIM_COMPILER "unknown"
+#endif
+
 /** @brief 通信协议主版本号。 */
 #define MISSILE_SIM_PROTOCOL_VERSION_MAJOR 1
 /** @brief 通信协议次版本号。 */

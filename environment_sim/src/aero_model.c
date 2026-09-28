@@ -6,10 +6,11 @@
 #include <math.h>
 
 /** @brief 计算沿相对气流反向的阻力及线性舵效力/力矩。 */
-SimStatus aero_model_evaluate(
+SimStatus aero_model_evaluate_extended(
     const AeroModel *model,
     double density_kgpm3,
     double mach,
+    double height_m,
     Vec3 velocity_air_b_mps,
     double pitch_actuator_rad,
     double yaw_actuator_rad,
@@ -24,6 +25,7 @@ SimStatus aero_model_evaluate(
     if (model == 0 || force_b_n == 0 || moment_b_nm == 0 ||
         !isfinite(density_kgpm3) || density_kgpm3 < 0.0 ||
         !isfinite(mach) || mach < 0.0 ||
+        !isfinite(height_m) ||
         !vec3_isfinite(velocity_air_b_mps) ||
         !isfinite(pitch_actuator_rad) || !isfinite(yaw_actuator_rad) ||
         !isfinite(model->reference_area_m2) || model->reference_area_m2 < 0.0 ||
@@ -46,6 +48,49 @@ SimStatus aero_model_evaluate(
         return SIM_OK;
     }
     dynamic_pressure = 0.5 * density_kgpm3 * speed * speed;
+    if (model->database_v2 != 0) {
+        AeroCoefficientSet coefficients;
+        uint32_t lookup_flags = 0u;
+        double alpha_rad = atan2(velocity_air_b_mps.z, velocity_air_b_mps.x);
+        double beta_ratio = velocity_air_b_mps.y / speed;
+        double beta_rad;
+        SimStatus status;
+
+        if (beta_ratio > 1.0) {
+            beta_ratio = 1.0;
+        } else if (beta_ratio < -1.0) {
+            beta_ratio = -1.0;
+        }
+        beta_rad = asin(beta_ratio);
+        status = aero_database_v2_lookup(
+            model->database_v2,
+            mach,
+            alpha_rad,
+            beta_rad,
+            height_m,
+            pitch_actuator_rad,
+            yaw_actuator_rad,
+            &coefficients,
+            &lookup_flags);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (model_flags != 0) {
+            *model_flags = lookup_flags;
+        }
+        *force_b_n = vec3_make(
+            dynamic_pressure * model->reference_area_m2 * coefficients.cx,
+            dynamic_pressure * model->reference_area_m2 * coefficients.cy,
+            dynamic_pressure * model->reference_area_m2 * coefficients.cz);
+        *moment_b_nm = vec3_make(
+            dynamic_pressure * model->reference_area_m2 * model->reference_length_m *
+                coefficients.cl,
+            dynamic_pressure * model->reference_area_m2 * model->reference_length_m *
+                coefficients.cm,
+            dynamic_pressure * model->reference_area_m2 * model->reference_length_m *
+                coefficients.cn);
+        return SIM_OK;
+    }
     if (model->database != 0) {
         AeroTableSample coefficients;
         uint32_t lookup_flags = 0u;
@@ -143,4 +188,28 @@ SimStatus aero_model_evaluate(
         dynamic_pressure * model->reference_area_m2 * model->reference_length_m *
             model->control_moment_coefficient * yaw_actuator_rad);
     return SIM_OK;
+}
+
+SimStatus aero_model_evaluate(
+    const AeroModel *model,
+    double density_kgpm3,
+    double mach,
+    Vec3 velocity_air_b_mps,
+    double pitch_actuator_rad,
+    double yaw_actuator_rad,
+    Vec3 *force_b_n,
+    Vec3 *moment_b_nm,
+    uint32_t *model_flags)
+{
+    return aero_model_evaluate_extended(
+        model,
+        density_kgpm3,
+        mach,
+        0.0,
+        velocity_air_b_mps,
+        pitch_actuator_rad,
+        yaw_actuator_rad,
+        force_b_n,
+        moment_b_nm,
+        model_flags);
 }

@@ -7,6 +7,7 @@
 #include "common/status.h"
 #include "common/vec3.h"
 #include "env/aero_database.h"
+#include "env/aero_database_v2.h"
 #include "env/aero_surrogate.h"
 
 /** @brief 气动模型配置。 */
@@ -19,9 +20,24 @@ typedef struct AeroModel {
     double control_moment_coefficient;
     /** @brief 可选气动表；为空时使用简化二次阻力模型。 */
     AeroDatabase *database;
+    /** @brief 可选六维气动表；启用时包含高度和舵偏影响。 */
+    AeroDatabaseV2 *database_v2;
     /** @brief 可选只读代理模型；气动表为空时优先于简化阻力模型。 */
     AeroSurrogateModel *surrogate;
 } AeroModel;
+
+/** @brief 使用高度、相对气流和舵偏计算气动力、力矩。 */
+SimStatus aero_model_evaluate_extended(
+    const AeroModel *model,
+    double density_kgpm3,
+    double mach,
+    double height_m,
+    Vec3 velocity_air_b_mps,
+    double pitch_actuator_rad,
+    double yaw_actuator_rad,
+    Vec3 *force_b_n,
+    Vec3 *moment_b_nm,
+    uint32_t *model_flags);
 
 /** @brief 根据机体系相对气流和舵偏计算气动力、力矩。 */
 SimStatus aero_model_evaluate(

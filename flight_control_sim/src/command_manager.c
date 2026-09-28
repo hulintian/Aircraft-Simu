@@ -108,9 +108,9 @@ SimStatus command_manager_build(
     if (request_hold != 0) {
         status_flags |= FC_HEALTH_WARNING_COMMAND_HELD;
         requested_accel = manager->last_command.accel_cmd_ecef;
-        if (manager->has_last_command == 0 ||
-            sim_time - manager->last_command.sim_time > manager->command_hold_s ||
-            sim_time < manager->last_command.sim_time) {
+        if (manager->has_fresh_command == 0 ||
+            sim_time - manager->last_fresh_command_time > manager->command_hold_s ||
+            sim_time < manager->last_fresh_command_time) {
             requested_accel = vec3_make(0.0, 0.0, 0.0);
         }
     } else {
@@ -142,6 +142,10 @@ SimStatus command_manager_build(
 
     manager->last_command = command;
     manager->has_last_command = 1;
+    if (request_hold == 0) {
+        manager->last_fresh_command_time = sim_time;
+        manager->has_fresh_command = 1;
+    }
     *out = command;
     *out_status_flags = status_flags;
     return SIM_OK;

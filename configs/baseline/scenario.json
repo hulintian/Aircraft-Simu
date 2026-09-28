@@ -35,6 +35,22 @@
     "mass_kg": 100.0,
     "propellant_mass_kg": 0.0,
     "inertia_diag": [1.0, 1.0, 1.0],
+    "mass_properties": {
+      "enabled": true,
+      "dry_center_of_mass_b_m": [0.0, 0.0, 0.0],
+      "propellant_center_of_mass_full_b_m": [0.0, 0.0, 0.0],
+      "propellant_center_of_mass_empty_b_m": [0.0, 0.0, 0.0],
+      "dry_inertia_centroid_b_kgm2": [
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0
+      ],
+      "propellant_inertia_full_centroid_b_kgm2": [
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0
+      ]
+    },
     "command_tau_s": 0.25,
     "acceleration_limit_mps2": 500.0,
     "acceleration_rate_limit_mps3": 2000.0
@@ -45,7 +61,16 @@
   "atmosphere": {
     "enabled": true,
     "maximum_model_height_m": 11000.0,
-    "wind_velocity_ecef_mps": [0.0, 0.0, 0.0]
+    "wind_velocity_ecef_mps": [0.0, 0.0, 0.0],
+    "wind_model": {
+      "enabled": true,
+      "reference_height_m": 0.0,
+      "shear_ecef_per_m": [0.0, 0.0, 0.0],
+      "gust_amplitude_ecef_mps": [0.0, 0.0, 0.0],
+      "gust_frequency_hz": 0.0,
+      "turbulence_sigma_ecef_mps": [0.0, 0.0, 0.0],
+      "turbulence_time_constant_s": 1.0
+    }
   },
   "propulsion": {
     "enabled": false,
@@ -67,7 +92,7 @@
     "initial_velocity_ecef_mps": [-390.0, -675.0, 0.0]
   },
   "target": {
-    "model": "SCRIPTED",
+    "model": "CONSTANT_VELOCITY",
     "initial_lla_deg_m": [30.0, 120.08, 1000.0],
     "initial_velocity_ecef_mps": [100.0, 173.0, 0.0]
   },

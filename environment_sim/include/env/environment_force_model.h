@@ -53,6 +53,8 @@ typedef struct EnvironmentForceInput {
     double propellant_mass_kg;
     /** @brief 当前积分步长，单位 s。 */
     double dt_s;
+    /** @brief 本步实例私有风模型输出的 ECEF 风速，单位 m/s。 */
+    Vec3 wind_velocity_ecef_mps;
 } EnvironmentForceInput;
 
 /** @brief 力模型计算结果和诊断分量。 */

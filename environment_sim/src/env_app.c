@@ -8,12 +8,14 @@
 
 #include "common/config.h"
 #include "common/build_info.h"
+#include "common/crc32.h"
 #include "common/logger.h"
 #include "common/math_constants.h"
 #include "common/matrix3.h"
 #include "common/packet.h"
 #include "common/protocol.h"
 #include "common/quaternion.h"
+#include "common/realtime_pacer.h"
 #include "common/status.h"
 #include "common/vec3.h"
 #include "env/actuator_model.h"
@@ -22,6 +24,7 @@
 #include "env/environment_force_model.h"
 #include "env/fault_injection.h"
 #include "env/geo_coordinate.h"
+#include "env/hit_detect.h"
 #include "env/mass_model.h"
 #include "env/missile_plant_6dof.h"
 #include "env/sensor_accel.h"
@@ -29,6 +32,8 @@
 #include "env/sensor_seeker.h"
 #include "env/sensor_speed.h"
 #include "env/terrain_model.h"
+#include "env/target_model.h"
+#include "env/wind_model.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -40,18 +45,38 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ENV_PACKET_BUFFER_SIZE 1024u
+#define ENV_MAX_DRAINED_COMMANDS_PER_STEP 64u
+#define ENV_MAX_CONFIG_WARNINGS 64u
 #define ENV_MAX_TERRAIN_TILES 16u
 #define ENV_COMM_DELAY_BUFFER_CAPACITY (ENV_MAX_COMMUNICATION_DELAY_STEPS + 1u)
+#define ENV_ACTUATOR_DELAY_BUFFER_CAPACITY (ENV_MAX_ACTUATOR_DELAY_STEPS + 1u)
+#define ENV_SENSOR_FAULT_DELAY_BUFFER_CAPACITY (ENV_MAX_SENSOR_DELAY_STEPS + 1u)
 #define ENV_MODEL_DEGRADATION_AERO_FLAGS UINT32_C(0x00000001)
 #define ENV_MODEL_DEGRADATION_TERRAIN_WARNING UINT32_C(0x00000002)
 #define ENV_MODEL_DEGRADATION_MASS_INVALID UINT32_C(0x00000004)
 #define ENV_MODEL_DEGRADATION_INERTIA_INVALID UINT32_C(0x00000008)
 #define ENV_MODEL_DEGRADATION_ATTITUDE_ERROR UINT32_C(0x00000010)
 #define ENV_MODEL_DEGRADATION_DCM_ERROR UINT32_C(0x00000020)
+
+/** @brief 环境进程墙钟执行模式；物理同步仍保持 LOCKSTEP。 */
+typedef enum EnvRunMode {
+    ENV_RUN_MODE_SIL_FAST = 0,
+    ENV_RUN_MODE_SIL_REALTIME = 1
+} EnvRunMode;
+
+/** @brief 环境与飞控之间的命令同步策略。 */
+typedef enum EnvSynchronizationMode {
+    ENV_SYNC_LOCKSTEP = 0,
+    ENV_SYNC_FREE_RUNNING = 1
+} EnvSynchronizationMode;
+
 typedef struct EnvRuntimeConfig {
+    /** @brief 本次任务稳定标识。 */
+    char campaign_id[128];
     /** @brief 环境进程 UDP 基础端口。 */
     unsigned int env_base_port;
     /** @brief 飞控进程 UDP 基础端口。 */
@@ -70,6 +95,10 @@ typedef struct EnvRuntimeConfig {
     int event_log;
     /** @brief 本次任务的随机种子基值。 */
     uint64_t base_random_seed;
+    /** @brief 最快推进或按墙钟节拍推进。 */
+    EnvRunMode run_mode;
+    /** @brief 每帧等待命令或非阻塞保持最新命令。 */
+    EnvSynchronizationMode synchronization_mode;
 } EnvRuntimeConfig;
 
 typedef struct EnvScenarioConfig {
@@ -87,6 +116,18 @@ typedef struct EnvScenarioConfig {
     double propellant_mass_kg;
     /** @brief 机体系惯量矩阵对角线，单位 kg*m^2。 */
     double inertia_diag[3];
+    /** @brief 是否启用质心迁移和完整惯量张量模型。 */
+    int mass_properties_enabled;
+    /** @brief 干体质心，机体系，单位米。 */
+    Vec3 dry_center_of_mass_b_m;
+    /** @brief 满装推进剂质心，机体系，单位米。 */
+    Vec3 propellant_center_of_mass_full_b_m;
+    /** @brief 空箱推进剂等效质心，机体系，单位米。 */
+    Vec3 propellant_center_of_mass_empty_b_m;
+    /** @brief 干体绕自身质心的完整惯量张量。 */
+    Matrix3 dry_inertia_centroid_b_kgm2;
+    /** @brief 满装推进剂绕自身质心的完整惯量张量。 */
+    Matrix3 propellant_inertia_full_centroid_b_kgm2;
     /** @brief 飞控加速度接口的幅值限制，单位 m/s^2。 */
     double acceleration_limit_mps2;
     /** @brief 飞控加速度接口的变化率限制，单位 m/s^3。 */
@@ -97,10 +138,18 @@ typedef struct EnvScenarioConfig {
     int enable_earth_rotation;
     /** @brief 环境力、力矩和重力模型配置快照。 */
     EnvironmentForceModel force_model;
+    /** @brief 实例私有风切变、阵风和湍流配置。 */
+    WindModelConfig wind_model;
     /** @brief 是否配置了内部气动表文件。 */
     int aero_table_path_enabled;
     /** @brief 内部气动表文件路径。 */
     char aero_table_path[512];
+    /** @brief 是否配置了六维 v2 气动表文件。 */
+    int aero_table_v2_path_enabled;
+    /** @brief 六维 v2 气动表文件路径。 */
+    char aero_table_v2_path[512];
+    /** @brief 已加载 v2 气动表的六个轴维度。 */
+    size_t aero_table_v2_dimensions[AERO_DATABASE_V2_AXIS_COUNT];
     /** @brief 是否用配置覆盖气动表文件中的包络外策略。 */
     int aero_table_policy_override_enabled;
     /** @brief 配置覆盖的气动表包络外策略。 */
@@ -143,6 +192,10 @@ typedef struct EnvScenarioConfig {
     double terrain_flat_fill_height_m;
     /** @brief 本实例允许加载的地形瓦片容量。 */
     size_t terrain_cache_tile_count;
+    /** @brief 是否配置地形资源来源清单。 */
+    int terrain_resource_manifest_path_enabled;
+    /** @brief 地形资源来源、许可和派生过程清单路径。 */
+    char terrain_resource_manifest_path[512];
     /** @brief 是否配置地形瓦片索引文件。 */
     int terrain_tile_index_path_enabled;
     /** @brief 地形瓦片索引文件路径。 */
@@ -161,6 +214,8 @@ typedef struct EnvScenarioConfig {
     double target_lla[3];
     /** @brief 目标初始 ECEF 速度，单位 m/s。 */
     double target_vel[3];
+    /** @brief 目标匀速或脚本加速度真值模型。 */
+    TargetModel target_model;
 } EnvScenarioConfig;
 
 typedef struct EnvTruthState {
@@ -178,6 +233,10 @@ typedef struct EnvTruthState {
     PlantState6Dof missile_plant;
     /** @brief 导弹干质量和推进剂质量状态。 */
     MassModel missile_mass;
+    /** @brief 实例私有风场运行状态。 */
+    WindModel wind_model;
+    /** @brief 最近一步 ECEF 风速，单位 m/s。 */
+    Vec3 wind_velocity_ecef_mps;
     /** @brief 初始惯量矩阵，用于按质量比例近似更新惯量。 */
     Matrix3 initial_inertia_b;
     /** @brief 初始总质量，单位千克。 */
@@ -240,6 +299,23 @@ typedef struct CommunicationReorderState {
     int has_previous;
 } CommunicationReorderState;
 
+typedef struct ActuatorCommandDelayLine {
+    double commands[ENV_ACTUATOR_DELAY_BUFFER_CAPACITY];
+    size_t head;
+    size_t count;
+} ActuatorCommandDelayLine;
+
+typedef struct SensorFaultDelayLine {
+    SensorFrame frames[ENV_SENSOR_FAULT_DELAY_BUFFER_CAPACITY];
+    size_t head;
+    size_t count;
+} SensorFaultDelayLine;
+
+typedef struct SensorFaultStuckState {
+    SensorFrame held;
+    int active;
+} SensorFaultStuckState;
+
 /** @brief 单实例数值诊断聚合，用于 summary.json 和批量统计。 */
 typedef struct DiagnosticRunStats {
     /** @brief 最大四元数范数误差。 */
@@ -260,6 +336,379 @@ typedef struct DiagnosticRunStats {
     size_t sample_count;
 } DiagnosticRunStats;
 
+/** @brief 一类墙钟耗时的固定内存统计。 */
+typedef struct TimingAccumulator {
+    size_t count;
+    double total_s;
+    double max_s;
+} TimingAccumulator;
+
+/** @brief 单实例闭环运行指标，用于 summary/performance 输出。 */
+typedef struct OperationalRunStats {
+    /** @brief 飞控 ECEF 加速度指令最大范数，单位 m/s^2。 */
+    double max_command_norm;
+    /** @brief 执行机构响应后 ECEF 加速度最大范数，单位 m/s^2。 */
+    double max_actual_accel;
+    /** @brief 至少一类预期传感器测量无效的发送帧数。 */
+    size_t sensor_dropout_count;
+    /** @brief 等待控制指令超时次数。 */
+    size_t command_timeout_count;
+    /** @brief FREE_RUNNING 下未收到新命令而保持上一指令的步数。 */
+    size_t command_hold_count;
+    /** @brief 接收并兼容处理的协议次版本不一致报文数。 */
+    size_t protocol_minor_mismatch_count;
+    /** @brief 仿真主循环总墙钟耗时。 */
+    double run_wall_time_s;
+    /** @brief 单步计算耗时，不含实时节拍等待。 */
+    TimingAccumulator step_compute;
+    /** @brief 传感器 UDP 发送耗时。 */
+    TimingAccumulator sensor_send;
+    /** @brief 控制命令 UDP 接收等待耗时。 */
+    TimingAccumulator command_receive;
+    /** @brief 发送传感器到收到控制命令的往返耗时。 */
+    TimingAccumulator control_roundtrip;
+    /** @brief 二进制/CSV 日志写入耗时。 */
+    TimingAccumulator log_write;
+    /** @brief 实时节拍累计睡眠时间。 */
+    double realtime_sleep_time_s;
+    /** @brief 未能在步截止时间前完成的次数。 */
+    size_t realtime_overrun_count;
+    /** @brief 最大实时超限时间。 */
+    double max_realtime_overrun_s;
+} OperationalRunStats;
+
+/** @brief 启动配置中允许但需要告警的未识别字段集合。 */
+typedef struct ConfigWarningCollector {
+    char source[32];
+    char paths[ENV_MAX_CONFIG_WARNINGS][256];
+    size_t stored_count;
+    size_t total_count;
+} ConfigWarningCollector;
+
+/** @brief 收集未知字段路径并立即输出启动 warning。 */
+static void collect_unknown_config_key(
+    const char *object_path,
+    const char *key,
+    void *user_data)
+{
+    ConfigWarningCollector *collector = (ConfigWarningCollector *)user_data;
+    char full_path[256];
+
+    if (collector == 0 || object_path == 0 || key == 0) {
+        return;
+    }
+    (void)snprintf(
+        full_path,
+        sizeof(full_path),
+        "%s.%s%s%s",
+        collector->source,
+        object_path[0] == '\0' ? "" : object_path,
+        object_path[0] == '\0' ? "" : ".",
+        key);
+    (void)fprintf(stderr, "environment_sim: config warning: unrecognized field %s\n", full_path);
+    if (collector->stored_count < ENV_MAX_CONFIG_WARNINGS) {
+        (void)snprintf(
+            collector->paths[collector->stored_count],
+            sizeof(collector->paths[collector->stored_count]),
+            "%s",
+            full_path);
+        ++collector->stored_count;
+    }
+    ++collector->total_count;
+}
+
+/** @brief 校验一个必需或可选对象的直接字段白名单。 */
+static SimStatus check_config_object_keys(
+    const ConfigTree *tree,
+    const char *source,
+    const char *path,
+    const char *const *allowed_keys,
+    size_t allowed_key_count,
+    int optional,
+    ConfigWarningCollector *collector)
+{
+    int exists = 1;
+    size_t unknown_count = 0u;
+    SimStatus status;
+
+    if (tree == 0 || source == 0 || path == 0 || collector == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (path[0] != '\0') {
+        status = config_path_exists(tree, path, &exists);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (exists == 0) {
+            return optional != 0 ? SIM_OK : SIM_ERR_CONFIG;
+        }
+    }
+    (void)snprintf(collector->source, sizeof(collector->source), "%s", source);
+    return config_visit_unknown_keys(
+        tree,
+        path,
+        allowed_keys,
+        allowed_key_count,
+        collect_unknown_config_key,
+        collector,
+        &unknown_count);
+}
+
+#define ENV_ARRAY_COUNT(values) (sizeof(values) / sizeof((values)[0]))
+
+/** @brief 对环境、运行时和故障配置执行已知字段审计。 */
+static SimStatus audit_environment_config_fields(
+    const ConfigTree *scenario,
+    const ConfigTree *runtime,
+    const ConfigTree *faults,
+    ConfigWarningCollector *collector)
+{
+    static const char *const scenario_root[] = {
+        "schema_version", "simulation", "earth", "map", "plant", "gravity",
+        "atmosphere", "propulsion", "aerodynamics", "missile", "target", "sensors"
+    };
+    static const char *const simulation_keys[] = { "mode", "dt", "max_time", "hit_radius_m" };
+    static const char *const earth_keys[] = { "model", "enable_rotation_terms", "origin" };
+    static const char *const origin_keys[] = { "lat_deg", "lon_deg", "height_m", "local_frame" };
+    static const char *const map_keys[] = {
+        "database_path", "tile_index", "tile_path", "tile_paths", "tile_index_path",
+        "resource_manifest_path", "enable_terrain", "enable_los_occlusion",
+        "missing_tile_policy", "terrain"
+    };
+    static const char *const terrain_keys[] = {
+        "interpolation", "height_reference", "cache_tile_count", "flat_fill_height_m"
+    };
+    static const char *const plant_keys[] = {
+        "model", "integrator", "mass_kg", "propellant_mass_kg", "inertia_diag",
+        "mass_properties", "command_tau_s", "acceleration_limit_mps2",
+        "acceleration_rate_limit_mps3"
+    };
+    static const char *const mass_property_keys[] = {
+        "enabled", "dry_center_of_mass_b_m", "propellant_center_of_mass_full_b_m",
+        "propellant_center_of_mass_empty_b_m", "dry_inertia_centroid_b_kgm2",
+        "propellant_inertia_full_centroid_b_kgm2"
+    };
+    static const char *const gravity_keys[] = { "enabled" };
+    static const char *const atmosphere_keys[] = {
+        "enabled", "maximum_model_height_m", "wind_velocity_ecef_mps", "wind_model"
+    };
+    static const char *const wind_keys[] = {
+        "enabled", "reference_height_m", "shear_ecef_per_m", "gust_amplitude_ecef_mps",
+        "gust_frequency_hz", "turbulence_sigma_ecef_mps", "turbulence_time_constant_s"
+    };
+    static const char *const propulsion_keys[] = {
+        "enabled", "thrust_n", "mass_flow_kgps", "burn_time_s", "thrust_direction_b"
+    };
+    static const char *const aero_keys[] = {
+        "enabled", "reference_area_m2", "reference_length_m", "drag_coefficient",
+        "control_force_coefficient", "control_moment_coefficient", "table_path",
+        "table_v2_path", "table_extrapolation_policy", "table_height_min_m",
+        "table_height_max_m", "table_actuator_min_rad", "table_actuator_max_rad",
+        "surrogate_model_path", "surrogate_model_version", "surrogate_training_data_version"
+    };
+    static const char *const missile_keys[] = {
+        "initial_lla_deg_m", "initial_velocity_ecef_mps"
+    };
+    static const char *const target_keys[] = {
+        "model", "initial_lla_deg_m", "initial_velocity_ecef_mps", "maneuvers"
+    };
+    static const char *const target_maneuver_keys[] = {
+        "start_time_s", "duration_s", "acceleration_ecef_mps2"
+    };
+    static const char *const sensors_keys[] = {
+        "imu", "accelerometer", "speedometer", "seeker"
+    };
+    static const char *const vector_sensor_keys[] = {
+        "enabled", "sample_period_s", "delay_s", "dropout_probability", "noise"
+    };
+    static const char *const seeker_keys[] = {
+        "enabled", "sample_period_s", "delay_s", "dropout_probability", "range_noise",
+        "los_unit_noise", "los_rate_noise", "closing_velocity_noise"
+    };
+    static const char *const noise_keys[] = {
+        "bias", "bias_xyz", "white_noise_std", "random_walk_std", "min_value",
+        "max_value", "resolution"
+    };
+    static const char *const runtime_root[] = {
+        "schema_version", "campaign", "network", "logging", "tools", "instances"
+    };
+    static const char *const campaign_keys[] = {
+        "campaign_id", "instance_count", "schedule", "run_mode", "synchronization_mode",
+        "max_parallel_instances", "base_random_seed", "failure_strategy"
+    };
+    static const char *const network_keys[] = {
+        "protocol_version_major", "protocol_version_minor", "environment_base_port",
+        "flight_control_base_port", "host"
+    };
+    static const char *const logging_keys[] = {
+        "output_dir", "instance_dir_template", "binary_logs", "event_log", "flush_every_steps"
+    };
+    static const char *const tools_keys[] = { "environment_program", "flight_control_program" };
+    static const char *const instance_keys[] = {
+        "enabled", "instance_id", "scenario", "flight_control", "faults", "random_seed"
+    };
+    static const char *const faults_root[] = { "schema_version", "faults" };
+    static const char *const fault_keys[] = {
+        "id", "enabled", "start_time_s", "time_s", "duration_s", "target", "type",
+        "value", "value_xyz", "scale", "ramp_in_s", "recovery_ramp_s",
+        "recovery_hold_s", "recovery_timeout_s", "burst_period_s", "burst_active_s",
+        "delay_pattern_steps", "min_value", "max_value"
+    };
+    static const char *const vector_sensor_paths[] = {
+        "sensors.imu", "sensors.accelerometer", "sensors.speedometer"
+    };
+    static const char *const noise_paths[] = {
+        "sensors.imu.noise", "sensors.accelerometer.noise", "sensors.speedometer.noise",
+        "sensors.seeker.range_noise", "sensors.seeker.los_unit_noise",
+        "sensors.seeker.los_rate_noise", "sensors.seeker.closing_velocity_noise"
+    };
+    size_t index;
+    size_t count = 0u;
+    SimStatus status;
+
+#define CHECK(tree, source, path, keys, optional) \
+    do { \
+        status = check_config_object_keys( \
+            tree, source, path, keys, ENV_ARRAY_COUNT(keys), optional, collector); \
+        if (status != SIM_OK) { \
+            return status; \
+        } \
+    } while (0)
+    CHECK(scenario, "scenario", "", scenario_root, 0);
+    CHECK(scenario, "scenario", "simulation", simulation_keys, 0);
+    CHECK(scenario, "scenario", "earth", earth_keys, 0);
+    CHECK(scenario, "scenario", "earth.origin", origin_keys, 1);
+    CHECK(scenario, "scenario", "map", map_keys, 0);
+    CHECK(scenario, "scenario", "map.terrain", terrain_keys, 0);
+    CHECK(scenario, "scenario", "plant", plant_keys, 0);
+    CHECK(scenario, "scenario", "plant.mass_properties", mass_property_keys, 1);
+    CHECK(scenario, "scenario", "gravity", gravity_keys, 0);
+    CHECK(scenario, "scenario", "atmosphere", atmosphere_keys, 0);
+    CHECK(scenario, "scenario", "atmosphere.wind_model", wind_keys, 1);
+    CHECK(scenario, "scenario", "propulsion", propulsion_keys, 0);
+    CHECK(scenario, "scenario", "aerodynamics", aero_keys, 0);
+    CHECK(scenario, "scenario", "missile", missile_keys, 0);
+    CHECK(scenario, "scenario", "target", target_keys, 0);
+    if (config_get_array_count(scenario, "target.maneuvers", &count) == SIM_OK) {
+        for (index = 0u; index < count; ++index) {
+            char maneuver_path[64];
+
+            (void)snprintf(maneuver_path, sizeof(maneuver_path), "target.maneuvers[%zu]", index);
+            status = check_config_object_keys(
+                scenario, "scenario", maneuver_path, target_maneuver_keys,
+                ENV_ARRAY_COUNT(target_maneuver_keys), 0, collector);
+            if (status != SIM_OK) {
+                return status;
+            }
+        }
+    }
+    CHECK(scenario, "scenario", "sensors", sensors_keys, 0);
+    for (index = 0u; index < ENV_ARRAY_COUNT(vector_sensor_paths); ++index) {
+        status = check_config_object_keys(
+            scenario, "scenario", vector_sensor_paths[index], vector_sensor_keys,
+            ENV_ARRAY_COUNT(vector_sensor_keys), 0, collector);
+        if (status != SIM_OK) {
+            return status;
+        }
+    }
+    CHECK(scenario, "scenario", "sensors.seeker", seeker_keys, 0);
+    for (index = 0u; index < ENV_ARRAY_COUNT(noise_paths); ++index) {
+        status = check_config_object_keys(
+            scenario, "scenario", noise_paths[index], noise_keys,
+            ENV_ARRAY_COUNT(noise_keys), 0, collector);
+        if (status != SIM_OK) {
+            return status;
+        }
+    }
+    CHECK(runtime, "runtime", "", runtime_root, 0);
+    CHECK(runtime, "runtime", "campaign", campaign_keys, 0);
+    CHECK(runtime, "runtime", "network", network_keys, 0);
+    CHECK(runtime, "runtime", "logging", logging_keys, 0);
+    CHECK(runtime, "runtime", "tools", tools_keys, 1);
+    if (config_get_array_count(runtime, "instances", &count) == SIM_OK) {
+        for (index = 0u; index < count; ++index) {
+            char instance_path[64];
+
+            (void)snprintf(instance_path, sizeof(instance_path), "instances[%zu]", index);
+            status = check_config_object_keys(
+                runtime, "runtime", instance_path, instance_keys,
+                ENV_ARRAY_COUNT(instance_keys), 0, collector);
+            if (status != SIM_OK) {
+                return status;
+            }
+        }
+    }
+    CHECK(faults, "faults", "", faults_root, 0);
+    status = config_get_array_count(faults, "faults", &count);
+    if (status != SIM_OK) {
+        return status;
+    }
+    for (index = 0u; index < count; ++index) {
+        char fault_path[64];
+
+        (void)snprintf(fault_path, sizeof(fault_path), "faults[%zu]", index);
+        status = check_config_object_keys(
+            faults, "faults", fault_path, fault_keys,
+            ENV_ARRAY_COUNT(fault_keys), 0, collector);
+        if (status != SIM_OK) {
+            return status;
+        }
+    }
+#undef CHECK
+    return SIM_OK;
+}
+
+#undef ENV_ARRAY_COUNT
+
+/** @brief 记录一次有限非负墙钟耗时。 */
+static void timing_accumulate(TimingAccumulator *stats, double duration_s)
+{
+    if (stats == 0 || !isfinite(duration_s) || duration_s < 0.0) {
+        return;
+    }
+    ++stats->count;
+    stats->total_s += duration_s;
+    if (duration_s > stats->max_s) {
+        stats->max_s = duration_s;
+    }
+}
+
+/** @brief 完成一次墙钟计时并更新统计。 */
+static SimStatus timing_finish(double start_s, TimingAccumulator *stats)
+{
+    double end_s;
+    SimStatus status = monotonic_time_now(&end_s);
+
+    if (status == SIM_OK) {
+        timing_accumulate(stats, end_s - start_s);
+    }
+    return status;
+}
+
+/** @brief 返回运行模式的稳定 manifest 字符串。 */
+static const char *env_run_mode_to_string(EnvRunMode mode)
+{
+    return mode == ENV_RUN_MODE_SIL_REALTIME ? "SIL_REALTIME" : "SIL_FAST";
+}
+
+/** @brief 返回同步策略的稳定 manifest 字符串。 */
+static const char *env_synchronization_mode_to_string(EnvSynchronizationMode mode)
+{
+    return mode == ENV_SYNC_FREE_RUNNING ? "FREE_RUNNING" : "LOCKSTEP";
+}
+
+/** @brief 返回积分器稳定名称。 */
+static const char *integrator_type_to_string(IntegratorType type)
+{
+    if (type == INTEGRATOR_EULER) {
+        return "EULER";
+    }
+    if (type == INTEGRATOR_RK2) {
+        return "RK2";
+    }
+    return "RK4";
+}
+
 /** @brief 从运行时配置读取网络和输出目录。 */
 static SimStatus load_runtime_config(const ConfigTree *runtime, EnvRuntimeConfig *out)
 {
@@ -270,6 +719,10 @@ static SimStatus load_runtime_config(const ConfigTree *runtime, EnvRuntimeConfig
     }
     memset(out, 0, sizeof(*out));
 
+    status = config_get_string(runtime, "campaign.campaign_id", out->campaign_id, sizeof(out->campaign_id));
+    if (status != SIM_OK || out->campaign_id[0] == '\0') {
+        return SIM_ERR_CONFIG;
+    }
     status = config_get_uint32(runtime, "network.environment_base_port", &out->env_base_port);
     if (status != SIM_OK) {
         return status;
@@ -311,6 +764,61 @@ static SimStatus load_runtime_config(const ConfigTree *runtime, EnvRuntimeConfig
 
         status = config_get_uint32(runtime, "campaign.base_random_seed", &base_seed);
         out->base_random_seed = status == SIM_OK ? (uint64_t)base_seed : UINT64_C(1);
+    }
+    {
+        char run_mode[32];
+        int run_mode_exists = 0;
+
+        status = config_path_exists(runtime, "campaign.run_mode", &run_mode_exists);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (run_mode_exists == 0) {
+            out->run_mode = ENV_RUN_MODE_SIL_FAST;
+        } else {
+            status = config_get_string(runtime, "campaign.run_mode", run_mode, sizeof(run_mode));
+            if (status != SIM_OK) {
+                return status;
+            }
+            if (strcmp(run_mode, "SIL_FAST") == 0) {
+                out->run_mode = ENV_RUN_MODE_SIL_FAST;
+            } else if (strcmp(run_mode, "SIL_REALTIME") == 0) {
+                out->run_mode = ENV_RUN_MODE_SIL_REALTIME;
+            } else {
+                return SIM_ERR_CONFIG;
+            }
+        }
+    }
+    {
+        char synchronization_mode[32];
+        int synchronization_mode_exists = 0;
+
+        status = config_path_exists(
+            runtime,
+            "campaign.synchronization_mode",
+            &synchronization_mode_exists);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (synchronization_mode_exists == 0) {
+            out->synchronization_mode = ENV_SYNC_LOCKSTEP;
+        } else {
+            status = config_get_string(
+                runtime,
+                "campaign.synchronization_mode",
+                synchronization_mode,
+                sizeof(synchronization_mode));
+            if (status != SIM_OK) {
+                return status;
+            }
+            if (strcmp(synchronization_mode, "LOCKSTEP") == 0) {
+                out->synchronization_mode = ENV_SYNC_LOCKSTEP;
+            } else if (strcmp(synchronization_mode, "FREE_RUNNING") == 0) {
+                out->synchronization_mode = ENV_SYNC_FREE_RUNNING;
+            } else {
+                return SIM_ERR_CONFIG;
+            }
+        }
     }
     return SIM_OK;
 }
@@ -817,6 +1325,7 @@ static SimStatus load_terrain_tile_index(EnvScenarioConfig *out, const char *ind
 static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioConfig *out)
 {
     double vector_values[3];
+    double matrix_values[9];
     char integrator[16];
     char missing_policy[32];
     char aero_policy[32];
@@ -868,6 +1377,74 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
         out->inertia_diag[1] <= 0.0 ||
         out->inertia_diag[2] <= 0.0) {
         return SIM_ERR_CONFIG;
+    }
+    status = config_get_bool(
+        scenario,
+        "plant.mass_properties.enabled",
+        &out->mass_properties_enabled);
+    if (status != SIM_OK) {
+        out->mass_properties_enabled = 0;
+    }
+    if (out->mass_properties_enabled != 0) {
+        size_t row;
+        size_t column;
+
+        status = config_get_double_array(
+            scenario,
+            "plant.mass_properties.dry_center_of_mass_b_m",
+            vector_values,
+            3u);
+        if (status != SIM_OK) {
+            return status;
+        }
+        out->dry_center_of_mass_b_m = vec3_make(vector_values[0], vector_values[1], vector_values[2]);
+        status = config_get_double_array(
+            scenario,
+            "plant.mass_properties.propellant_center_of_mass_full_b_m",
+            vector_values,
+            3u);
+        if (status != SIM_OK) {
+            return status;
+        }
+        out->propellant_center_of_mass_full_b_m =
+            vec3_make(vector_values[0], vector_values[1], vector_values[2]);
+        status = config_get_double_array(
+            scenario,
+            "plant.mass_properties.propellant_center_of_mass_empty_b_m",
+            vector_values,
+            3u);
+        if (status != SIM_OK) {
+            return status;
+        }
+        out->propellant_center_of_mass_empty_b_m =
+            vec3_make(vector_values[0], vector_values[1], vector_values[2]);
+        status = config_get_double_array(
+            scenario,
+            "plant.mass_properties.dry_inertia_centroid_b_kgm2",
+            matrix_values,
+            9u);
+        if (status != SIM_OK) {
+            return status;
+        }
+        for (row = 0u; row < 3u; ++row) {
+            for (column = 0u; column < 3u; ++column) {
+                out->dry_inertia_centroid_b_kgm2.m[row][column] = matrix_values[(3u * row) + column];
+            }
+        }
+        status = config_get_double_array(
+            scenario,
+            "plant.mass_properties.propellant_inertia_full_centroid_b_kgm2",
+            matrix_values,
+            9u);
+        if (status != SIM_OK) {
+            return status;
+        }
+        for (row = 0u; row < 3u; ++row) {
+            for (column = 0u; column < 3u; ++column) {
+                out->propellant_inertia_full_centroid_b_kgm2.m[row][column] =
+                    matrix_values[(3u * row) + column];
+            }
+        }
     }
     status = config_get_double(
         scenario,
@@ -932,6 +1509,48 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
         out->force_model.wind_velocity_ecef_mps =
             vec3_make(vector_values[0], vector_values[1], vector_values[2]);
     }
+    out->wind_model.enabled = 1;
+    out->wind_model.base_velocity_ecef_mps = out->force_model.wind_velocity_ecef_mps;
+    out->wind_model.turbulence_time_constant_s = 1.0;
+    (void)config_get_bool(scenario, "atmosphere.wind_model.enabled", &out->wind_model.enabled);
+    status = config_get_double_array(
+        scenario,
+        "atmosphere.wind_model.shear_ecef_per_m",
+        vector_values,
+        3u);
+    if (status == SIM_OK) {
+        out->wind_model.shear_ecef_per_m = vec3_make(vector_values[0], vector_values[1], vector_values[2]);
+    }
+    (void)config_get_double(
+        scenario,
+        "atmosphere.wind_model.reference_height_m",
+        &out->wind_model.reference_height_m);
+    status = config_get_double_array(
+        scenario,
+        "atmosphere.wind_model.gust_amplitude_ecef_mps",
+        vector_values,
+        3u);
+    if (status == SIM_OK) {
+        out->wind_model.gust_amplitude_ecef_mps =
+            vec3_make(vector_values[0], vector_values[1], vector_values[2]);
+    }
+    (void)config_get_double(
+        scenario,
+        "atmosphere.wind_model.gust_frequency_hz",
+        &out->wind_model.gust_frequency_hz);
+    status = config_get_double_array(
+        scenario,
+        "atmosphere.wind_model.turbulence_sigma_ecef_mps",
+        vector_values,
+        3u);
+    if (status == SIM_OK) {
+        out->wind_model.turbulence_sigma_ecef_mps =
+            vec3_make(vector_values[0], vector_values[1], vector_values[2]);
+    }
+    (void)config_get_double(
+        scenario,
+        "atmosphere.wind_model.turbulence_time_constant_s",
+        &out->wind_model.turbulence_time_constant_s);
     status = config_get_bool(
         scenario,
         "propulsion.enabled",
@@ -1019,6 +1638,16 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
         sizeof(out->aero_table_path));
     if (status == SIM_OK) {
         out->aero_table_path_enabled = 1;
+    } else if (status == SIM_ERR_OUT_OF_RANGE) {
+        return status;
+    }
+    status = config_get_string(
+        scenario,
+        "aerodynamics.table_v2_path",
+        out->aero_table_v2_path,
+        sizeof(out->aero_table_v2_path));
+    if (status == SIM_OK) {
+        out->aero_table_v2_path_enabled = 1;
     } else if (status == SIM_ERR_OUT_OF_RANGE) {
         return status;
     }
@@ -1131,6 +1760,11 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
     } else if (status == SIM_ERR_OUT_OF_RANGE) {
         return status;
     }
+    if (out->aero_table_v2_path_enabled != 0 &&
+        (out->aero_table_path_enabled != 0 ||
+            out->aero_surrogate_model_path_enabled != 0)) {
+        return SIM_ERR_CONFIG;
+    }
     out->force_model.enable_earth_rotation = out->enable_earth_rotation;
     out->force_model.earth_rotation_rate_radps =
         ENV_WGS84_EARTH_ROTATION_RADPS;
@@ -1218,6 +1852,22 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
     }
     status = config_get_string(
         scenario,
+        "map.resource_manifest_path",
+        out->terrain_resource_manifest_path,
+        sizeof(out->terrain_resource_manifest_path));
+    if (status == SIM_OK) {
+        FILE *manifest = fopen(out->terrain_resource_manifest_path, "rb");
+
+        if (manifest == 0) {
+            return SIM_ERR_IO;
+        }
+        (void)fclose(manifest);
+        out->terrain_resource_manifest_path_enabled = 1;
+    } else if (status == SIM_ERR_OUT_OF_RANGE) {
+        return status;
+    }
+    status = config_get_string(
+        scenario,
         "map.tile_path",
         out->terrain_tile_paths[out->terrain_tile_path_count],
         sizeof(out->terrain_tile_paths[out->terrain_tile_path_count]));
@@ -1288,6 +1938,9 @@ static SimStatus load_scenario_config(const ConfigTree *scenario, EnvScenarioCon
         return status;
     }
     status = config_get_double_array(scenario, "target.initial_velocity_ecef_mps", out->target_vel, 3u);
+    if (status == SIM_OK) {
+        status = target_model_load_config(scenario, &out->target_model);
+    }
     return status;
 }
 
@@ -1342,7 +1995,8 @@ static SimStatus send_sensor_frame(
     int sock,
     const struct sockaddr_in *peer,
     uint32_t instance_id,
-    const SensorFrame *sensor)
+    const SensorFrame *sensor,
+    const FaultStepEffects *effects)
 {
     unsigned char buffer[SIM_SENSOR_PACKET_WIRE_SIZE];
     size_t packet_size;
@@ -1361,11 +2015,54 @@ static SimStatus send_sensor_frame(
     if (status != SIM_OK) {
         return status;
     }
+    if (effects != 0 && effects->communication_drop_enabled != 0) {
+        return SIM_OK;
+    }
+    if (effects != 0 && effects->communication_corrupt_enabled != 0) {
+        buffer[packet_size - 1u] ^= UINT8_C(0x01);
+    }
     sent = sendto(sock, buffer, packet_size, 0, (const struct sockaddr *)peer, sizeof(*peer));
     if (sent != (ssize_t)packet_size) {
         return SIM_ERR_IO;
     }
+    if (effects != 0 && effects->communication_duplicate_enabled != 0) {
+        sent = sendto(sock, buffer, packet_size, 0, (const struct sockaddr *)peer, sizeof(*peer));
+        if (sent != (ssize_t)packet_size) {
+            return SIM_ERR_IO;
+        }
+    }
     return SIM_OK;
+}
+
+/** @brief 向飞控发送带 CRC 的本实例正常停止控制帧。 */
+static SimStatus send_sim_stop(
+    int sock,
+    const struct sockaddr_in *peer,
+    uint32_t instance_id,
+    uint32_t seq,
+    double sim_time)
+{
+    unsigned char buffer[SIM_SIM_CONTROL_PACKET_WIRE_SIZE];
+    size_t packet_size = 0u;
+    ssize_t sent;
+    SimStatus status;
+
+    if (peer == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = packet_encode_sim_control(
+        instance_id,
+        seq,
+        sim_time,
+        SIM_CONTROL_STOP,
+        buffer,
+        sizeof(buffer),
+        &packet_size);
+    if (status != SIM_OK) {
+        return status;
+    }
+    sent = sendto(sock, buffer, packet_size, 0, (const struct sockaddr *)peer, sizeof(*peer));
+    return sent == (ssize_t)packet_size ? SIM_OK : SIM_ERR_IO;
 }
 
 /** @brief 清空通信层传感器帧延迟线。 */
@@ -1480,10 +2177,164 @@ static SimStatus apply_communication_reorder(
     return SIM_OK;
 }
 
+/** @brief 重置单轴执行机构命令延迟线。 */
+static void actuator_command_delay_reset(ActuatorCommandDelayLine *delay)
+{
+    if (delay != 0) {
+        (void)memset(delay, 0, sizeof(*delay));
+    }
+}
+
+/** @brief 应用固定步数执行机构命令延迟，激活初期以中立命令填充。 */
+static SimStatus apply_actuator_command_delay(
+    ActuatorCommandDelayLine *delay,
+    unsigned int delay_steps,
+    double *command)
+{
+    size_t tail;
+    double current;
+
+    if (delay == 0 || command == 0 || !isfinite(*command)) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (delay_steps == 0u) {
+        actuator_command_delay_reset(delay);
+        return SIM_OK;
+    }
+    if (delay_steps > ENV_MAX_ACTUATOR_DELAY_STEPS ||
+        delay->count >= ENV_ACTUATOR_DELAY_BUFFER_CAPACITY) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    current = *command;
+    tail = (delay->head + delay->count) % ENV_ACTUATOR_DELAY_BUFFER_CAPACITY;
+    delay->commands[tail] = current;
+    ++delay->count;
+    if (delay->count > (size_t)delay_steps) {
+        *command = delay->commands[delay->head];
+        delay->head = (delay->head + 1u) % ENV_ACTUATOR_DELAY_BUFFER_CAPACITY;
+        --delay->count;
+    } else {
+        *command = 0.0;
+    }
+    return SIM_OK;
+}
+
+/** @brief 返回故障测量通道对应的 SensorFrame 有效位。 */
+static uint32_t sensor_fault_channel_valid_mask(size_t channel)
+{
+    if (channel <= 3u) {
+        return SIM_SENSOR_VALID_SEEKER;
+    }
+    if (channel == 4u) {
+        return SIM_SENSOR_VALID_IMU_GYRO;
+    }
+    if (channel == 5u) {
+        return SIM_SENSOR_VALID_ACCEL;
+    }
+    return channel == 6u ? SIM_SENSOR_VALID_SPEED : 0u;
+}
+
+/** @brief 仅复制一个故障测量通道，不改变当前帧序号和时间戳。 */
+static SimStatus copy_sensor_fault_channel(
+    SensorFrame *destination,
+    const SensorFrame *source,
+    size_t channel)
+{
+    if (destination == 0 || source == 0 ||
+        channel >= ENV_SENSOR_FAULT_CHANNEL_COUNT) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (channel == 0u) {
+        destination->target_range_meas = source->target_range_meas;
+    } else if (channel == 1u) {
+        destination->target_los_unit_ecef_meas = source->target_los_unit_ecef_meas;
+    } else if (channel == 2u) {
+        destination->target_los_rate_ecef_meas = source->target_los_rate_ecef_meas;
+    } else if (channel == 3u) {
+        destination->target_closing_velocity_meas = source->target_closing_velocity_meas;
+    } else if (channel == 4u) {
+        destination->missile_gyro_b_meas = source->missile_gyro_b_meas;
+    } else if (channel == 5u) {
+        destination->missile_accel_ecef_meas = source->missile_accel_ecef_meas;
+    } else {
+        destination->missile_vel_ecef_meas = source->missile_vel_ecef_meas;
+    }
+    return SIM_OK;
+}
+
+/** @brief 应用传感器故障起点捕获卡滞。 */
+static SimStatus apply_sensor_fault_stuck(
+    SensorFaultStuckState states[ENV_SENSOR_FAULT_CHANNEL_COUNT],
+    const FaultStepEffects *effects,
+    SensorFrame *sensor)
+{
+    size_t channel;
+
+    if (states == 0 || effects == 0 || sensor == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    for (channel = 0u; channel < ENV_SENSOR_FAULT_CHANNEL_COUNT; ++channel) {
+        if (effects->sensor_stuck_enabled[channel] == 0) {
+            states[channel].active = 0;
+            continue;
+        }
+        if (states[channel].active == 0) {
+            states[channel].held = *sensor;
+            states[channel].active = 1;
+        } else if (copy_sensor_fault_channel(sensor, &states[channel].held, channel) != SIM_OK) {
+            return SIM_ERR_INTERNAL;
+        }
+    }
+    return SIM_OK;
+}
+
+/** @brief 应用逐测量通道固定步数延迟。 */
+static SimStatus apply_sensor_fault_delay(
+    SensorFaultDelayLine lines[ENV_SENSOR_FAULT_CHANNEL_COUNT],
+    const FaultStepEffects *effects,
+    SensorFrame *sensor)
+{
+    size_t channel;
+
+    if (lines == 0 || effects == 0 || sensor == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    for (channel = 0u; channel < ENV_SENSOR_FAULT_CHANNEL_COUNT; ++channel) {
+        SensorFaultDelayLine *line = &lines[channel];
+        const unsigned int delay_steps = effects->sensor_delay_steps[channel];
+        size_t tail;
+
+        if (delay_steps == 0u) {
+            (void)memset(line, 0, sizeof(*line));
+            continue;
+        }
+        if (delay_steps > ENV_MAX_SENSOR_DELAY_STEPS ||
+            line->count >= ENV_SENSOR_FAULT_DELAY_BUFFER_CAPACITY) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        tail = (line->head + line->count) % ENV_SENSOR_FAULT_DELAY_BUFFER_CAPACITY;
+        line->frames[tail] = *sensor;
+        ++line->count;
+        if (line->count > (size_t)delay_steps) {
+            if (copy_sensor_fault_channel(sensor, &line->frames[line->head], channel) != SIM_OK) {
+                return SIM_ERR_INTERNAL;
+            }
+            line->head = (line->head + 1u) % ENV_SENSOR_FAULT_DELAY_BUFFER_CAPACITY;
+            --line->count;
+        } else {
+            sensor->sensor_valid_flags &= ~sensor_fault_channel_valid_mask(channel);
+            sensor->sensor_fault_flags |= SIM_SENSOR_FAULT_DELAY_WARMUP;
+        }
+    }
+    return SIM_OK;
+}
+
 /** @brief 接收并校验飞控控制指令。 */
 static SimStatus receive_control_command(
     int sock,
     uint32_t instance_id,
+    const struct sockaddr_in *expected_peer,
+    size_t *minor_mismatch_count,
     ControlCommand *command)
 {
     unsigned char buffer[ENV_PACKET_BUFFER_SIZE];
@@ -1491,13 +2342,92 @@ static SimStatus receive_control_command(
     socklen_t from_len = sizeof(from);
     ssize_t got = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_len);
 
-    if (command == 0) {
+    PacketHeader header;
+    SimStatus status;
+
+    if (expected_peer == 0 || minor_mismatch_count == 0 || command == 0) {
         return SIM_ERR_INVALID_ARG;
     }
     if (got < 0) {
         return errno == EAGAIN || errno == EWOULDBLOCK ? SIM_ERR_TIMEOUT : SIM_ERR_IO;
     }
+    if (from.sin_family != expected_peer->sin_family ||
+        from.sin_port != expected_peer->sin_port ||
+        from.sin_addr.s_addr != expected_peer->sin_addr.s_addr) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    status = packet_peek_header(buffer, (size_t)got, &header);
+    if (status != SIM_OK) {
+        return status;
+    }
+    if (header.version_minor != MISSILE_SIM_PROTOCOL_VERSION_MINOR) {
+        ++*minor_mismatch_count;
+    }
     return packet_decode_control_command(buffer, (size_t)got, instance_id, command);
+}
+
+/** @brief 非阻塞排空有限数量控制帧，并保留不晚于当前传感器序号的最新命令。 */
+static SimStatus receive_latest_control_command(
+    int sock,
+    uint32_t instance_id,
+    uint32_t current_sensor_seq,
+    const struct sockaddr_in *expected_peer,
+    size_t *minor_mismatch_count,
+    ControlCommand *latest_command,
+    int *received_new_command)
+{
+    size_t drained_count;
+
+    if (expected_peer == 0 || minor_mismatch_count == 0 ||
+        latest_command == 0 || received_new_command == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    *received_new_command = 0;
+    for (drained_count = 0u;
+         drained_count < ENV_MAX_DRAINED_COMMANDS_PER_STEP;
+         ++drained_count) {
+        unsigned char buffer[ENV_PACKET_BUFFER_SIZE];
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        ControlCommand candidate;
+        PacketHeader header;
+        ssize_t got = recvfrom(
+            sock,
+            buffer,
+            sizeof(buffer),
+            MSG_DONTWAIT,
+            (struct sockaddr *)&from,
+            &from_len);
+        SimStatus status;
+
+        if (got < 0) {
+            return errno == EAGAIN || errno == EWOULDBLOCK ? SIM_OK : SIM_ERR_IO;
+        }
+        if (from.sin_family != expected_peer->sin_family ||
+            from.sin_port != expected_peer->sin_port ||
+            from.sin_addr.s_addr != expected_peer->sin_addr.s_addr) {
+            return SIM_ERR_BAD_PACKET;
+        }
+        status = packet_peek_header(buffer, (size_t)got, &header);
+        if (status == SIM_OK && header.version_minor != MISSILE_SIM_PROTOCOL_VERSION_MINOR) {
+            ++*minor_mismatch_count;
+        }
+        if (status == SIM_OK) {
+            status = packet_decode_control_command(
+            buffer,
+            (size_t)got,
+            instance_id,
+            &candidate);
+        }
+        if (status != SIM_OK || candidate.seq > current_sensor_seq) {
+            return status == SIM_OK ? SIM_ERR_BAD_PACKET : status;
+        }
+        if (candidate.seq >= latest_command->seq) {
+            *latest_command = candidate;
+            *received_new_command = 1;
+        }
+    }
+    return SIM_OK;
 }
 
 /** @brief 初始化单实例四类传感器及相互独立的确定性随机流。 */
@@ -1672,7 +2602,8 @@ static SimStatus update_truth(
     const ControlCommand *command,
     const EnvScenarioConfig *cfg,
     const EnvironmentForceModel *force_model,
-    const FaultStepEffects *fault_effects)
+    const FaultStepEffects *fault_effects,
+    ActuatorCommandDelayLine actuator_delays[3])
 {
     EnvironmentForceInput force_input;
     EnvironmentForceOutput force_output;
@@ -1685,7 +2616,8 @@ static SimStatus update_truth(
     size_t index;
     SimStatus status = SIM_OK;
 
-    if (state == 0 || command == 0 || cfg == 0 || force_model == 0) {
+    if (state == 0 || command == 0 || cfg == 0 || force_model == 0 ||
+        actuator_delays == 0) {
         return SIM_ERR_INVALID_ARG;
     }
     if (fault_effects != 0) {
@@ -1695,10 +2627,29 @@ static SimStatus update_truth(
             commands);
     }
     for (index = 0u; index < 3u && status == SIM_OK; ++index) {
-        status = actuator_model_step(
-            &state->acceleration_actuators[index],
-            commands[index],
-            cfg->dt);
+        ActuatorState *actuator = &state->acceleration_actuators[index];
+        const double original_rate_limit = actuator->rate_limit;
+        const double original_pos_min = actuator->pos_min;
+        const double original_pos_max = actuator->pos_max;
+
+        if (fault_effects != 0) {
+            status = apply_actuator_command_delay(
+                &actuator_delays[index],
+                fault_effects->actuator_delay_steps[index],
+                &commands[index]);
+            actuator->rate_limit = original_rate_limit *
+                fault_effects->actuator_rate_limit_scale[index];
+            actuator->pos_min = original_pos_min *
+                fault_effects->actuator_position_limit_scale[index];
+            actuator->pos_max = original_pos_max *
+                fault_effects->actuator_position_limit_scale[index];
+        }
+        if (status == SIM_OK) {
+            status = actuator_model_step(actuator, commands[index], cfg->dt);
+        }
+        actuator->rate_limit = original_rate_limit;
+        actuator->pos_min = original_pos_min;
+        actuator->pos_max = original_pos_max;
         actual[index] = state->acceleration_actuators[index].pos;
     }
     if (status != SIM_OK) {
@@ -1713,6 +2664,16 @@ static SimStatus update_truth(
     force_input.yaw_actuator_rad = command->actuator_cmd[1];
     force_input.propellant_mass_kg = state->missile_mass.propellant_mass_kg;
     force_input.dt_s = cfg->dt;
+    status = wind_model_step(
+        &state->wind_model,
+        state->time,
+        state->missile_lla.height_m,
+        cfg->dt,
+        &state->wind_velocity_ecef_mps);
+    if (status != SIM_OK) {
+        return status;
+    }
+    force_input.wind_velocity_ecef_mps = state->wind_velocity_ecef_mps;
     status = environment_force_model_evaluate(
         force_model,
         &force_input,
@@ -1737,7 +2698,17 @@ static SimStatus update_truth(
         return status;
     }
     state->missile_plant.mass = state->missile_mass.mass_kg;
-    if (state->initial_mass_kg > 0.0) {
+    if (state->missile_mass.properties_enabled != 0) {
+        Vec3 center_of_mass_b_m;
+
+        status = mass_model_get_properties(
+            &state->missile_mass,
+            &center_of_mass_b_m,
+            &state->missile_plant.inertia_b);
+        if (status != SIM_OK) {
+            return status;
+        }
+    } else if (state->initial_mass_kg > 0.0) {
         const double inertia_scale =
             state->missile_mass.mass_kg / state->initial_mass_kg;
         size_t row;
@@ -1759,7 +2730,15 @@ static SimStatus update_truth(
     state->missile_pos = state->missile_plant.pos_ecef;
     state->missile_vel = state->missile_plant.vel_ecef;
     state->missile_accel = state->missile_plant.accel_ecef;
-    state->target_pos = vec3_add(state->target_pos, vec3_scale(state->target_vel, cfg->dt));
+    status = target_model_step(
+        &cfg->target_model,
+        state->time,
+        cfg->dt,
+        &state->target_pos,
+        &state->target_vel);
+    if (status != SIM_OK) {
+        return status;
+    }
     state->time = state->missile_plant.time;
     return SIM_OK;
 }
@@ -1841,19 +2820,125 @@ static const char *aero_extrapolation_policy_name(AeroDatabaseExtrapolationPolic
     }
 }
 
+/** @brief 计算原始配置文件字节的 CRC32。 */
+static SimStatus config_file_crc32(const char *path, uint32_t *crc_out)
+{
+    ConfigTree config;
+    SimStatus status;
+
+    if (path == 0 || crc_out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    (void)memset(&config, 0, sizeof(config));
+    status = config_load_file(path, &config);
+    if (status != SIM_OK) {
+        return status;
+    }
+    *crc_out = crc32_compute(config.data, config.size);
+    config_free(&config);
+    return SIM_OK;
+}
+
+/** @brief 将配置原始字节复制到实例证据目录。 */
+static SimStatus copy_file_bytes(const char *source_path, const char *destination_path)
+{
+    FILE *source;
+    FILE *destination;
+    unsigned char buffer[4096];
+    size_t size;
+    SimStatus status = SIM_OK;
+
+    if (source_path == 0 || destination_path == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    source = fopen(source_path, "rb");
+    if (source == 0) {
+        return SIM_ERR_IO;
+    }
+    destination = fopen(destination_path, "wb");
+    if (destination == 0) {
+        (void)fclose(source);
+        return SIM_ERR_IO;
+    }
+    while ((size = fread(buffer, 1u, sizeof(buffer), source)) > 0u) {
+        if (fwrite(buffer, 1u, size, destination) != size) {
+            status = SIM_ERR_IO;
+            break;
+        }
+    }
+    if (ferror(source) != 0) {
+        status = SIM_ERR_IO;
+    }
+    if (fclose(source) != 0) {
+        status = SIM_ERR_IO;
+    }
+    if (fclose(destination) != 0) {
+        status = SIM_ERR_IO;
+    }
+    return status;
+}
+
+/** @brief 保存三份运行配置的逐字节快照。 */
+static SimStatus write_config_snapshots(const char *instance_dir, const EnvContext *ctx)
+{
+    char path[1024];
+    SimStatus status;
+
+    if (instance_dir == 0 || ctx == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/config_snapshot_scenario.json", instance_dir);
+    status = copy_file_bytes(ctx->scenario_path, path);
+    if (status != SIM_OK) {
+        return status;
+    }
+    (void)snprintf(path, sizeof(path), "%s/config_snapshot_runtime.json", instance_dir);
+    status = copy_file_bytes(ctx->runtime_path, path);
+    if (status != SIM_OK) {
+        return status;
+    }
+    (void)snprintf(path, sizeof(path), "%s/config_snapshot_faults.json", instance_dir);
+    return copy_file_bytes(ctx->faults_path, path);
+}
+
+/** @brief 生成 UTC 墙钟启动时间。 */
+static void format_wall_clock_utc(char *out, size_t out_size)
+{
+    const time_t now = time(0);
+    const struct tm *utc = now == (time_t)-1 ? 0 : gmtime(&now);
+
+    if (out == 0 || out_size == 0u) {
+        return;
+    }
+    if (utc == 0 || strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", utc) == 0u) {
+        (void)snprintf(out, out_size, "unknown");
+    }
+}
+
 /** @brief 写出可复现实例所需的软件、配置、端口和时间参数。 */
 static SimStatus write_run_manifest(
     const char *instance_dir,
     const EnvContext *ctx,
     const EnvScenarioConfig *scenario,
     const EnvRuntimeConfig *runtime,
+    const char *start_time_wall_clock,
     uint64_t instance_random_seed,
     unsigned int env_port,
-    unsigned int fc_port)
+    unsigned int fc_port,
+    const ConfigWarningCollector *config_warnings)
 {
     char path[1024];
     FILE *file;
     size_t tile_index;
+    uint32_t scenario_crc;
+    uint32_t runtime_crc;
+    uint32_t faults_crc;
+
+    if (config_file_crc32(ctx->scenario_path, &scenario_crc) != SIM_OK ||
+        config_file_crc32(ctx->runtime_path, &runtime_crc) != SIM_OK ||
+        config_file_crc32(ctx->faults_path, &faults_crc) != SIM_OK) {
+        return SIM_ERR_IO;
+    }
 
     (void)snprintf(path, sizeof(path), "%s/run_manifest.json", instance_dir);
     file = fopen(path, "wb");
@@ -1863,16 +2948,100 @@ static SimStatus write_run_manifest(
     (void)fprintf(file, "{\n");
     (void)fprintf(file, "  \"schema_version\": 1,\n");
     (void)fprintf(file, "  \"instance_id\": %u,\n", ctx->instance_id);
+    (void)fprintf(file, "  \"campaign_id\": \"%s\",\n", runtime->campaign_id);
     (void)fprintf(file, "  \"software_version\": \"%d.%d.%d\",\n",
         MISSILE_SIM_VERSION_MAJOR,
         MISSILE_SIM_VERSION_MINOR,
         MISSILE_SIM_VERSION_PATCH);
+    (void)fprintf(
+        file,
+        "  \"program_version\": \"environment_sim %d.%d.%d\",\n",
+        MISSILE_SIM_VERSION_MAJOR,
+        MISSILE_SIM_VERSION_MINOR,
+        MISSILE_SIM_VERSION_PATCH);
+    (void)fprintf(file, "  \"git_commit\": \"%s\",\n", MISSILE_SIM_GIT_COMMIT);
+    (void)fprintf(
+        file,
+        "  \"git_worktree_dirty\": %s,\n",
+        MISSILE_SIM_GIT_DIRTY != 0 ? "true" : "false");
+    (void)fprintf(file, "  \"build_time\": \"%s\",\n", MISSILE_SIM_BUILD_TIME);
+    (void)fprintf(file, "  \"compiler\": \"%s\",\n", MISSILE_SIM_COMPILER);
+    (void)fprintf(file, "  \"start_time_wall_clock\": \"%s\",\n", start_time_wall_clock);
     (void)fprintf(file, "  \"protocol_version\": \"%d.%d\",\n",
         MISSILE_SIM_PROTOCOL_VERSION_MAJOR,
         MISSILE_SIM_PROTOCOL_VERSION_MINOR);
     (void)fprintf(file, "  \"scenario_path\": \"%s\",\n", ctx->scenario_path);
     (void)fprintf(file, "  \"runtime_path\": \"%s\",\n", ctx->runtime_path);
     (void)fprintf(file, "  \"faults_path\": \"%s\",\n", ctx->faults_path);
+    (void)fprintf(
+        file,
+        "  \"config_file_list\": [\"%s\", \"%s\", \"%s\"],\n",
+        ctx->scenario_path,
+        ctx->runtime_path,
+        ctx->faults_path);
+    (void)fprintf(file, "  \"config_crc32\": {\n");
+    (void)fprintf(file, "    \"scenario\": \"0x%08x\",\n", scenario_crc);
+    (void)fprintf(file, "    \"runtime\": \"0x%08x\",\n", runtime_crc);
+    (void)fprintf(file, "    \"faults\": \"0x%08x\"\n", faults_crc);
+    (void)fprintf(file, "  },\n");
+    (void)fprintf(file, "  \"config_snapshots\": {\n");
+    (void)fprintf(file, "    \"scenario\": \"%s/config_snapshot_scenario.json\",\n", instance_dir);
+    (void)fprintf(file, "    \"runtime\": \"%s/config_snapshot_runtime.json\",\n", instance_dir);
+    (void)fprintf(file, "    \"faults\": \"%s/config_snapshot_faults.json\"\n", instance_dir);
+    (void)fprintf(file, "  },\n");
+    (void)fprintf(
+        file,
+        "  \"unrecognized_config_field_count\": %lu,\n",
+        config_warnings != 0 ? (unsigned long)config_warnings->total_count : 0ul);
+    (void)fprintf(file, "  \"unrecognized_config_fields\": [");
+    if (config_warnings != 0) {
+        size_t warning_index;
+
+        for (warning_index = 0u;
+             warning_index < config_warnings->stored_count;
+             ++warning_index) {
+            (void)fprintf(
+                file,
+                "%s\"%s\"",
+                warning_index == 0u ? "" : ", ",
+                config_warnings->paths[warning_index]);
+        }
+    }
+    (void)fprintf(file, "],\n");
+    (void)fprintf(
+        file,
+        "  \"run_mode\": \"%s\",\n",
+        env_run_mode_to_string(runtime->run_mode));
+    (void)fprintf(
+        file,
+        "  \"synchronization_mode\": \"%s\",\n",
+        env_synchronization_mode_to_string(runtime->synchronization_mode));
+    (void)fprintf(file, "  \"output_dir\": \"%s\",\n", runtime->output_dir);
+    (void)fprintf(file, "  \"instance_dir\": \"%s\",\n", instance_dir);
+    (void)fprintf(
+        file,
+        "  \"integrator_type\": \"%s\",\n",
+        integrator_type_to_string(scenario->integrator));
+    (void)fprintf(
+        file,
+        "  \"target_model\": \"%s\",\n",
+        target_model_type_to_string(scenario->target_model.type));
+    (void)fprintf(
+        file,
+        "  \"target_maneuver_count\": %zu,\n",
+        scenario->target_model.maneuver_count);
+    (void)fprintf(file, "  \"log_files\": {\n");
+    (void)fprintf(file, "    \"sensor\": \"%s/sensor_log.bin\",\n", instance_dir);
+    (void)fprintf(file, "    \"command\": \"%s/command_log.bin\",\n", instance_dir);
+    (void)fprintf(file, "    \"flight_control_internal\": \"%s/fc_internal_log.bin\",\n", instance_dir);
+    (void)fprintf(file, "    \"flight_control_manifest\": \"%s/fc_run_manifest.json\",\n", instance_dir);
+    (void)fprintf(file, "    \"truth_trajectory\": \"%s/trajectory.csv\",\n", instance_dir);
+    (void)fprintf(file, "    \"diagnostics\": \"%s/trajectory_diagnostics.csv\",\n", instance_dir);
+    (void)fprintf(file, "    \"events\": \"%s/event_log.txt\",\n", instance_dir);
+    (void)fprintf(file, "    \"summary\": \"%s/summary.json\",\n", instance_dir);
+    (void)fprintf(file, "    \"environment_performance\": \"%s/performance.json\",\n", instance_dir);
+    (void)fprintf(file, "    \"flight_control_performance\": \"%s/fc_performance.json\"\n", instance_dir);
+    (void)fprintf(file, "  },\n");
     (void)fprintf(file, "  \"dt_s\": %.17g,\n", scenario->dt);
     (void)fprintf(file, "  \"max_time_s\": %.17g,\n", scenario->max_time);
     (void)fprintf(file, "  \"environment_port\": %u,\n", env_port);
@@ -1888,12 +3057,58 @@ static SimStatus write_run_manifest(
         scenario->propellant_mass_kg);
     (void)fprintf(
         file,
+        "  \"mass_properties_enabled\": %s,\n",
+        scenario->mass_properties_enabled != 0 ? "true" : "false");
+    if (scenario->mass_properties_enabled != 0) {
+        (void)fprintf(
+            file,
+            "  \"dry_center_of_mass_b_m\": [%.17g, %.17g, %.17g],\n",
+            scenario->dry_center_of_mass_b_m.x,
+            scenario->dry_center_of_mass_b_m.y,
+            scenario->dry_center_of_mass_b_m.z);
+        (void)fprintf(
+            file,
+            "  \"propellant_center_of_mass_full_b_m\": [%.17g, %.17g, %.17g],\n",
+            scenario->propellant_center_of_mass_full_b_m.x,
+            scenario->propellant_center_of_mass_full_b_m.y,
+            scenario->propellant_center_of_mass_full_b_m.z);
+        (void)fprintf(
+            file,
+            "  \"propellant_center_of_mass_empty_b_m\": [%.17g, %.17g, %.17g],\n",
+            scenario->propellant_center_of_mass_empty_b_m.x,
+            scenario->propellant_center_of_mass_empty_b_m.y,
+            scenario->propellant_center_of_mass_empty_b_m.z);
+    }
+    (void)fprintf(
+        file,
         "  \"gravity_enabled\": %s,\n",
         scenario->force_model.gravity.enabled != 0 ? "true" : "false");
     (void)fprintf(
         file,
         "  \"atmosphere_enabled\": %s,\n",
         scenario->force_model.atmosphere.enabled != 0 ? "true" : "false");
+    (void)fprintf(
+        file,
+        "  \"wind_model_enabled\": %s,\n",
+        scenario->wind_model.enabled != 0 ? "true" : "false");
+    (void)fprintf(
+        file,
+        "  \"wind_turbulence_sigma_ecef_mps\": [%.17g, %.17g, %.17g],\n",
+        scenario->wind_model.turbulence_sigma_ecef_mps.x,
+        scenario->wind_model.turbulence_sigma_ecef_mps.y,
+        scenario->wind_model.turbulence_sigma_ecef_mps.z);
+    (void)fprintf(
+        file,
+        "  \"wind_shear_ecef_per_m\": [%.17g, %.17g, %.17g],\n",
+        scenario->wind_model.shear_ecef_per_m.x,
+        scenario->wind_model.shear_ecef_per_m.y,
+        scenario->wind_model.shear_ecef_per_m.z);
+    (void)fprintf(
+        file,
+        "  \"wind_gust_amplitude_ecef_mps\": [%.17g, %.17g, %.17g],\n",
+        scenario->wind_model.gust_amplitude_ecef_mps.x,
+        scenario->wind_model.gust_amplitude_ecef_mps.y,
+        scenario->wind_model.gust_amplitude_ecef_mps.z);
     (void)fprintf(
         file,
         "  \"aerodynamics_enabled\": %s,\n",
@@ -1946,9 +3161,46 @@ static SimStatus write_run_manifest(
     }
     (void)fprintf(
         file,
+        "  \"aero_table_v2_enabled\": %s,\n",
+        scenario->aero_table_v2_path_enabled != 0 ? "true" : "false");
+    if (scenario->aero_table_v2_path_enabled != 0) {
+        (void)fprintf(
+            file,
+            "  \"aero_table_v2_path\": \"%s\",\n",
+            scenario->aero_table_v2_path);
+        (void)fprintf(
+            file,
+            "  \"aero_table_v2_file_version\": %u,\n",
+            AERO_DATABASE_V2_VERSION);
+        (void)fprintf(
+            file,
+            "  \"aero_table_v2_dimensions\": [%zu, %zu, %zu, %zu, %zu, %zu],\n",
+            scenario->aero_table_v2_dimensions[0],
+            scenario->aero_table_v2_dimensions[1],
+            scenario->aero_table_v2_dimensions[2],
+            scenario->aero_table_v2_dimensions[3],
+            scenario->aero_table_v2_dimensions[4],
+            scenario->aero_table_v2_dimensions[5]);
+        (void)fprintf(
+            file,
+            "  \"aero_table_v2_extrapolation_policy_source\": \"%s\",\n",
+            scenario->aero_table_policy_override_enabled != 0 ?
+                "CONFIG_OVERRIDE" : "FILE_HEADER");
+        if (scenario->aero_table_policy_override_enabled != 0) {
+            (void)fprintf(
+                file,
+                "  \"aero_table_v2_extrapolation_policy\": \"%s\",\n",
+                aero_extrapolation_policy_name(scenario->aero_table_policy_override));
+        }
+    }
+    (void)fprintf(
+        file,
         "  \"aero_surrogate_enabled\": %s,\n",
         scenario->aero_surrogate_model_path_enabled != 0 ? "true" : "false");
     if (scenario->aero_surrogate_model_path_enabled != 0) {
+        const AeroSurrogateModel *surrogate =
+            scenario->force_model.aerodynamics.surrogate;
+
         (void)fprintf(file, "  \"aero_surrogate_model_path\": \"%s\",\n", scenario->aero_surrogate_model_path);
         (void)fprintf(
             file,
@@ -1958,6 +3210,22 @@ static SimStatus write_run_manifest(
             file,
             "  \"aero_surrogate_training_data_version\": \"%s\",\n",
             scenario->aero_surrogate_training_data_version);
+        (void)fprintf(
+            file,
+            "  \"aero_surrogate_envelope_available\": %s,\n",
+            surrogate != 0 ? "true" : "false");
+        if (surrogate != 0) {
+            (void)fprintf(
+                file,
+                "  \"aero_surrogate_envelope\": { \"mach\": [%.17g, %.17g], "
+                "\"alpha_rad\": [%.17g, %.17g], \"beta_rad\": [%.17g, %.17g] },\n",
+                surrogate->mach_min,
+                surrogate->mach_max,
+                surrogate->alpha_min_rad,
+                surrogate->alpha_max_rad,
+                surrogate->beta_min_rad,
+                surrogate->beta_max_rad);
+        }
     }
     (void)fprintf(
         file,
@@ -1981,6 +3249,16 @@ static SimStatus write_run_manifest(
         terrain_missing_policy_name(scenario->terrain_missing_policy));
     (void)fprintf(file, "  \"terrain_flat_fill_height_m\": %.17g,\n", scenario->terrain_flat_fill_height_m);
     (void)fprintf(file, "  \"terrain_cache_tile_count\": %zu,\n", scenario->terrain_cache_tile_count);
+    (void)fprintf(
+        file,
+        "  \"terrain_resource_manifest_path_enabled\": %s,\n",
+        scenario->terrain_resource_manifest_path_enabled != 0 ? "true" : "false");
+    if (scenario->terrain_resource_manifest_path_enabled != 0) {
+        (void)fprintf(
+            file,
+            "  \"terrain_resource_manifest_path\": \"%s\",\n",
+            scenario->terrain_resource_manifest_path);
+    }
     (void)fprintf(
         file,
         "  \"terrain_tile_index_path_enabled\": %s,\n",
@@ -2080,7 +3358,10 @@ static int fault_effects_affect_sensor(const FaultStepEffects *effects)
         vec3_norm(effects->accel_bias_ecef_mps2) > 0.0 ||
         vec3_norm(effects->speed_bias_ecef_mps) > 0.0 ||
         effects->communication_delay_enabled != 0 ||
-        effects->communication_reorder_enabled != 0;
+        effects->communication_reorder_enabled != 0 ||
+        effects->communication_drop_enabled != 0 ||
+        effects->communication_duplicate_enabled != 0 ||
+        effects->communication_corrupt_enabled != 0;
 }
 
 /** @brief 判断当前步故障效果是否改变了虚拟执行机构命令或状态。 */
@@ -2093,7 +3374,12 @@ static int fault_effects_affect_actuator(const FaultStepEffects *effects)
     }
     for (index = 0u; index < 3u; ++index) {
         if (effects->actuator_stuck[index] != 0 ||
-            effects->actuator_command_scale[index] != 1.0) {
+            effects->actuator_command_scale[index] != 1.0 ||
+            effects->actuator_command_bias[index] != 0.0 ||
+            effects->actuator_rate_limit_scale[index] != 1.0 ||
+            effects->actuator_position_limit_scale[index] != 1.0 ||
+            effects->actuator_delay_steps[index] != 0u ||
+            effects->actuator_disabled[index] != 0) {
             return 1;
         }
     }
@@ -2107,6 +3393,7 @@ static void write_summary(
     const EnvTruthState *state,
     uint32_t steps,
     const char *exit_reason,
+    const OperationalRunStats *operational_stats,
     const FaultRunStats *fault_stats,
     const TerrainTileCache *terrain_cache,
     const DiagnosticRunStats *diagnostic_stats)
@@ -2125,6 +3412,35 @@ static void write_summary(
     (void)fprintf(file, "  \"time_of_closest_approach\": %.6f,\n", state->time_of_closest);
     (void)fprintf(file, "  \"simulation_steps\": %u,\n", steps);
     (void)fprintf(file, "  \"exit_reason\": \"%s\",\n", exit_reason);
+    (void)fprintf(
+        file,
+        "  \"max_command_norm\": %.9f,\n",
+        operational_stats != 0 ? operational_stats->max_command_norm : 0.0);
+    (void)fprintf(
+        file,
+        "  \"max_actual_accel\": %.9f,\n",
+        operational_stats != 0 ? operational_stats->max_actual_accel : 0.0);
+    (void)fprintf(
+        file,
+        "  \"sensor_dropout_count\": %lu,\n",
+        operational_stats != 0 ? (unsigned long)operational_stats->sensor_dropout_count : 0ul);
+    (void)fprintf(
+        file,
+        "  \"command_timeout_count\": %lu,\n",
+        operational_stats != 0 ? (unsigned long)operational_stats->command_timeout_count : 0ul);
+    (void)fprintf(
+        file,
+        "  \"command_hold_count\": %lu,\n",
+        operational_stats != 0 ? (unsigned long)operational_stats->command_hold_count : 0ul);
+    (void)fprintf(
+        file,
+        "  \"protocol_minor_mismatch_count\": %lu,\n",
+        operational_stats != 0 ?
+            (unsigned long)operational_stats->protocol_minor_mismatch_count : 0ul);
+    (void)fprintf(
+        file,
+        "  \"fault_count\": %lu,\n",
+        fault_stats != 0 ? (unsigned long)fault_stats->fault_start_count : 0ul);
     if (fault_stats != 0) {
         (void)fprintf(
             file,
@@ -2238,6 +3554,91 @@ static void write_summary(
     (void)fclose(file);
 }
 
+/** @brief 写出不参与确定性物理回归的环境墙钟性能指标。 */
+static void write_performance_report(
+    const char *instance_dir,
+    const EnvRuntimeConfig *runtime,
+    double dt_s,
+    const OperationalRunStats *stats)
+{
+    char path[1024];
+    FILE *file;
+
+    if (instance_dir == 0 || runtime == 0 || stats == 0) {
+        return;
+    }
+    (void)snprintf(path, sizeof(path), "%s/performance.json", instance_dir);
+    file = fopen(path, "wb");
+    if (file == 0) {
+        return;
+    }
+    (void)fprintf(file, "{\n");
+    (void)fprintf(file, "  \"schema_version\": 1,\n");
+    (void)fprintf(file, "  \"scope\": \"wall_clock_diagnostics_not_physics_input\",\n");
+    (void)fprintf(file, "  \"run_mode\": \"%s\",\n", env_run_mode_to_string(runtime->run_mode));
+    (void)fprintf(
+        file,
+        "  \"synchronization_mode\": \"%s\",\n",
+        env_synchronization_mode_to_string(runtime->synchronization_mode));
+    (void)fprintf(file, "  \"target_step_period_s\": %.9f,\n", dt_s);
+    (void)fprintf(file, "  \"run_wall_time_s\": %.9f,\n", stats->run_wall_time_s);
+    (void)fprintf(file, "  \"step_sample_count\": %lu,\n", (unsigned long)stats->step_compute.count);
+    (void)fprintf(
+        file,
+        "  \"mean_step_compute_time_s\": %.12f,\n",
+        stats->step_compute.count > 0u ?
+            stats->step_compute.total_s / (double)stats->step_compute.count : 0.0);
+    (void)fprintf(file, "  \"max_step_compute_time_s\": %.12f,\n", stats->step_compute.max_s);
+    (void)fprintf(
+        file,
+        "  \"mean_sensor_send_time_s\": %.12f,\n",
+        stats->sensor_send.count > 0u ?
+            stats->sensor_send.total_s / (double)stats->sensor_send.count : 0.0);
+    (void)fprintf(file, "  \"max_sensor_send_time_s\": %.12f,\n", stats->sensor_send.max_s);
+    (void)fprintf(
+        file,
+        "  \"mean_command_receive_time_s\": %.12f,\n",
+        stats->command_receive.count > 0u ?
+            stats->command_receive.total_s / (double)stats->command_receive.count : 0.0);
+    (void)fprintf(file, "  \"max_command_receive_time_s\": %.12f,\n", stats->command_receive.max_s);
+    (void)fprintf(
+        file,
+        "  \"mean_control_roundtrip_time_s\": %.12f,\n",
+        stats->control_roundtrip.count > 0u ?
+            stats->control_roundtrip.total_s / (double)stats->control_roundtrip.count : 0.0);
+    (void)fprintf(file, "  \"max_control_roundtrip_time_s\": %.12f,\n", stats->control_roundtrip.max_s);
+    (void)fprintf(
+        file,
+        "  \"mean_log_write_time_s\": %.12f,\n",
+        stats->log_write.count > 0u ?
+            stats->log_write.total_s / (double)stats->log_write.count : 0.0);
+    (void)fprintf(file, "  \"max_log_write_time_s\": %.12f,\n", stats->log_write.max_s);
+    (void)fprintf(file, "  \"realtime_sleep_time_s\": %.9f,\n", stats->realtime_sleep_time_s);
+    (void)fprintf(
+        file,
+        "  \"realtime_overrun_count\": %lu,\n",
+        (unsigned long)stats->realtime_overrun_count);
+    (void)fprintf(file, "  \"max_realtime_overrun_s\": %.12f,\n", stats->max_realtime_overrun_s);
+    (void)fprintf(
+        file,
+        "  \"realtime_margin_s\": %.12f,\n",
+        dt_s - stats->step_compute.max_s);
+    (void)fprintf(
+        file,
+        "  \"command_timeout_count\": %lu,\n",
+        (unsigned long)stats->command_timeout_count);
+    (void)fprintf(
+        file,
+        "  \"command_hold_count\": %lu,\n",
+        (unsigned long)stats->command_hold_count);
+    (void)fprintf(
+        file,
+        "  \"protocol_minor_mismatch_count\": %lu\n",
+        (unsigned long)stats->protocol_minor_mismatch_count);
+    (void)fprintf(file, "}\n");
+    (void)fclose(file);
+}
+
 /** @brief 写入轨迹 CSV 的字段名称和单位。 */
 static void write_trajectory_header(FILE *file)
 {
@@ -2312,7 +3713,11 @@ static void write_diagnostics_header(FILE *file)
     (void)fprintf(
         file,
         "time_s,quat_norm_error,dcm_orthogonality_error,mass_kg,"
-        "propellant_mass_kg,inertia_min_diag_kgm2,aero_model_flags,"
+        "propellant_mass_kg,center_of_mass_b_x_m,center_of_mass_b_y_m,center_of_mass_b_z_m,"
+        "inertia_xx_kgm2,inertia_xy_kgm2,inertia_xz_kgm2,"
+        "inertia_yy_kgm2,inertia_yz_kgm2,inertia_zz_kgm2,"
+        "wind_x_ecef_mps,wind_y_ecef_mps,wind_z_ecef_mps,"
+        "inertia_min_diag_kgm2,aero_model_flags,"
         "model_degradation_flags,aero_uncertainty_scale,integrator_type,dt_s,"
         "force_norm_n,moment_norm_nm\n");
 }
@@ -2466,12 +3871,26 @@ static void write_diagnostics_row(
         inertia_min);
     (void)fprintf(
         file,
-        "%.6f,%.12e,%.12e,%.9f,%.9f,%.9f,%u,%u,%.9f,%d,%.9f,%.9f,%.9f\n",
+        "%.6f,%.12e,%.12e,%.9f,%.9f,"
+        "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,"
+        "%.9f,%u,%u,%.9f,%d,%.9f,%.9f,%.9f\n",
         state->time,
         quat_error,
         dcm_error,
         state->missile_mass.mass_kg,
         state->missile_mass.propellant_mass_kg,
+        state->missile_mass.center_of_mass_b_m.x,
+        state->missile_mass.center_of_mass_b_m.y,
+        state->missile_mass.center_of_mass_b_m.z,
+        state->missile_plant.inertia_b.m[0][0],
+        state->missile_plant.inertia_b.m[0][1],
+        state->missile_plant.inertia_b.m[0][2],
+        state->missile_plant.inertia_b.m[1][1],
+        state->missile_plant.inertia_b.m[1][2],
+        state->missile_plant.inertia_b.m[2][2],
+        state->wind_velocity_ecef_mps.x,
+        state->wind_velocity_ecef_mps.y,
+        state->wind_velocity_ecef_mps.z,
         inertia_min,
         state->aero_model_flags,
         degradation_flags,
@@ -2516,16 +3935,24 @@ SimStatus env_app_run(const EnvContext *ctx)
     FaultInjection faults;
     CommunicationDelayLine communication_delay;
     CommunicationReorderState communication_reorder;
+    ActuatorCommandDelayLine actuator_command_delays[3];
+    SensorFaultDelayLine sensor_fault_delay_lines[ENV_SENSOR_FAULT_CHANNEL_COUNT];
+    SensorFaultStuckState sensor_fault_stuck_states[ENV_SENSOR_FAULT_CHANNEL_COUNT];
     FaultRunStats fault_stats;
+    OperationalRunStats operational_stats;
     DiagnosticRunStats diagnostic_stats;
+    RealtimePacer realtime_pacer;
+    ConfigWarningCollector config_warnings;
     EarthModel earth;
     TerrainModel terrain;
     TerrainTile terrain_tiles[ENV_MAX_TERRAIN_TILES];
     TerrainTileCache terrain_cache;
     size_t terrain_tile_count = 0u;
     AeroDatabase aero_database;
+    AeroDatabaseV2 aero_database_v2;
     AeroSurrogateModel aero_surrogate;
     int aero_database_loaded = 0;
+    int aero_database_v2_loaded = 0;
     Logger logger;
     SimStatus status;
     int sock = -1;
@@ -2534,6 +3961,7 @@ SimStatus env_app_run(const EnvContext *ctx)
     struct sockaddr_in fc_addr;
     char instance_dir[512];
     char path[1024];
+    char start_time_wall_clock[32];
     FILE *sensor_log = 0;
     FILE *command_log = 0;
     FILE *trajectory_log = 0;
@@ -2541,8 +3969,14 @@ SimStatus env_app_run(const EnvContext *ctx)
     FILE *event_log = 0;
     uint32_t seq = 0u;
     int hit = 0;
-    const char *exit_reason = "timeout";
+    const char *exit_reason = "max_time_reached";
     uint64_t instance_random_seed;
+    double run_wall_start_s = 0.0;
+    int realtime_overrun_event_written = 0;
+    ControlCommand held_command;
+    int has_held_command = 0;
+    int initial_command_hold_event_written = 0;
+    int protocol_minor_warning_written = 0;
 
     if (ctx == 0 || ctx->scenario_path == 0 ||
         ctx->runtime_path == 0 || ctx->faults_path == 0) {
@@ -2552,13 +3986,24 @@ SimStatus env_app_run(const EnvContext *ctx)
     memset(&scenario_tree, 0, sizeof(scenario_tree));
     memset(&runtime_tree, 0, sizeof(runtime_tree));
     memset(&fault_stats, 0, sizeof(fault_stats));
+    memset(&operational_stats, 0, sizeof(operational_stats));
     memset(&diagnostic_stats, 0, sizeof(diagnostic_stats));
+    memset(&realtime_pacer, 0, sizeof(realtime_pacer));
+    memset(&config_warnings, 0, sizeof(config_warnings));
+    memset(&held_command, 0, sizeof(held_command));
     memset(terrain_tiles, 0, sizeof(terrain_tiles));
     memset(&terrain_cache, 0, sizeof(terrain_cache));
     memset(&aero_database, 0, sizeof(aero_database));
+    memset(&aero_database_v2, 0, sizeof(aero_database_v2));
     memset(&aero_surrogate, 0, sizeof(aero_surrogate));
+    format_wall_clock_utc(start_time_wall_clock, sizeof(start_time_wall_clock));
     communication_delay_reset(&communication_delay);
     communication_reorder_reset(&communication_reorder);
+    actuator_command_delay_reset(&actuator_command_delays[0]);
+    actuator_command_delay_reset(&actuator_command_delays[1]);
+    actuator_command_delay_reset(&actuator_command_delays[2]);
+    (void)memset(sensor_fault_delay_lines, 0, sizeof(sensor_fault_delay_lines));
+    (void)memset(sensor_fault_stuck_states, 0, sizeof(sensor_fault_stuck_states));
     status = logger_open_stdout(&logger);
     if (status != SIM_OK) {
         return status;
@@ -2669,6 +4114,21 @@ SimStatus env_app_run(const EnvContext *ctx)
             config_free(&runtime_tree);
             return status;
         }
+        status = audit_environment_config_fields(
+            &scenario_tree,
+            &runtime_tree,
+            &faults_tree,
+            &config_warnings);
+        if (status != SIM_OK) {
+            (void)fprintf(
+                stderr,
+                "environment_sim: config field audit failed: %s\n",
+                sim_status_to_string(status));
+            config_free(&faults_tree);
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            return status;
+        }
         status = fault_injection_load_config(&faults_tree, &faults);
         config_free(&faults_tree);
         if (status != SIM_OK) {
@@ -2683,6 +4143,9 @@ SimStatus env_app_run(const EnvContext *ctx)
     instance_random_seed = ctx->has_random_seed_override != 0 ?
         ctx->random_seed_override :
         runtime.base_random_seed + ctx->instance_id;
+    fault_injection_set_seed(
+        &faults,
+        instance_random_seed ^ UINT64_C(0x4641554C54));
     status = init_sensor_state(
         &sensors,
         &scenario,
@@ -2724,14 +4187,23 @@ SimStatus env_app_run(const EnvContext *ctx)
         config_free(&runtime_tree);
         return status;
     }
+    status = write_config_snapshots(instance_dir, ctx);
+    if (status != SIM_OK) {
+        (void)close(sock);
+        config_free(&scenario_tree);
+        config_free(&runtime_tree);
+        return status;
+    }
     status = write_run_manifest(
         instance_dir,
         ctx,
         &scenario,
         &runtime,
+        start_time_wall_clock,
         instance_random_seed,
         env_port,
-        fc_port);
+        fc_port,
+        &config_warnings);
     if (status != SIM_OK) {
         (void)close(sock);
         config_free(&scenario_tree);
@@ -2770,6 +4242,19 @@ SimStatus env_app_run(const EnvContext *ctx)
             config_free(&scenario_tree);
             config_free(&runtime_tree);
             return SIM_ERR_IO;
+        }
+        {
+            size_t warning_index;
+
+            for (warning_index = 0u;
+                 warning_index < config_warnings.stored_count;
+                 ++warning_index) {
+                write_event(
+                    event_log,
+                    0.0,
+                    "CONFIG_UNKNOWN_FIELD_WARNING",
+                    config_warnings.paths[warning_index]);
+            }
         }
     }
     (void)snprintf(path, sizeof(path), "%s/trajectory.csv", instance_dir);
@@ -2859,6 +4344,27 @@ SimStatus env_app_run(const EnvContext *ctx)
     state.missile_plant.pos_ecef = state.missile_pos;
     state.missile_plant.vel_ecef = state.missile_vel;
     state.missile_plant.q_bi = quat_identity();
+    status = wind_model_init(
+        &state.wind_model,
+        &scenario.wind_model,
+        instance_random_seed ^ UINT64_C(0x57494E44));
+    if (status != SIM_OK) {
+        (void)fclose(trajectory_log);
+        if (sensor_log != 0) {
+            (void)fclose(sensor_log);
+        }
+        if (command_log != 0) {
+            (void)fclose(command_log);
+        }
+        if (event_log != 0) {
+            (void)fclose(event_log);
+        }
+        (void)close(sock);
+        config_free(&scenario_tree);
+        config_free(&runtime_tree);
+        unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+        return status;
+    }
     status = mass_model_init(
         &state.missile_mass,
         scenario.mass_kg - scenario.propellant_mass_kg,
@@ -2886,6 +4392,40 @@ SimStatus env_app_run(const EnvContext *ctx)
     state.missile_plant.inertia_b.m[0][0] = scenario.inertia_diag[0];
     state.missile_plant.inertia_b.m[1][1] = scenario.inertia_diag[1];
     state.missile_plant.inertia_b.m[2][2] = scenario.inertia_diag[2];
+    if (scenario.mass_properties_enabled != 0) {
+        Vec3 center_of_mass_b_m;
+
+        status = mass_model_configure_properties(
+            &state.missile_mass,
+            scenario.dry_center_of_mass_b_m,
+            scenario.propellant_center_of_mass_full_b_m,
+            scenario.propellant_center_of_mass_empty_b_m,
+            scenario.dry_inertia_centroid_b_kgm2,
+            scenario.propellant_inertia_full_centroid_b_kgm2);
+        if (status == SIM_OK) {
+            status = mass_model_get_properties(
+                &state.missile_mass,
+                &center_of_mass_b_m,
+                &state.missile_plant.inertia_b);
+        }
+        if (status != SIM_OK) {
+            (void)fclose(trajectory_log);
+            if (sensor_log != 0) {
+                (void)fclose(sensor_log);
+            }
+            if (command_log != 0) {
+                (void)fclose(command_log);
+            }
+            if (event_log != 0) {
+                (void)fclose(event_log);
+            }
+            (void)close(sock);
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+            return status;
+        }
+    }
     state.initial_inertia_b = state.missile_plant.inertia_b;
     {
         size_t index;
@@ -2923,8 +4463,12 @@ SimStatus env_app_run(const EnvContext *ctx)
         scenario.force_model.aerodynamics.database = &aero_database;
         aero_database_loaded = 1;
     }
-    if (scenario.aero_surrogate_model_path_enabled != 0) {
-        status = aero_surrogate_load_file(scenario.aero_surrogate_model_path, &aero_surrogate);
+    if (scenario.aero_table_v2_path_enabled != 0) {
+        size_t axis;
+
+        status = aero_database_v2_load_file(
+            scenario.aero_table_v2_path,
+            &aero_database_v2);
         if (status != SIM_OK) {
             (void)fclose(trajectory_log);
             if (sensor_log != 0) {
@@ -2945,7 +4489,74 @@ SimStatus env_app_run(const EnvContext *ctx)
             config_free(&runtime_tree);
             return status;
         }
+        if (scenario.aero_table_policy_override_enabled != 0) {
+            aero_database_v2.extrapolation_policy = scenario.aero_table_policy_override;
+        }
+        for (axis = 0u; axis < AERO_DATABASE_V2_AXIS_COUNT; ++axis) {
+            scenario.aero_table_v2_dimensions[axis] = aero_database_v2.dimensions[axis];
+        }
+        scenario.force_model.aerodynamics.database_v2 = &aero_database_v2;
+        aero_database_v2_loaded = 1;
+    }
+    if (scenario.aero_surrogate_model_path_enabled != 0) {
+        status = aero_surrogate_load_file(scenario.aero_surrogate_model_path, &aero_surrogate);
+        if (status != SIM_OK) {
+            (void)fclose(trajectory_log);
+            if (sensor_log != 0) {
+                (void)fclose(sensor_log);
+            }
+            if (command_log != 0) {
+                (void)fclose(command_log);
+            }
+            if (event_log != 0) {
+                (void)fclose(event_log);
+            }
+            if (aero_database_loaded != 0) {
+                aero_database_unload(&aero_database);
+            }
+            if (aero_database_v2_loaded != 0) {
+                aero_database_v2_unload(&aero_database_v2);
+            }
+            unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+            (void)close(sock);
+            config_free(&scenario_tree);
+            config_free(&runtime_tree);
+            return status;
+        }
         scenario.force_model.aerodynamics.surrogate = &aero_surrogate;
+    }
+    status = write_run_manifest(
+        instance_dir,
+        ctx,
+        &scenario,
+        &runtime,
+        start_time_wall_clock,
+        instance_random_seed,
+        env_port,
+        fc_port,
+        &config_warnings);
+    if (status != SIM_OK) {
+        if (aero_database_loaded != 0) {
+            aero_database_unload(&aero_database);
+        }
+        if (aero_database_v2_loaded != 0) {
+            aero_database_v2_unload(&aero_database_v2);
+        }
+        unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
+        (void)fclose(trajectory_log);
+        if (sensor_log != 0) {
+            (void)fclose(sensor_log);
+        }
+        if (command_log != 0) {
+            (void)fclose(command_log);
+        }
+        if (event_log != 0) {
+            (void)fclose(event_log);
+        }
+        (void)close(sock);
+        config_free(&scenario_tree);
+        config_free(&runtime_tree);
+        return status;
     }
     status = update_geodetic_state(&state, &earth, &terrain);
     if (status != SIM_OK) {
@@ -2970,6 +4581,9 @@ SimStatus env_app_run(const EnvContext *ctx)
             if (aero_database_loaded != 0) {
                 aero_database_unload(&aero_database);
             }
+            if (aero_database_v2_loaded != 0) {
+                aero_database_v2_unload(&aero_database_v2);
+            }
             unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
             (void)close(sock);
             config_free(&scenario_tree);
@@ -2983,8 +4597,23 @@ SimStatus env_app_run(const EnvContext *ctx)
         write_diagnostics_row(diagnostics_log, &state, &scenario, &terrain);
     }
 
+    status = realtime_pacer_init(
+        &realtime_pacer,
+        scenario.dt,
+        runtime.run_mode == ENV_RUN_MODE_SIL_REALTIME);
+    if (status == SIM_OK) {
+        status = monotonic_time_now(&run_wall_start_s);
+    }
+    if (status != SIM_OK) {
+        exit_reason = "wall_clock_initialization_failed";
+        write_event(event_log, state.time, "REALTIME_ERROR", sim_status_to_string(status));
+    }
     (void)logger_info(&logger, "environment_sim UDP loop started");
-    write_event(event_log, state.time, "SIMULATION_START", "lockstep");
+    write_event(
+        event_log,
+        state.time,
+        "SIMULATION_START",
+        env_run_mode_to_string(runtime.run_mode));
     (void)printf("instance_id=%u env_port=%u fc_port=%u\n", ctx->instance_id, env_port, fc_port);
 
     while (status == SIM_OK && state.time <= scenario.max_time) {
@@ -2994,7 +4623,16 @@ SimStatus env_app_run(const EnvContext *ctx)
         FaultTransition fault_transitions[ENV_MAX_FAULT_TRANSITIONS];
         size_t fault_transition_count = 0u;
         double range = vec3_norm(vec3_sub(state.target_pos, state.missile_pos));
+        double step_start_s = 0.0;
+        double control_roundtrip_start_s = 0.0;
         int surface_collision = 0;
+
+        status = monotonic_time_now(&step_start_s);
+        if (status != SIM_OK) {
+            exit_reason = "wall_clock_read_failed";
+            write_event(event_log, state.time, "REALTIME_ERROR", sim_status_to_string(status));
+            break;
+        }
 
         status = terrain_is_surface_collision(&terrain, &state.missile_lla, &surface_collision);
         if (status != SIM_OK) {
@@ -3103,6 +4741,21 @@ SimStatus env_app_run(const EnvContext *ctx)
             }
         }
         fault_injection_apply_sensor(&fault_effects, &sensor);
+        status = apply_sensor_fault_stuck(
+            sensor_fault_stuck_states,
+            &fault_effects,
+            &sensor);
+        if (status == SIM_OK) {
+            status = apply_sensor_fault_delay(
+                sensor_fault_delay_lines,
+                &fault_effects,
+                &sensor);
+        }
+        if (status != SIM_OK) {
+            exit_reason = "sensor_fault_state_failed";
+            write_event(event_log, state.time, "FAULT_ERROR", sim_status_to_string(status));
+            break;
+        }
         status = apply_communication_reorder(&communication_reorder, &fault_effects, &sensor);
         if (status != SIM_OK) {
             exit_reason = "communication_reorder_failed";
@@ -3115,8 +4768,31 @@ SimStatus env_app_run(const EnvContext *ctx)
             write_event(event_log, state.time, "FAULT_ERROR", sim_status_to_string(status));
             break;
         }
+        {
+            const uint32_t expected_sensor_flags =
+                SIM_SENSOR_VALID_SEEKER |
+                SIM_SENSOR_VALID_IMU_GYRO |
+                SIM_SENSOR_VALID_ACCEL |
+                SIM_SENSOR_VALID_SPEED |
+                SIM_SENSOR_VALID_GEODETIC;
 
-        status = send_sensor_frame(sock, &fc_addr, ctx->instance_id, &sensor);
+            if ((sensor.sensor_valid_flags & expected_sensor_flags) != expected_sensor_flags) {
+                ++operational_stats.sensor_dropout_count;
+            }
+        }
+
+        status = monotonic_time_now(&control_roundtrip_start_s);
+        if (status == SIM_OK) {
+            status = send_sensor_frame(
+                sock,
+                &fc_addr,
+                ctx->instance_id,
+                &sensor,
+                &fault_effects);
+        }
+        if (status == SIM_OK) {
+            status = timing_finish(control_roundtrip_start_s, &operational_stats.sensor_send);
+        }
         if (status != SIM_OK) {
             exit_reason = "send_failed";
             break;
@@ -3126,35 +4802,170 @@ SimStatus env_app_run(const EnvContext *ctx)
                 sensor.target_range_meas,
                 sensor.target_closing_velocity_meas);
         }
-        status = write_sensor_log(sensor_log, ctx->instance_id, &sensor);
+        {
+            double log_start_s = 0.0;
+
+            status = monotonic_time_now(&log_start_s);
+            if (status == SIM_OK) {
+                status = write_sensor_log(sensor_log, ctx->instance_id, &sensor);
+            }
+            if (status == SIM_OK) {
+                status = timing_finish(log_start_s, &operational_stats.log_write);
+            }
+        }
         if (status != SIM_OK) {
             exit_reason = "sensor_log_failed";
             write_event(event_log, state.time, "IO_ERROR", exit_reason);
             break;
         }
 
-        status = receive_control_command(sock, ctx->instance_id, &command);
+        {
+            double receive_start_s = 0.0;
+            SimStatus timing_status;
+
+            status = monotonic_time_now(&receive_start_s);
+            if (status == SIM_OK && runtime.synchronization_mode == ENV_SYNC_LOCKSTEP) {
+                status = receive_control_command(
+                    sock,
+                    ctx->instance_id,
+                    &fc_addr,
+                    &operational_stats.protocol_minor_mismatch_count,
+                    &command);
+                if (status == SIM_OK) {
+                    held_command = command;
+                    has_held_command = 1;
+                }
+            } else if (status == SIM_OK) {
+                int received_new_command = 0;
+
+                status = receive_latest_control_command(
+                    sock,
+                    ctx->instance_id,
+                    seq,
+                    &fc_addr,
+                    &operational_stats.protocol_minor_mismatch_count,
+                    &held_command,
+                    &received_new_command);
+                if (status == SIM_OK && received_new_command != 0) {
+                    has_held_command = 1;
+                } else if (status == SIM_OK) {
+                    ++operational_stats.command_hold_count;
+                }
+                command = held_command;
+            }
+            if (status == SIM_OK || status == SIM_ERR_TIMEOUT) {
+                timing_status = timing_finish(
+                    receive_start_s,
+                    &operational_stats.command_receive);
+                if (timing_status != SIM_OK && status == SIM_OK) {
+                    status = timing_status;
+                }
+                if (runtime.synchronization_mode == ENV_SYNC_LOCKSTEP) {
+                    timing_status = timing_finish(
+                        control_roundtrip_start_s,
+                        &operational_stats.control_roundtrip);
+                    if (timing_status != SIM_OK && status == SIM_OK) {
+                        status = timing_status;
+                    }
+                }
+            }
+        }
         if (status != SIM_OK) {
-            exit_reason = "control_timeout";
+            if (status == SIM_ERR_TIMEOUT) {
+                ++operational_stats.command_timeout_count;
+                exit_reason = "control_timeout";
+            } else {
+                exit_reason = "control_receive_failed";
+            }
             write_event(event_log, state.time, "CONTROL_RECEIVE_FAILED", sim_status_to_string(status));
             break;
         }
-        status = write_command_log(command_log, ctx->instance_id, &command);
+        if (operational_stats.protocol_minor_mismatch_count > 0u &&
+            protocol_minor_warning_written == 0) {
+            write_event(
+                event_log,
+                state.time,
+                "PROTOCOL_MINOR_VERSION_WARNING",
+                "compatible_minor_version_received");
+            protocol_minor_warning_written = 1;
+        }
+        if (runtime.synchronization_mode == ENV_SYNC_FREE_RUNNING &&
+            has_held_command == 0 && initial_command_hold_event_written == 0) {
+            write_event(event_log, state.time, "COMMAND_HOLD", "no_command_received_yet");
+            initial_command_hold_event_written = 1;
+        }
+        {
+            const double command_norm = vec3_norm(command.accel_cmd_ecef);
+
+            if (command_norm > operational_stats.max_command_norm) {
+                operational_stats.max_command_norm = command_norm;
+            }
+        }
+        {
+            double log_start_s = 0.0;
+
+            status = monotonic_time_now(&log_start_s);
+            if (status == SIM_OK) {
+                status = write_command_log(command_log, ctx->instance_id, &command);
+            }
+            if (status == SIM_OK) {
+                status = timing_finish(log_start_s, &operational_stats.log_write);
+            }
+        }
         if (status != SIM_OK) {
             exit_reason = "command_log_failed";
             write_event(event_log, state.time, "IO_ERROR", exit_reason);
             break;
         }
-        status = update_truth(
-            &state,
-            &command,
-            &scenario,
-            &scenario.force_model,
-            &fault_effects);
-        if (status != SIM_OK) {
-            exit_reason = "plant_update_failed";
-            write_event(event_log, state.time, "PLANT_ERROR", sim_status_to_string(status));
-            break;
+        {
+            const Vec3 missile_start = state.missile_pos;
+            const Vec3 target_start = state.target_pos;
+            const double step_start_time = state.time;
+            HitDetectResult hit_result;
+
+            status = update_truth(
+                &state,
+                &command,
+                &scenario,
+                &scenario.force_model,
+                &fault_effects,
+                actuator_command_delays);
+            if (status == SIM_OK) {
+                status = hit_detect_segment(
+                    missile_start,
+                    state.missile_pos,
+                    target_start,
+                    state.target_pos,
+                    scenario.hit_radius_m,
+                    &hit_result);
+            }
+            if (status != SIM_OK) {
+                exit_reason = "plant_update_failed";
+                write_event(event_log, state.time, "PLANT_ERROR", sim_status_to_string(status));
+                break;
+            }
+            if (hit_result.minimum_range_m < state.min_range) {
+                state.min_range = hit_result.minimum_range_m;
+                state.time_of_closest = step_start_time +
+                    (hit_result.closest_fraction * scenario.dt);
+            }
+            if (hit_result.hit != 0) {
+                hit = 1;
+                exit_reason = "hit";
+                write_event(
+                    event_log,
+                    state.time_of_closest,
+                    "HIT",
+                    "continuous_relative_segment");
+                break;
+            }
+        }
+        {
+            const double actual_accel = vec3_norm(state.missile_actual_accel);
+
+            if (actual_accel > operational_stats.max_actual_accel) {
+                operational_stats.max_actual_accel = actual_accel;
+            }
         }
         status = update_geodetic_state(&state, &earth, &terrain);
         if (status != SIM_OK) {
@@ -3163,9 +4974,21 @@ SimStatus env_app_run(const EnvContext *ctx)
             break;
         }
         if (trajectory_log != 0) {
+            double log_start_s = 0.0;
+
+            status = monotonic_time_now(&log_start_s);
+            if (status != SIM_OK) {
+                exit_reason = "wall_clock_read_failed";
+                break;
+            }
             write_trajectory_row(trajectory_log, &state);
             update_diagnostic_stats(&diagnostic_stats, &state, &terrain);
             write_diagnostics_row(diagnostics_log, &state, &scenario, &terrain);
+            status = timing_finish(log_start_s, &operational_stats.log_write);
+            if (status != SIM_OK) {
+                exit_reason = "wall_clock_read_failed";
+                break;
+            }
         }
         ++seq;
         if (runtime.flush_every_steps > 0u && (seq % runtime.flush_every_steps) == 0u) {
@@ -3182,6 +5005,63 @@ SimStatus env_app_run(const EnvContext *ctx)
             if (event_log != 0) {
                 (void)fflush(event_log);
             }
+        }
+        status = timing_finish(step_start_s, &operational_stats.step_compute);
+        if (status == SIM_OK) {
+            double sleep_s = 0.0;
+            double overrun_s = 0.0;
+
+            status = realtime_pacer_wait_next(&realtime_pacer, &sleep_s, &overrun_s);
+            operational_stats.realtime_sleep_time_s += sleep_s;
+            if (overrun_s > 0.0) {
+                char detail[96];
+
+                ++operational_stats.realtime_overrun_count;
+                if (overrun_s > operational_stats.max_realtime_overrun_s) {
+                    operational_stats.max_realtime_overrun_s = overrun_s;
+                }
+                if (realtime_overrun_event_written == 0) {
+                    (void)snprintf(detail, sizeof(detail), "overrun_s=%.9f", overrun_s);
+                    write_event(event_log, state.time, "REALTIME_OVERRUN", detail);
+                    realtime_overrun_event_written = 1;
+                }
+            }
+        }
+        if (status != SIM_OK) {
+            exit_reason = "wall_clock_pacing_failed";
+            write_event(event_log, state.time, "REALTIME_ERROR", sim_status_to_string(status));
+            break;
+        }
+    }
+
+    {
+        SimStatus shutdown_status = send_sim_stop(
+            sock,
+            &fc_addr,
+            ctx->instance_id,
+            seq,
+            state.time);
+
+        if (shutdown_status == SIM_OK) {
+            write_event(event_log, state.time, "SIM_CONTROL_STOP_SENT", exit_reason);
+        } else {
+            write_event(
+                event_log,
+                state.time,
+                "SIM_CONTROL_STOP_FAILED",
+                sim_status_to_string(shutdown_status));
+            if (status == SIM_OK) {
+                status = shutdown_status;
+                exit_reason = "sim_control_stop_failed";
+            }
+        }
+    }
+
+    {
+        double run_wall_end_s = 0.0;
+
+        if (monotonic_time_now(&run_wall_end_s) == SIM_OK && run_wall_end_s >= run_wall_start_s) {
+            operational_stats.run_wall_time_s = run_wall_end_s - run_wall_start_s;
         }
     }
 
@@ -3207,9 +5087,11 @@ SimStatus env_app_run(const EnvContext *ctx)
         &state,
         seq,
         exit_reason,
+        &operational_stats,
         &fault_stats,
         &terrain_cache,
         &diagnostic_stats);
+    write_performance_report(instance_dir, &runtime, scenario.dt, &operational_stats);
 
     if (sock >= 0) {
         (void)close(sock);
@@ -3217,6 +5099,9 @@ SimStatus env_app_run(const EnvContext *ctx)
     unload_terrain_resources(terrain_tiles, terrain_tile_count, &terrain_cache);
     if (aero_database_loaded != 0) {
         aero_database_unload(&aero_database);
+    }
+    if (aero_database_v2_loaded != 0) {
+        aero_database_v2_unload(&aero_database_v2);
     }
     config_free(&scenario_tree);
     config_free(&runtime_tree);

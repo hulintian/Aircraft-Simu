@@ -741,6 +741,124 @@ SimStatus config_require_section(const ConfigTree *config, const char *path)
     return *value == '{' ? SIM_OK : SIM_ERR_CONFIG;
 }
 
+SimStatus config_path_exists(const ConfigTree *config, const char *path, int *exists_out)
+{
+    const char *value;
+    SimStatus status;
+
+    if (config == 0 || config->data == 0 || path == 0 || exists_out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = find_path_value(config, path, &value);
+    if (status == SIM_OK) {
+        *exists_out = 1;
+        return SIM_OK;
+    }
+    if (status == SIM_ERR_CONFIG) {
+        *exists_out = 0;
+        return SIM_OK;
+    }
+    return status;
+}
+
+SimStatus config_visit_unknown_keys(
+    const ConfigTree *config,
+    const char *object_path,
+    const char *const *allowed_keys,
+    size_t allowed_key_count,
+    ConfigUnknownKeyVisitor visitor,
+    void *user_data,
+    size_t *unknown_count_out)
+{
+    const char *object_start;
+    const char *object_end;
+    const char *p;
+    size_t unknown_count = 0u;
+    SimStatus status;
+
+    if (config == 0 || config->data == 0 || object_path == 0 ||
+        (allowed_keys == 0 && allowed_key_count > 0u) || unknown_count_out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (object_path[0] == '\0') {
+        object_start = skip_ws(config->data, config->data + config->size);
+    } else {
+        status = find_path_value(config, object_path, &object_start);
+        if (status != SIM_OK) {
+            return status;
+        }
+    }
+    if (object_start >= config->data + config->size || *object_start != '{') {
+        return SIM_ERR_CONFIG;
+    }
+    object_end = find_matching_bracket(object_start, config->data + config->size);
+    if (object_end == 0) {
+        return SIM_ERR_CONFIG;
+    }
+    p = skip_ws(object_start + 1, object_end);
+    while (p < object_end) {
+        const char *key_start;
+        const char *key_end;
+        const char *value_start;
+        const char *value_end;
+        char key[CONFIG_PATH_MAX];
+        size_t key_length;
+        size_t allowed_index;
+        int recognized = 0;
+
+        if (*p != '"') {
+            return SIM_ERR_CONFIG;
+        }
+        key_start = p + 1;
+        key_end = key_start;
+        while (key_end < object_end && *key_end != '"') {
+            if (*key_end == '\\') {
+                return SIM_ERR_CONFIG;
+            }
+            ++key_end;
+        }
+        if (key_end >= object_end) {
+            return SIM_ERR_CONFIG;
+        }
+        key_length = (size_t)(key_end - key_start);
+        if (key_length == 0u || key_length >= sizeof(key)) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        (void)memcpy(key, key_start, key_length);
+        key[key_length] = '\0';
+        p = skip_ws(key_end + 1, object_end);
+        if (p >= object_end || *p != ':') {
+            return SIM_ERR_CONFIG;
+        }
+        value_start = skip_ws(p + 1, object_end);
+        value_end = find_json_value_end(value_start, object_end);
+        if (value_end == 0 || value_end > object_end) {
+            return SIM_ERR_CONFIG;
+        }
+        for (allowed_index = 0u; allowed_index < allowed_key_count; ++allowed_index) {
+            if (strcmp(key, allowed_keys[allowed_index]) == 0) {
+                recognized = 1;
+                break;
+            }
+        }
+        if (recognized == 0) {
+            ++unknown_count;
+            if (visitor != 0) {
+                visitor(object_path, key, user_data);
+            }
+        }
+        p = skip_ws(value_end, object_end);
+        if (p < object_end) {
+            if (*p != ',') {
+                return SIM_ERR_CONFIG;
+            }
+            p = skip_ws(p + 1, object_end);
+        }
+    }
+    *unknown_count_out = unknown_count;
+    return SIM_OK;
+}
+
 /** @brief 读取 JSON 数组长度。 */
 SimStatus config_get_array_count(const ConfigTree *config, const char *path, size_t *out)
 {

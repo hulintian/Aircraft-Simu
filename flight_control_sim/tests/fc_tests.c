@@ -253,6 +253,63 @@ static int test_command_manager_limits(void)
     return failures;
 }
 
+/** @brief 验证命令保持窗口按最后一条新鲜命令计时并最终降为受控零。 */
+static int test_command_manager_hold_timeout(void)
+{
+    int failures = 0;
+    CommandManager manager;
+    CommandManagerConfig config = { 1000.0, 10000.0, 0.2 };
+    AutopilotCommand request;
+    ControlCommand command;
+    uint32_t flags = 0u;
+
+    failures += expect_int(command_manager_init(&manager, &config) == SIM_OK, "hold_timeout_init");
+    autopilot_zero_command(&request);
+    request.accel_cmd_ecef = vec3_make(10.0, 0.0, 0.0);
+    failures += expect_int(
+        command_manager_build(
+            &manager,
+            1u,
+            1.0,
+            0.01,
+            FC_GUIDANCE_ACTIVE,
+            0u,
+            0,
+            &request,
+            &command,
+            &flags) == SIM_OK,
+        "hold_timeout_fresh");
+    failures += expect_int(
+        command_manager_build(
+            &manager,
+            2u,
+            1.1,
+            0.01,
+            FC_COMMAND_HOLD,
+            0u,
+            1,
+            0,
+            &command,
+            &flags) == SIM_OK,
+        "hold_timeout_within_window");
+    failures += expect_near(command.accel_cmd_ecef.x, 10.0, 1.0e-12, "hold_timeout_held_value");
+    failures += expect_int(
+        command_manager_build(
+            &manager,
+            3u,
+            1.21,
+            0.01,
+            FC_COMMAND_HOLD,
+            0u,
+            1,
+            0,
+            &command,
+            &flags) == SIM_OK,
+        "hold_timeout_expired");
+    failures += expect_near(vec3_norm(command.accel_cmd_ecef), 0.0, 1.0e-12, "hold_timeout_zero");
+    return failures;
+}
+
 /** @brief 验证模式状态机从上电到制导激活的转换。 */
 static int test_mode_state_machine(void)
 {
@@ -485,6 +542,7 @@ int main(void)
     failures += test_autopilot_attitude_allocation();
     failures += test_autopilot_disabled_inner_loops();
     failures += test_command_manager_limits();
+    failures += test_command_manager_hold_timeout();
     failures += test_mode_state_machine();
     failures += test_flight_controller_protection();
     failures += test_safety_monitor_recovery();

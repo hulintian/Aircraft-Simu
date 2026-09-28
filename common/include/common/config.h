@@ -23,6 +23,12 @@ typedef struct ConfigTree {
     size_t size;
 } ConfigTree;
 
+/** @brief 未识别对象键访问回调；object_path 为空字符串表示根对象。 */
+typedef void (*ConfigUnknownKeyVisitor)(
+    const char *object_path,
+    const char *key,
+    void *user_data);
+
 /** @brief 探测 JSON 文件是否存在并读取其大小。 */
 SimStatus config_probe_json_file(const char *path, ConfigFile *out);
 /** @brief 将文件完整加载到内存。 */
@@ -35,6 +41,17 @@ SimStatus config_validate_json(const ConfigTree *config);
 SimStatus config_validate_schema(const ConfigTree *config, unsigned int expected_version);
 /** @brief 要求指定点路径存在且值为 JSON 对象。 */
 SimStatus config_require_section(const ConfigTree *config, const char *path);
+/** @brief 判断指定点路径是否存在；路径或参数非法时返回错误。 */
+SimStatus config_path_exists(const ConfigTree *config, const char *path, int *exists_out);
+/** @brief 遍历对象的直接键，对不在白名单中的键调用 visitor。 */
+SimStatus config_visit_unknown_keys(
+    const ConfigTree *config,
+    const char *object_path,
+    const char *const *allowed_keys,
+    size_t allowed_key_count,
+    ConfigUnknownKeyVisitor visitor,
+    void *user_data,
+    size_t *unknown_count_out);
 /** @brief 读取 JSON 数组元素数量。点路径支持 `items[0].field` 形式。 */
 SimStatus config_get_array_count(const ConfigTree *config, const char *path, size_t *out);
 /** @brief 读取 JSON 浮点字段。 */

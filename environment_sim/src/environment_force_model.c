@@ -76,7 +76,8 @@ SimStatus environment_force_model_evaluate(
         !isfinite(input->propellant_mass_kg) ||
         input->propellant_mass_kg < 0.0 ||
         !isfinite(input->dt_s) ||
-        input->dt_s <= 0.0) {
+        input->dt_s <= 0.0 ||
+        !vec3_isfinite(input->wind_velocity_ecef_mps)) {
         return SIM_ERR_INVALID_ARG;
     }
     status = missile_plant_validate(input->plant);
@@ -100,13 +101,14 @@ SimStatus environment_force_model_evaluate(
     }
     air_velocity_ecef = vec3_sub(
         input->plant->vel_ecef,
-        model->wind_velocity_ecef_mps);
+        input->wind_velocity_ecef_mps);
     air_velocity_body = matrix3_multiply_vec3(ecef_to_body, air_velocity_ecef);
-    status = aero_model_evaluate(
+    status = aero_model_evaluate_extended(
         &model->aerodynamics,
         output->atmosphere.density_kgpm3,
         output->atmosphere.speed_of_sound_mps > 0.0 ?
             vec3_norm(air_velocity_body) / output->atmosphere.speed_of_sound_mps : 0.0,
+        input->height_m,
         air_velocity_body,
         input->pitch_actuator_rad,
         input->yaw_actuator_rad,

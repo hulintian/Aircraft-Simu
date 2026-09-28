@@ -6,6 +6,7 @@
 #include "common/random.h"
 #include "env/actuator_model.h"
 #include "env/aero_database.h"
+#include "env/aero_database_v2.h"
 #include "env/aero_model.h"
 #include "env/aero_surrogate.h"
 #include "env/atmosphere_model.h"
@@ -14,6 +15,7 @@
 #include "env/fault_injection.h"
 #include "env/geo_coordinate.h"
 #include "env/gravity_model.h"
+#include "env/hit_detect.h"
 #include "env/map_tile.h"
 #include "env/mass_model.h"
 #include "env/missile_plant_6dof.h"
@@ -22,7 +24,10 @@
 #include "env/sensor_seeker.h"
 #include "env/sensor_noise.h"
 #include "env/terrain_model.h"
+#include "env/target_model.h"
+#include "env/wind_model.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -361,7 +366,12 @@ static int test_force_models(void)
         1, 1000.0, 2.0, 5.0, { 1.0, 0.0, 0.0 }
     };
     AeroModel aero = {
-        1, 0.1, 1.0, 0.5, 0.2, 0.1, 0, 0
+        .enabled = 1,
+        .reference_area_m2 = 0.1,
+        .reference_length_m = 1.0,
+        .drag_coefficient = 0.5,
+        .control_force_coefficient = 0.2,
+        .control_moment_coefficient = 0.1
     };
     Vec3 gravity_accel;
     Vec3 propulsion_force;
@@ -409,6 +419,93 @@ static int test_force_models(void)
         "aero_evaluate");
     failures += expect(aero_force.x < 0.0, "aero_drag_direction");
     failures += expect(aero_moment.y > 0.0 && aero_moment.z < 0.0, "aero_moment_direction");
+    return failures;
+}
+
+/** @brief 验证推进剂消耗引起的质心迁移和完整惯量张量演化。 */
+static int test_mass_properties_evolution(void)
+{
+    MassModel mass;
+    Matrix3 dry_inertia = matrix3_zero();
+    Matrix3 propellant_inertia = matrix3_zero();
+    Matrix3 inertia;
+    Vec3 center_of_mass;
+    int failures = 0;
+
+    dry_inertia.m[0][0] = 10.0;
+    dry_inertia.m[1][1] = 20.0;
+    dry_inertia.m[2][2] = 20.0;
+    propellant_inertia.m[0][0] = 2.0;
+    propellant_inertia.m[1][1] = 3.0;
+    propellant_inertia.m[2][2] = 3.0;
+    failures += expect(
+        mass_model_init(&mass, 80.0, 20.0) == SIM_OK,
+        "mass_properties_init");
+    failures += expect(
+        mass_model_configure_properties(
+            &mass,
+            vec3_make(0.0, 0.0, 0.0),
+            vec3_make(2.0, 0.0, 0.0),
+            vec3_make(1.0, 0.0, 0.0),
+            dry_inertia,
+            propellant_inertia) == SIM_OK,
+        "mass_properties_configure");
+    failures += expect(
+        mass_model_get_properties(&mass, &center_of_mass, &inertia) == SIM_OK,
+        "mass_properties_full_get");
+    failures += expect_near(center_of_mass.x, 0.4, 1.0e-12, "mass_properties_full_cg");
+    failures += expect_near(inertia.m[0][0], 12.0, 1.0e-12, "mass_properties_full_ixx");
+    failures += expect_near(inertia.m[1][1], 87.0, 1.0e-12, "mass_properties_full_iyy");
+    failures += expect(
+        mass_model_step(&mass, 5.0, 2.0) == SIM_OK &&
+            mass_model_get_properties(&mass, &center_of_mass, &inertia) == SIM_OK,
+        "mass_properties_half_get");
+    failures += expect_near(center_of_mass.x, 1.0 / 6.0, 1.0e-12, "mass_properties_half_cg");
+    failures += expect_near(inertia.m[0][0], 11.0, 1.0e-12, "mass_properties_half_ixx");
+    failures += expect_near(inertia.m[1][1], 41.5, 1.0e-12, "mass_properties_half_iyy");
+    return failures;
+}
+
+/** @brief 验证风切变/阵风计算和固定种子湍流可重复性。 */
+static int test_wind_model(void)
+{
+    WindModelConfig config;
+    WindModel first;
+    WindModel second;
+    Vec3 first_wind;
+    Vec3 second_wind;
+    int failures = 0;
+    unsigned int index;
+
+    (void)memset(&config, 0, sizeof(config));
+    config.enabled = 1;
+    config.base_velocity_ecef_mps = vec3_make(1.0, 2.0, 3.0);
+    config.shear_ecef_per_m = vec3_make(0.001, 0.0, 0.0);
+    config.reference_height_m = 1000.0;
+    config.gust_amplitude_ecef_mps = vec3_make(2.0, 0.0, 0.0);
+    config.gust_frequency_hz = 0.5;
+    config.turbulence_sigma_ecef_mps = vec3_make(0.0, 0.0, 0.0);
+    config.turbulence_time_constant_s = 1.0;
+    failures += expect(wind_model_init(&first, &config, 123u) == SIM_OK, "wind_init");
+    failures += expect(
+        wind_model_step(&first, 0.5, 1100.0, 0.01, &first_wind) == SIM_OK,
+        "wind_deterministic_step");
+    failures += expect_near(first_wind.x, 3.1, 1.0e-12, "wind_shear_gust_x");
+    failures += expect_near(first_wind.y, 2.0, 1.0e-12, "wind_base_y");
+
+    config.gust_amplitude_ecef_mps = vec3_make(0.0, 0.0, 0.0);
+    config.turbulence_sigma_ecef_mps = vec3_make(1.0, 2.0, 3.0);
+    failures += expect(wind_model_init(&first, &config, 456u) == SIM_OK, "wind_repeat_first_init");
+    failures += expect(wind_model_init(&second, &config, 456u) == SIM_OK, "wind_repeat_second_init");
+    for (index = 0u; index < 100u; ++index) {
+        failures += expect(
+            wind_model_step(&first, 0.01 * (double)index, 1000.0, 0.01, &first_wind) == SIM_OK &&
+                wind_model_step(&second, 0.01 * (double)index, 1000.0, 0.01, &second_wind) == SIM_OK,
+            "wind_repeat_step");
+        failures += expect_near(first_wind.x, second_wind.x, 0.0, "wind_repeat_x");
+        failures += expect_near(first_wind.y, second_wind.y, 0.0, "wind_repeat_y");
+        failures += expect_near(first_wind.z, second_wind.z, 0.0, "wind_repeat_z");
+    }
     return failures;
 }
 
@@ -512,7 +609,13 @@ static int test_aero_database_file_and_model(void)
     failures += expect(
         aero_database_load_file(path, &database) == SIM_OK,
         "aero_database_file_load");
-    aero = (AeroModel){ 1, 0.1, 1.0, 0.5, 0.0, 0.0, &database, 0 };
+    aero = (AeroModel){
+        .enabled = 1,
+        .reference_area_m2 = 0.1,
+        .reference_length_m = 1.0,
+        .drag_coefficient = 0.5,
+        .database = &database
+    };
     failures += expect(
         aero_model_evaluate(
             &aero,
@@ -556,6 +659,176 @@ static int test_aero_database_file_and_model(void)
     return failures;
 }
 
+/** @brief 生成可由六维多线性插值精确恢复的仿射系数。 */
+static AeroCoefficientSet aero_v2_affine_coefficients(
+    double mach,
+    double alpha,
+    double beta,
+    double height,
+    double pitch,
+    double yaw)
+{
+    AeroCoefficientSet value;
+
+    value.cx = -0.1 - (0.01 * mach) + (0.2 * alpha) + (0.3 * beta) +
+        (1.0e-5 * height) + (0.4 * pitch) + (0.5 * yaw);
+    value.cy = 2.0 * yaw;
+    value.cz = 3.0 * pitch;
+    value.cl = alpha;
+    value.cm = pitch;
+    value.cn = yaw;
+    return value;
+}
+
+/** @brief 验证 v2 六维插值、包络策略、CRC 和环境力主链路。 */
+static int test_aero_database_v2(void)
+{
+    const double mach_axis[2] = { 0.0, 2.0 };
+    const double alpha_axis[2] = { -0.2, 0.2 };
+    const double beta_axis[2] = { -0.1, 0.1 };
+    const double height_axis[2] = { 0.0, 1000.0 };
+    const double pitch_axis[2] = { -0.05, 0.05 };
+    const double yaw_axis[2] = { -0.04, 0.04 };
+    AeroCoefficientSet coefficients[64];
+    AeroDatabaseV2Grid grid;
+    AeroDatabaseV2 database;
+    AeroCoefficientSet out;
+    AeroCoefficientSet expected;
+    AeroModel aero;
+    Vec3 force;
+    Vec3 moment;
+    uint32_t flags = 0u;
+    char path[128];
+    FILE *file;
+    size_t index;
+    int failures = 0;
+
+    for (index = 0u; index < 64u; ++index) {
+        coefficients[index] = aero_v2_affine_coefficients(
+            mach_axis[(index >> 5u) & 1u],
+            alpha_axis[(index >> 4u) & 1u],
+            beta_axis[(index >> 3u) & 1u],
+            height_axis[(index >> 2u) & 1u],
+            pitch_axis[(index >> 1u) & 1u],
+            yaw_axis[index & 1u]);
+    }
+    (void)memset(&grid, 0, sizeof(grid));
+    grid.mach_axis = mach_axis;
+    grid.mach_count = 2u;
+    grid.alpha_axis_rad = alpha_axis;
+    grid.alpha_count = 2u;
+    grid.beta_axis_rad = beta_axis;
+    grid.beta_count = 2u;
+    grid.height_axis_m = height_axis;
+    grid.height_count = 2u;
+    grid.pitch_actuator_axis_rad = pitch_axis;
+    grid.pitch_actuator_count = 2u;
+    grid.yaw_actuator_axis_rad = yaw_axis;
+    grid.yaw_actuator_count = 2u;
+    grid.coefficients = coefficients;
+    grid.coefficient_count = 64u;
+
+    failures += expect(
+        aero_database_v2_init(&database, &grid, AERO_DB_EXTRAPOLATION_ERROR) == SIM_OK,
+        "aero_database_v2_init");
+    failures += expect(
+        aero_database_v2_lookup(
+            &database, 1.0, 0.05, -0.025, 500.0, 0.01, 0.02, &out, &flags) == SIM_OK,
+        "aero_database_v2_interpolate");
+    expected = aero_v2_affine_coefficients(1.0, 0.05, -0.025, 500.0, 0.01, 0.02);
+    failures += expect_near(out.cx, expected.cx, 1.0e-12, "aero_database_v2_cx");
+    failures += expect_near(out.cy, expected.cy, 1.0e-12, "aero_database_v2_cy");
+    failures += expect_near(out.cz, expected.cz, 1.0e-12, "aero_database_v2_cz");
+    failures += expect(flags == 0u, "aero_database_v2_inside_flags");
+    failures += expect(
+        aero_database_v2_lookup(
+            &database, 3.0, 0.0, 0.0, 500.0, 0.0, 0.0, &out, &flags) ==
+            SIM_ERR_OUT_OF_RANGE,
+        "aero_database_v2_error_policy");
+    aero_database_v2_unload(&database);
+
+    failures += expect(
+        aero_database_v2_init(
+            &database, &grid, AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN) == SIM_OK &&
+            aero_database_v2_lookup(
+                &database, 3.0, 0.0, 0.0, 500.0, 0.0, 0.0, &out, &flags) == SIM_OK,
+        "aero_database_v2_clamp_policy");
+    expected = aero_v2_affine_coefficients(2.0, 0.0, 0.0, 500.0, 0.0, 0.0);
+    failures += expect_near(out.cx, expected.cx, 1.0e-12, "aero_database_v2_clamped_cx");
+    failures += expect(
+        (flags & AERO_DB_FLAG_EXTRAPOLATED) != 0u,
+        "aero_database_v2_clamp_flag");
+    aero_database_v2_unload(&database);
+
+    failures += expect(
+        aero_database_v2_init(
+            &database, &grid, AERO_DB_EXTRAPOLATION_HOLD_LAST_VALID) == SIM_OK &&
+            aero_database_v2_lookup(
+                &database, 1.0, 0.0, 0.0, 500.0, 0.0, 0.0, &out, &flags) == SIM_OK,
+        "aero_database_v2_hold_seed");
+    expected = out;
+    failures += expect(
+        aero_database_v2_lookup(
+            &database, 3.0, 0.0, 0.0, 500.0, 0.0, 0.0, &out, &flags) == SIM_OK,
+        "aero_database_v2_hold_policy");
+    failures += expect_near(out.cx, expected.cx, 0.0, "aero_database_v2_held_cx");
+    failures += expect(
+        (flags & AERO_DB_FLAG_EXTRAPOLATED) != 0u,
+        "aero_database_v2_hold_flag");
+    aero_database_v2_unload(&database);
+
+    (void)snprintf(path, sizeof(path), "/tmp/missile_aero_v2_%ld.bin", (long)getpid());
+    failures += expect(
+        aero_database_v2_write_file(
+            path, &grid, AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN) == SIM_OK &&
+            aero_database_v2_load_file(path, &database) == SIM_OK,
+        "aero_database_v2_file_round_trip");
+    (void)memset(&aero, 0, sizeof(aero));
+    aero.enabled = 1;
+    aero.reference_area_m2 = 0.1;
+    aero.reference_length_m = 1.0;
+    aero.control_force_coefficient = 100.0;
+    aero.control_moment_coefficient = 100.0;
+    aero.database_v2 = &database;
+    failures += expect(
+        aero_model_evaluate_extended(
+            &aero,
+            1.0,
+            1.0,
+            500.0,
+            vec3_make(100.0, 0.0, 0.0),
+            0.01,
+            0.02,
+            &force,
+            &moment,
+            &flags) == SIM_OK,
+        "aero_database_v2_model_evaluate");
+    expected = aero_v2_affine_coefficients(1.0, 0.0, 0.0, 500.0, 0.01, 0.02);
+    failures += expect_near(force.x, 500.0 * expected.cx, 1.0e-9, "aero_database_v2_force_x");
+    failures += expect_near(force.y, 500.0 * expected.cy, 1.0e-9, "aero_database_v2_force_y");
+    failures += expect_near(force.z, 500.0 * expected.cz, 1.0e-9, "aero_database_v2_force_z");
+    failures += expect_near(moment.y, 500.0 * expected.cm, 1.0e-9, "aero_database_v2_moment_y");
+    failures += expect_near(moment.z, 500.0 * expected.cn, 1.0e-9, "aero_database_v2_moment_z");
+    aero_database_v2_unload(&database);
+
+    file = fopen(path, "r+b");
+    if (file != 0) {
+        int ch;
+        (void)fseek(file, (long)AERO_DATABASE_V2_HEADER_WIRE_SIZE, SEEK_SET);
+        ch = fgetc(file);
+        if (ch != EOF) {
+            (void)fseek(file, (long)AERO_DATABASE_V2_HEADER_WIRE_SIZE, SEEK_SET);
+            (void)fputc(ch ^ 0x01, file);
+        }
+        (void)fclose(file);
+    }
+    failures += expect(
+        aero_database_v2_load_file(path, &database) == SIM_ERR_CONFIG,
+        "aero_database_v2_reject_crc");
+    (void)unlink(path);
+    return failures;
+}
+
 /** @brief 验证线性气动代理模型加载、推理和气动力主计算路径。 */
 static int test_aero_surrogate_file_and_model(void)
 {
@@ -581,6 +854,7 @@ static int test_aero_surrogate_file_and_model(void)
         return 1;
     }
     (void)fprintf(file, "MISSILE_AERO_SURROGATE_LINEAR_V1\n");
+    (void)fprintf(file, "envelope 0.0 5.0 -0.5 0.5 -0.5 0.5\n");
     (void)fprintf(file, "cx -0.1 -0.2 0.0 0.0\n");
     (void)fprintf(file, "cy 0.0 0.0 0.0 1.0\n");
     (void)fprintf(file, "cz 0.0 0.0 2.0 0.0\n");
@@ -600,8 +874,17 @@ static int test_aero_surrogate_file_and_model(void)
     failures += expect_near(coefficients.cz, 0.2, 1.0e-12, "aero_surrogate_cz");
     failures += expect_near(coefficients.cm, 0.01, 1.0e-12, "aero_surrogate_cm");
     failures += expect_near(coefficients.cn, -0.02, 1.0e-12, "aero_surrogate_cn");
+    failures += expect(
+        aero_surrogate_evaluate(&surrogate, 5.1, 0.1, 0.2, &coefficients) == SIM_ERR_OUT_OF_RANGE,
+        "aero_surrogate_reject_out_of_envelope");
 
-    aero = (AeroModel){ 1, 0.1, 1.0, 0.5, 0.0, 0.0, 0, &surrogate };
+    aero = (AeroModel){
+        .enabled = 1,
+        .reference_area_m2 = 0.1,
+        .reference_length_m = 1.0,
+        .drag_coefficient = 0.5,
+        .surrogate = &surrogate
+    };
     failures += expect(
         aero_model_evaluate(
             &aero,
@@ -622,6 +905,7 @@ static int test_aero_surrogate_file_and_model(void)
     file = fopen(bad_path, "wb");
     if (file != 0) {
         (void)fprintf(file, "MISSILE_AERO_SURROGATE_LINEAR_V1\n");
+        (void)fprintf(file, "envelope 0.0 5.0 -0.5 0.5 -0.5 0.5\n");
         (void)fprintf(file, "cx -0.1 -0.2 0.0 0.0\n");
         (void)fclose(file);
         failures += expect(
@@ -1413,6 +1697,129 @@ static int test_fault_injection_communication_recovery_hold(void)
     return failures;
 }
 
+/** @brief 验证周期突发丢包和确定性通信延迟抖动。 */
+static int test_fault_injection_communication_burst_and_jitter(void)
+{
+    char json[] =
+        "{"
+        "\"schema_version\":1,"
+        "\"faults\":["
+        "{"
+        "\"id\":\"periodic_loss\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"target\":\"sensor.frame\","
+        "\"type\":\"COMMUNICATION_LOSS\","
+        "\"burst_period_s\":0.4,"
+        "\"burst_active_s\":0.1"
+        "},"
+        "{"
+        "\"id\":\"delay_jitter\","
+        "\"time_s\":1.0,"
+        "\"duration_s\":1.0,"
+        "\"target\":\"sensor.frame\","
+        "\"type\":\"COMMUNICATION_JITTER\","
+        "\"delay_pattern_steps\":[1,3,2]"
+        "}"
+        "]"
+        "}";
+    char bad_burst_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,\"duration_s\":1.0,"
+        "\"target\":\"sensor.frame\",\"type\":\"COMMUNICATION_LOSS\","
+        "\"burst_period_s\":0.2,\"burst_active_s\":0.3"
+        "}]}";
+    char bad_jitter_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,\"duration_s\":1.0,"
+        "\"target\":\"sensor.frame\",\"type\":\"COMMUNICATION_JITTER\","
+        "\"delay_pattern_steps\":[0,2]"
+        "}]}";
+    char zero_burst_json[] =
+        "{\"schema_version\":1,\"faults\":[{"
+        "\"time_s\":1.0,\"duration_s\":1.0,"
+        "\"target\":\"sensor.frame\",\"type\":\"COMMUNICATION_LOSS\","
+        "\"burst_period_s\":0.0,\"burst_active_s\":0.0"
+        "}]}";
+    ConfigTree config = { json, sizeof(json) - 1u };
+    ConfigTree bad_burst = { bad_burst_json, sizeof(bad_burst_json) - 1u };
+    ConfigTree bad_jitter = { bad_jitter_json, sizeof(bad_jitter_json) - 1u };
+    ConfigTree zero_burst = { zero_burst_json, sizeof(zero_burst_json) - 1u };
+    FaultInjection faults;
+    FaultStepEffects effects;
+    FaultTransition transitions[ENV_MAX_FAULT_TRANSITIONS];
+    size_t transition_count = 0u;
+    int failures = 0;
+
+    failures += expect(
+        fault_injection_load_config(&config, &faults) == SIM_OK &&
+            faults.fault_count == 2u,
+        "fault_comm_burst_jitter_load");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            1.0,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 2u &&
+            effects.sensor_valid_clear_mask != 0u &&
+            effects.communication_delay_enabled != 0 &&
+            effects.communication_delay_steps == 1u &&
+            transition_count == 2u,
+        "fault_comm_burst_jitter_first_step");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            1.15,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 1u &&
+            effects.sensor_valid_clear_mask == 0u &&
+            effects.communication_delay_steps == 3u &&
+            transition_count == 1u &&
+            transitions[0].active == 0,
+        "fault_comm_burst_gap_and_jitter_second");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            1.41,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 2u &&
+            effects.sensor_valid_clear_mask != 0u &&
+            effects.communication_delay_steps == 2u &&
+            transition_count == 1u &&
+            transitions[0].active != 0,
+        "fault_comm_burst_reentry_and_jitter_third");
+    failures += expect(
+        fault_injection_update(
+            &faults,
+            2.0,
+            &effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            effects.active_fault_count == 0u &&
+            transition_count == 2u,
+        "fault_comm_burst_jitter_end");
+    failures += expect(
+        fault_injection_load_config(&bad_burst, &faults) == SIM_ERR_CONFIG,
+        "fault_comm_reject_bad_burst");
+    failures += expect(
+        fault_injection_load_config(&bad_jitter, &faults) == SIM_ERR_OUT_OF_RANGE,
+        "fault_comm_reject_bad_jitter");
+    failures += expect(
+        fault_injection_load_config(&zero_burst, &faults) == SIM_ERR_CONFIG,
+        "fault_comm_reject_zero_burst");
+    return failures;
+}
+
 /** @brief 验证传感器漂移故障按激活时间线性增长并在窗口后恢复。 */
 static int test_fault_injection_drift(void)
 {
@@ -1561,6 +1968,193 @@ static int test_fault_injection_ramp_bias(void)
     return failures;
 }
 
+/** @brief 覆盖设计故障矩阵中的动态传感器、执行机构和报文故障。 */
+static int test_fault_injection_professional_matrix(void)
+{
+    char json[] =
+        "{\"schema_version\":1,\"faults\":["
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"sensor.accel\","
+        "\"type\":\"SENSOR_FAULT_NOISE_INCREASE\",\"value_xyz\":[0.1,0.2,0.3]},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"sensor.speed\","
+        "\"type\":\"SENSOR_FAULT_SATURATION\",\"min_value\":-5,\"max_value\":5},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"sensor.seeker.range\","
+        "\"type\":\"SENSOR_FAULT_DELAY\",\"value\":2},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"sensor.imu.gyro\","
+        "\"type\":\"SENSOR_FAULT_STUCK\"},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"actuator.accel_x\","
+        "\"type\":\"ACTUATOR_FAULT_BIAS\",\"value\":1.5},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"actuator.accel_y\","
+        "\"type\":\"ACTUATOR_FAULT_RATE_LIMIT\",\"scale\":0.5},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"actuator.accel_z\","
+        "\"type\":\"ACTUATOR_FAULT_POSITION_LIMIT_DEGRADED\",\"scale\":0.6},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"actuator.accel_x\","
+        "\"type\":\"ACTUATOR_FAULT_DELAY\",\"value\":2},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"actuator.accel_y\","
+        "\"type\":\"ACTUATOR_FAULT_DISABLED\"},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"sensor.frame\","
+        "\"type\":\"COMM_FAULT_DROP_PACKET\"},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"sensor.frame\","
+        "\"type\":\"COMM_FAULT_DUPLICATE_PACKET\"},"
+        "{\"start_time_s\":1,\"duration_s\":1,\"target\":\"sensor.frame\","
+        "\"type\":\"COMM_FAULT_CORRUPT_PACKET\"}]}";
+    ConfigTree config = { json, sizeof(json) - 1u };
+    FaultInjection first;
+    FaultInjection second;
+    FaultStepEffects first_effects;
+    FaultStepEffects second_effects;
+    FaultTransition transitions[ENV_MAX_FAULT_TRANSITIONS];
+    SensorFrame sensor;
+    ActuatorState actuators[3];
+    double commands[3] = { 10.0, 20.0, 30.0 };
+    size_t transition_count = 0u;
+    int failures = 0;
+
+    failures += expect(
+        fault_injection_load_config(&config, &first) == SIM_OK &&
+            fault_injection_load_config(&config, &second) == SIM_OK,
+        "fault_matrix_load");
+    fault_injection_set_seed(&first, UINT64_C(77));
+    fault_injection_set_seed(&second, UINT64_C(77));
+    failures += expect(
+        fault_injection_update(
+            &first,
+            1.0,
+            &first_effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            first_effects.active_fault_count == 12u,
+        "fault_matrix_update");
+    failures += expect(
+        fault_injection_update(
+            &second,
+            1.0,
+            &second_effects,
+            transitions,
+            ENV_MAX_FAULT_TRANSITIONS,
+            &transition_count) == SIM_OK &&
+            first_effects.accel_bias_ecef_mps2.x == second_effects.accel_bias_ecef_mps2.x &&
+            first_effects.accel_bias_ecef_mps2.y == second_effects.accel_bias_ecef_mps2.y &&
+            first_effects.accel_bias_ecef_mps2.z == second_effects.accel_bias_ecef_mps2.z,
+        "fault_matrix_noise_repeatable");
+    failures += expect(
+        first_effects.saturation_enabled[6] != 0 &&
+            first_effects.saturation_min[6] == -5.0 &&
+            first_effects.saturation_max[6] == 5.0 &&
+            first_effects.sensor_delay_steps[0] == 2u &&
+            first_effects.sensor_stuck_enabled[4] != 0,
+        "fault_matrix_sensor_effects");
+    failures += expect(
+        first_effects.actuator_command_bias[0] == 1.5 &&
+            first_effects.actuator_rate_limit_scale[1] == 0.5 &&
+            first_effects.actuator_position_limit_scale[2] == 0.6 &&
+            first_effects.actuator_delay_steps[0] == 2u &&
+            first_effects.actuator_disabled[1] != 0,
+        "fault_matrix_actuator_effects");
+    failures += expect(
+        first_effects.communication_drop_enabled != 0 &&
+            first_effects.communication_duplicate_enabled != 0 &&
+            first_effects.communication_corrupt_enabled != 0,
+        "fault_matrix_communication_effects");
+
+    (void)memset(&sensor, 0, sizeof(sensor));
+    sensor.missile_vel_ecef_meas = vec3_make(100.0, -100.0, 1.0);
+    fault_injection_apply_sensor(&first_effects, &sensor);
+    failures += expect(
+        sensor.missile_vel_ecef_meas.x == 5.0 &&
+            sensor.missile_vel_ecef_meas.y == -5.0 &&
+            sensor.missile_vel_ecef_meas.z == 1.0 &&
+            (sensor.sensor_fault_flags & SIM_SENSOR_FAULT_SATURATED) != 0u,
+        "fault_matrix_saturation_apply");
+    (void)memset(actuators, 0, sizeof(actuators));
+    fault_injection_apply_actuators(&first_effects, actuators, commands);
+    failures += expect_near(commands[0], 11.5, 1.0e-12, "fault_matrix_actuator_bias_apply");
+    failures += expect_near(commands[1], 0.0, 1.0e-12, "fault_matrix_actuator_disabled_apply");
+    failures += expect(
+        (actuators[0].fault_flags & ACTUATOR_FAULT_DELAYED) != 0u &&
+            (actuators[1].fault_flags & ACTUATOR_FAULT_DISABLED) != 0u &&
+            (actuators[1].fault_flags & ACTUATOR_FAULT_RATE_LIMIT_DEGRADED) != 0u &&
+            (actuators[2].fault_flags & ACTUATOR_FAULT_POSITION_LIMIT_DEGRADED) != 0u,
+        "fault_matrix_actuator_flags");
+    return failures;
+}
+
+/** @brief 验证匀速、脚本机动步内边界积分和配置拒绝。 */
+static int test_target_model(void)
+{
+    char scripted_json[] =
+        "{\"target\":{\"model\":\"SCRIPTED\",\"maneuvers\":[{"
+        "\"start_time_s\":0.25,\"duration_s\":0.5,"
+        "\"acceleration_ecef_mps2\":[2,0,0]}]}}";
+    char invalid_json[] = "{\"target\":{\"model\":\"SCRIPTED\"}}";
+    ConfigTree scripted_config = { scripted_json, sizeof(scripted_json) - 1u };
+    ConfigTree invalid_config = { invalid_json, sizeof(invalid_json) - 1u };
+    TargetModel model;
+    Vec3 position = vec3_make(0.0, 0.0, 0.0);
+    Vec3 velocity = vec3_make(1.0, 0.0, 0.0);
+    int failures = 0;
+
+    failures += expect(
+        target_model_load_config(&scripted_config, &model) == SIM_OK &&
+            model.type == TARGET_MODEL_SCRIPTED_ACCELERATION &&
+            model.maneuver_count == 1u,
+        "target_model_scripted_load");
+    failures += expect(
+        target_model_step(&model, 0.0, 1.0, &position, &velocity) == SIM_OK,
+        "target_model_scripted_step");
+    failures += expect_near(position.x, 1.5, 1.0e-12, "target_model_piecewise_position");
+    failures += expect_near(velocity.x, 2.0, 1.0e-12, "target_model_piecewise_velocity");
+    failures += expect(
+        target_model_load_config(&invalid_config, &model) == SIM_ERR_CONFIG,
+        "target_model_reject_empty_script");
+
+    (void)memset(&model, 0, sizeof(model));
+    position = vec3_make(0.0, 0.0, 0.0);
+    velocity = vec3_make(1.0, 2.0, 3.0);
+    failures += expect(
+        target_model_step(&model, 0.0, 2.0, &position, &velocity) == SIM_OK,
+        "target_model_constant_step");
+    failures += expect_near(position.x, 2.0, 1.0e-12, "target_model_constant_x");
+    failures += expect_near(position.y, 4.0, 1.0e-12, "target_model_constant_y");
+    failures += expect(
+        target_model_step(&model, DBL_MAX, DBL_MAX, &position, &velocity) ==
+            SIM_ERR_OUT_OF_RANGE,
+        "target_model_reject_time_overflow");
+    return failures;
+}
+
+/** @brief 验证端点均在命中半径外时仍可检出步间高速穿越。 */
+static int test_continuous_hit_detect(void)
+{
+    HitDetectResult result;
+    int failures = 0;
+
+    failures += expect(
+        hit_detect_segment(
+            vec3_make(-10.0, 0.0, 0.0),
+            vec3_make(10.0, 0.0, 0.0),
+            vec3_make(0.0, 0.0, 0.0),
+            vec3_make(0.0, 0.0, 0.0),
+            1.0,
+            &result) == SIM_OK &&
+            result.hit != 0,
+        "hit_detect_tunneling");
+    failures += expect_near(result.minimum_range_m, 0.0, 1.0e-12, "hit_detect_minimum");
+    failures += expect_near(result.closest_fraction, 0.5, 1.0e-12, "hit_detect_fraction");
+    failures += expect(
+        hit_detect_segment(
+            vec3_make(-10.0, 5.0, 0.0),
+            vec3_make(10.0, 5.0, 0.0),
+            vec3_make(0.0, 0.0, 0.0),
+            vec3_make(0.0, 0.0, 0.0),
+            1.0,
+            &result) == SIM_OK &&
+            result.hit == 0,
+        "hit_detect_miss");
+    failures += expect_near(result.minimum_range_m, 5.0, 1.0e-12, "hit_detect_miss_distance");
+    return failures;
+}
+
 /** @brief 运行环境基础模型单元测试。 */
 int main(void)
 {
@@ -1574,8 +2168,11 @@ int main(void)
     failures += test_line_of_sight();
     failures += test_actuator();
     failures += test_force_models();
+    failures += test_mass_properties_evolution();
+    failures += test_wind_model();
     failures += test_aero_database();
     failures += test_aero_database_file_and_model();
+    failures += test_aero_database_v2();
     failures += test_aero_surrogate_file_and_model();
     failures += test_environment_force_model();
     failures += test_environment_force_model_aero_table();
@@ -1586,7 +2183,11 @@ int main(void)
     failures += test_fault_injection();
     failures += test_fault_injection_rejects_bad_config();
     failures += test_fault_injection_communication_recovery_hold();
+    failures += test_fault_injection_communication_burst_and_jitter();
     failures += test_fault_injection_drift();
     failures += test_fault_injection_ramp_bias();
+    failures += test_fault_injection_professional_matrix();
+    failures += test_target_model();
+    failures += test_continuous_hit_detect();
     return failures == 0 ? 0 : 1;
 }

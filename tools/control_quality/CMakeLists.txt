@@ -1,0 +1,2 @@
+add_executable(control_quality_report src/main.c)
+target_link_libraries(control_quality_report PRIVATE missile_flight_control missile_common m)

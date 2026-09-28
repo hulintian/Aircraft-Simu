@@ -4,6 +4,7 @@
 #include "env/env_app.h"
 #include "env/env_config.h"
 
+#include "common/build_info.h"
 #include "common/status.h"
 
 #include <stdio.h>
@@ -13,8 +14,21 @@
 static void print_usage(const char *argv0)
 {
     (void)printf(
-        "usage: %s [--instance-id N] [--scenario PATH] [--runtime PATH] [--faults PATH] [--random-seed N]\n",
+        "usage: %s [--help] [--version] [--instance-id N] [--scenario PATH] "
+        "[--runtime PATH] [--faults PATH] [--random-seed N]\n",
         argv0);
+}
+
+/** @brief 打印软件和协议版本。 */
+static void print_version(void)
+{
+    (void)printf(
+        "environment_sim missile_sim %d.%d.%d protocol %d.%d\n",
+        MISSILE_SIM_VERSION_MAJOR,
+        MISSILE_SIM_VERSION_MINOR,
+        MISSILE_SIM_VERSION_PATCH,
+        MISSILE_SIM_PROTOCOL_VERSION_MAJOR,
+        MISSILE_SIM_PROTOCOL_VERSION_MINOR);
 }
 
 /** @brief 解析环境进程参数并运行指定实例。 */
@@ -34,6 +48,10 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[i], "--version") == 0) {
+            print_version();
             return 0;
         }
         if (strcmp(argv[i], "--instance-id") == 0 && (i + 1) < argc) {

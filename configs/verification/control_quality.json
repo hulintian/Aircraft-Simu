@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "maneuvers": {
+    "dt_s": 0.01,
+    "duration_s": 3.0,
+    "target_accel_mps2": 40.0,
+    "closing_velocity_mps": 100.0,
+    "step_time_s": 0.5,
+    "reversal_time_s": 1.0,
+    "dropout_start_s": 1.0,
+    "dropout_duration_s": 0.5
+  },
+  "criteria": {
+    "settling_band_fraction": 0.02,
+    "max_rise_time_s": 0.10,
+    "max_step_settling_time_s": 0.20,
+    "max_reversal_settling_time_s": 0.20,
+    "max_recovery_settling_time_s": 0.25,
+    "max_overshoot_percent": 1.0,
+    "max_steady_state_error": 0.01,
+    "max_saturation_fraction": 0.10,
+    "rate_tolerance_fraction": 0.000001
+  }
+}

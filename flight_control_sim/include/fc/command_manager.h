@@ -19,6 +19,10 @@ typedef struct CommandManager {
     ControlCommand last_command;
     /** @brief 最近一次输出是否有效。 */
     int has_last_command;
+    /** @brief 最近一条非保持自动驾驶仪命令的仿真时间，单位 s。 */
+    double last_fresh_command_time;
+    /** @brief 是否已经接收过非保持自动驾驶仪命令。 */
+    int has_fresh_command;
     /** @brief 最大加速度指令范数，单位 m/s^2。 */
     double max_accel_mps2;
     /** @brief 最大加速度变化率，单位 m/s^3。 */

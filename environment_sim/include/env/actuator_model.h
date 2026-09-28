@@ -13,6 +13,14 @@
 
 /** @brief 执行机构卡滞故障。 */
 #define ACTUATOR_FAULT_STUCK UINT32_C(0x00000001)
+/** @brief 执行机构驱动失能，命令被强制为中立值。 */
+#define ACTUATOR_FAULT_DISABLED UINT32_C(0x00000002)
+/** @brief 执行机构速率能力被故障脚本降低。 */
+#define ACTUATOR_FAULT_RATE_LIMIT_DEGRADED UINT32_C(0x00000004)
+/** @brief 执行机构位置行程被故障脚本降低。 */
+#define ACTUATOR_FAULT_POSITION_LIMIT_DEGRADED UINT32_C(0x00000008)
+/** @brief 执行机构命令经过故障延迟线。 */
+#define ACTUATOR_FAULT_DELAYED UINT32_C(0x00000010)
 
 /** @brief 单个执行机构的连续时间状态。 */
 typedef struct ActuatorState {

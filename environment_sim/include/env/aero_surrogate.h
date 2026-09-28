@@ -30,6 +30,12 @@ typedef struct AeroSurrogateCoefficients {
 
 /** @brief 固定格式线性代理模型。 */
 typedef struct AeroSurrogateModel {
+    double mach_min;
+    double mach_max;
+    double alpha_min_rad;
+    double alpha_max_rad;
+    double beta_min_rad;
+    double beta_max_rad;
     AeroSurrogateLinearTerm cx;
     AeroSurrogateLinearTerm cy;
     AeroSurrogateLinearTerm cz;

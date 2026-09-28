@@ -6,14 +6,17 @@
 #include "common/math_constants.h"
 #include "common/matrix3.h"
 #include "common/packet.h"
+#include "common/provenance.h"
 #include "common/quaternion.h"
 #include "common/random.h"
+#include "common/realtime_pacer.h"
 #include "common/ring_buffer.h"
 #include "common/vec3.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 /** @brief 记录布尔断言结果并返回失败计数增量。 */
 static int expect_int(int condition, const char *name)
@@ -29,6 +32,16 @@ static int expect_int(int condition, const char *name)
 static int expect_near(double actual, double expected, double tolerance, const char *name)
 {
     return expect_int(fabs(actual - expected) <= tolerance, name);
+}
+
+/** @brief common 配置未知字段测试回调。 */
+static void count_unknown_key(const char *object_path, const char *key, void *user_data)
+{
+    size_t *count = (size_t *)user_data;
+
+    if (object_path != 0 && key != 0 && count != 0) {
+        ++*count;
+    }
 }
 
 /** @brief 验证向量点积、叉积和范数。 */
@@ -244,6 +257,7 @@ static int test_packet(void)
     {
         unsigned char wire[SIM_HEARTBEAT_PACKET_WIRE_SIZE];
         PacketHeader decoded;
+        PacketHeader peeked;
         size_t wire_size = 0u;
 
         failures += expect_int(
@@ -256,8 +270,44 @@ static int test_packet(void)
         failures += expect_int(decoded.type == (uint16_t)PACKET_HEARTBEAT, "heartbeat_packet_type");
         failures += expect_int(decoded.seq == 99u, "heartbeat_packet_seq");
         failures += expect_int(
+            packet_peek_header(wire, wire_size, &peeked) == SIM_OK && peeked.seq == 99u,
+            "packet_peek_header");
+        wire[6] = 1u;
+        wire[7] = 0u;
+        failures += expect_int(
+            packet_decode_heartbeat(wire, wire_size, 5u, &decoded) == SIM_OK &&
+                packet_peek_header(wire, wire_size, &peeked) == SIM_OK &&
+                peeked.version_minor == 1u,
+            "packet_minor_version_compatible");
+        failures += expect_int(
             packet_decode_heartbeat(wire, wire_size, 6u, &decoded) == SIM_ERR_BAD_PACKET,
             "heartbeat_packet_instance");
+    }
+    {
+        unsigned char wire[SIM_SIM_CONTROL_PACKET_WIRE_SIZE];
+        PacketHeader decoded;
+        SimControlAction action = (SimControlAction)0;
+        size_t wire_size = 0u;
+
+        failures += expect_int(
+            packet_encode_sim_control(
+                8u,
+                123u,
+                4.5,
+                SIM_CONTROL_STOP,
+                wire,
+                sizeof(wire),
+                &wire_size) == SIM_OK && wire_size == SIM_SIM_CONTROL_PACKET_WIRE_SIZE,
+            "sim_control_packet_encode");
+        failures += expect_int(
+            packet_decode_sim_control(wire, wire_size, 8u, &decoded, &action) == SIM_OK &&
+                action == SIM_CONTROL_STOP && decoded.seq == 123u,
+            "sim_control_packet_decode");
+        wire[wire_size - 1u] ^= 1u;
+        failures += expect_int(
+            packet_decode_sim_control(wire, wire_size, 8u, &decoded, &action) ==
+                SIM_ERR_BAD_PACKET,
+            "sim_control_packet_crc");
     }
     return failures;
 }
@@ -317,6 +367,130 @@ static int test_config(void)
         config_get_string(&valid, "faults[0].target", target, sizeof(target)) == SIM_OK &&
             strcmp(target, "sensor.seeker") == 0,
         "config_array_object_string");
+    {
+        int exists = 0;
+
+        failures += expect_int(
+            config_path_exists(&valid, "faults[0].target", &exists) == SIM_OK && exists != 0,
+            "config_path_exists_present");
+        failures += expect_int(
+            config_path_exists(&valid, "faults[0].missing", &exists) == SIM_OK && exists == 0,
+            "config_path_exists_absent");
+    }
+    {
+        const char *const allowed[] = { "dt" };
+        size_t callback_count = 0u;
+        size_t unknown_count = 0u;
+
+        failures += expect_int(
+            config_visit_unknown_keys(
+                &valid,
+                "simulation",
+                allowed,
+                sizeof(allowed) / sizeof(allowed[0]),
+                count_unknown_key,
+                &callback_count,
+                &unknown_count) == SIM_OK &&
+                callback_count == 0u && unknown_count == 0u,
+            "config_unknown_keys_none");
+    }
+    {
+        const char *const allowed[] = { "schema_version", "simulation" };
+        size_t callback_count = 0u;
+        size_t unknown_count = 0u;
+
+        failures += expect_int(
+            config_visit_unknown_keys(
+                &valid,
+                "",
+                allowed,
+                sizeof(allowed) / sizeof(allowed[0]),
+                count_unknown_key,
+                &callback_count,
+                &unknown_count) == SIM_OK &&
+                callback_count == 4u && unknown_count == 4u,
+            "config_unknown_keys_reported");
+    }
+    return failures;
+}
+
+/** @brief 验证单调计时和实时节拍状态，不把墙钟反馈到仿真时间。 */
+static int test_realtime_pacer(void)
+{
+    int failures = 0;
+    RealtimePacer pacer;
+    double before = 0.0;
+    double after = 0.0;
+    double sleep_s = -1.0;
+    double overrun_s = -1.0;
+
+    failures += expect_int(monotonic_time_now(&before) == SIM_OK, "monotonic_time_before");
+    failures += expect_int(
+        realtime_pacer_init(&pacer, 0.002, 1) == SIM_OK,
+        "realtime_pacer_init");
+    failures += expect_int(
+        realtime_pacer_wait_next(&pacer, &sleep_s, &overrun_s) == SIM_OK,
+        "realtime_pacer_wait");
+    failures += expect_int(monotonic_time_now(&after) == SIM_OK, "monotonic_time_after");
+    failures += expect_int(after >= before, "monotonic_time_order");
+    failures += expect_int(
+        pacer.wait_count == 1u && sleep_s >= 0.0 && overrun_s >= 0.0,
+        "realtime_pacer_stats");
+    failures += expect_int(
+        realtime_pacer_init(&pacer, 0.002, 0) == SIM_OK &&
+            realtime_pacer_wait_next(&pacer, &sleep_s, &overrun_s) == SIM_OK &&
+            sleep_s == 0.0 && overrun_s == 0.0,
+        "realtime_pacer_disabled");
+    failures += expect_int(
+        realtime_pacer_init(&pacer, 0.0, 1) == SIM_ERR_INVALID_ARG,
+        "realtime_pacer_invalid_period");
+    return failures;
+}
+
+/** @brief 验证流式 CRC、文件大小和 JSON 字符串转义。 */
+static int test_provenance(void)
+{
+    static const char payload[] = "provenance-test\n";
+    char input_path[128];
+    char json_path[128];
+    char json_text[128];
+    FILE *file;
+    uint32_t file_crc = 0u;
+    uint64_t file_size = 0u;
+    size_t got;
+    int failures = 0;
+
+    (void)snprintf(input_path, sizeof(input_path), "/tmp/missile_provenance_%ld.bin", (long)getpid());
+    (void)snprintf(json_path, sizeof(json_path), "/tmp/missile_provenance_%ld.json", (long)getpid());
+    file = fopen(input_path, "wb");
+    failures += expect_int(
+        file != 0 && fwrite(payload, 1u, sizeof(payload) - 1u, file) == sizeof(payload) - 1u,
+        "provenance_write_fixture");
+    if (file != 0) {
+        failures += expect_int(fclose(file) == 0, "provenance_close_fixture");
+    }
+    failures += expect_int(
+        provenance_file_crc32(input_path, &file_crc, &file_size) == SIM_OK &&
+            file_crc == crc32_compute(payload, sizeof(payload) - 1u) &&
+            file_size == sizeof(payload) - 1u,
+        "provenance_file_crc");
+
+    file = fopen(json_path, "wb");
+    failures += expect_int(
+        file != 0 && provenance_write_json_string(file, "a\"b\\c\n") == SIM_OK,
+        "provenance_json_write");
+    if (file != 0) {
+        failures += expect_int(fclose(file) == 0, "provenance_json_close");
+    }
+    file = fopen(json_path, "rb");
+    got = file == 0 ? 0u : fread(json_text, 1u, sizeof(json_text) - 1u, file);
+    if (file != 0) {
+        (void)fclose(file);
+    }
+    json_text[got] = '\0';
+    failures += expect_int(strcmp(json_text, "\"a\\\"b\\\\c\\n\"") == 0, "provenance_json_value");
+    (void)unlink(input_path);
+    (void)unlink(json_path);
     return failures;
 }
 
@@ -331,6 +505,8 @@ int main(void)
     failures += test_ring_buffer();
     failures += test_packet();
     failures += test_config();
+    failures += test_realtime_pacer();
+    failures += test_provenance();
 
     return failures == 0 ? 0 : 1;
 }

@@ -260,6 +260,33 @@ static SimStatus validate_wire_header(
     return SIM_OK;
 }
 
+SimStatus packet_peek_header(
+    const unsigned char *data,
+    size_t data_size,
+    PacketHeader *out_header)
+{
+    PacketReader reader = { data, data_size, 0u };
+    PacketHeader header;
+    SimStatus status;
+
+    if (data == 0 || out_header == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (data_size < SIM_PACKET_HEADER_WIRE_SIZE) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    status = decode_header(&reader, &header);
+    if (status != SIM_OK || header.magic != SIM_PACKET_MAGIC ||
+        header.header_size != SIM_PACKET_HEADER_WIRE_SIZE ||
+        header.version_major != MISSILE_SIM_PROTOCOL_VERSION_MAJOR ||
+        !isfinite(header.sim_time) ||
+        (size_t)header.payload_size + SIM_PACKET_HEADER_WIRE_SIZE != data_size) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    *out_header = header;
+    return SIM_OK;
+}
+
 /** @brief 检查传感器帧所有浮点字段是否有效。 */
 static int sensor_frame_isfinite(const SensorFrame *frame)
 {
@@ -710,6 +737,95 @@ SimStatus packet_decode_heartbeat(
     }
     if (status == SIM_OK) {
         *out_header = header;
+    }
+    return status;
+}
+
+SimStatus packet_encode_sim_control(
+    uint32_t instance_id,
+    uint32_t seq,
+    double sim_time,
+    SimControlAction action,
+    unsigned char *out,
+    size_t out_capacity,
+    size_t *out_size)
+{
+    unsigned char payload[SIM_SIM_CONTROL_PAYLOAD_WIRE_SIZE];
+    PacketWriter payload_writer = { payload, sizeof(payload), 0u };
+    PacketWriter packet_writer = { out, out_capacity, 0u };
+    PacketHeader header;
+    SimStatus status;
+
+    if (out == 0 || out_size == 0 || !isfinite(sim_time) || action != SIM_CONTROL_STOP) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (out_capacity < SIM_SIM_CONTROL_PACKET_WIRE_SIZE) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    status = writer_u32(&payload_writer, (uint32_t)action);
+    if (status != SIM_OK || payload_writer.offset != SIM_SIM_CONTROL_PAYLOAD_WIRE_SIZE) {
+        return status == SIM_OK ? SIM_ERR_INTERNAL : status;
+    }
+    header = packet_header_make(
+        PACKET_SIM_CONTROL,
+        instance_id,
+        seq,
+        sim_time,
+        SIM_SIM_CONTROL_PAYLOAD_WIRE_SIZE,
+        crc32_compute(payload, sizeof(payload)));
+    status = encode_header(&packet_writer, &header);
+    if (status == SIM_OK) {
+        (void)memcpy(out + packet_writer.offset, payload, sizeof(payload));
+        packet_writer.offset += sizeof(payload);
+    }
+    if (status == SIM_OK && packet_writer.offset != SIM_SIM_CONTROL_PACKET_WIRE_SIZE) {
+        status = SIM_ERR_INTERNAL;
+    }
+    *out_size = packet_writer.offset;
+    return status;
+}
+
+SimStatus packet_decode_sim_control(
+    const unsigned char *data,
+    size_t data_size,
+    uint32_t expected_instance_id,
+    PacketHeader *out_header,
+    SimControlAction *action_out)
+{
+    PacketReader reader = { data, data_size, 0u };
+    PacketHeader header;
+    uint32_t action = 0u;
+    SimStatus status;
+
+    if (data == 0 || out_header == 0 || action_out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (data_size != SIM_SIM_CONTROL_PACKET_WIRE_SIZE) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    status = decode_header(&reader, &header);
+    if (status == SIM_OK) {
+        status = validate_wire_header(
+            &header,
+            PACKET_SIM_CONTROL,
+            expected_instance_id,
+            SIM_SIM_CONTROL_PAYLOAD_WIRE_SIZE);
+    }
+    if (status == SIM_OK &&
+        crc32_compute(data + SIM_PACKET_HEADER_WIRE_SIZE, SIM_SIM_CONTROL_PAYLOAD_WIRE_SIZE) !=
+            header.payload_crc32) {
+        status = SIM_ERR_BAD_PACKET;
+    }
+    if (status == SIM_OK) {
+        status = reader_u32(&reader, &action);
+    }
+    if (status == SIM_OK &&
+        (reader.offset != data_size || action != (uint32_t)SIM_CONTROL_STOP)) {
+        status = SIM_ERR_BAD_PACKET;
+    }
+    if (status == SIM_OK) {
+        *out_header = header;
+        *action_out = (SimControlAction)action;
     }
     return status;
 }

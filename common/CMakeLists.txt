@@ -7,8 +7,10 @@ set(COMMON_HEADERS
     include/common/matrix3.h
     include/common/packet.h
     include/common/protocol.h
+    include/common/provenance.h
     include/common/quaternion.h
     include/common/random.h
+    include/common/realtime_pacer.h
     include/common/ring_buffer.h
     include/common/sim_time.h
     include/common/status.h
@@ -22,8 +24,10 @@ set(COMMON_SOURCES
     src/matrix3.c
     src/packet.c
     src/protocol.c
+    src/provenance.c
     src/quaternion.c
     src/random.c
+    src/realtime_pacer.c
     src/ring_buffer.c
     src/sim_time.c
     src/status.c

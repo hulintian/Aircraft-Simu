@@ -39,6 +39,10 @@
 #define SIM_SENSOR_FAULT_SPEED_DROPOUT UINT32_C(0x00000010)
 /** @brief 至少一个传感器延迟线尚未积累足够历史样本。 */
 #define SIM_SENSOR_FAULT_DELAY_WARMUP UINT32_C(0x00000020)
+/** @brief 故障脚本注入了仍保持有效的退化测量。 */
+#define SIM_SENSOR_FAULT_INJECTED_DEGRADED UINT32_C(0x00000040)
+/** @brief 故障脚本将测量钳位到饱和边界。 */
+#define SIM_SENSOR_FAULT_SATURATED UINT32_C(0x00000080)
 
 /** @brief 报文类型枚举。
  *
@@ -51,6 +55,12 @@ typedef enum PacketType {
     PACKET_SIM_CONTROL = 4,
     PACKET_EVENT = 5
 } PacketType;
+
+/** @brief 仿真生命周期控制动作。 */
+typedef enum SimControlAction {
+    /** @brief 环境进程已结束本实例，飞控应完成日志并正常退出。 */
+    SIM_CONTROL_STOP = 1
+} SimControlAction;
 
 /** @brief 协议报文头。
  *

@@ -76,6 +76,34 @@ SimStatus aero_surrogate_load_file(const char *path, AeroSurrogateModel *model)
         return SIM_ERR_CONFIG;
     }
     (void)memset(model, 0, sizeof(*model));
+    {
+        char envelope_name[16];
+
+        if (fscanf(
+                file,
+                "%15s %lf %lf %lf %lf %lf %lf",
+                envelope_name,
+                &model->mach_min,
+                &model->mach_max,
+                &model->alpha_min_rad,
+                &model->alpha_max_rad,
+                &model->beta_min_rad,
+                &model->beta_max_rad) != 7 ||
+            strcmp(envelope_name, "envelope") != 0 ||
+            !isfinite(model->mach_min) ||
+            !isfinite(model->mach_max) ||
+            !isfinite(model->alpha_min_rad) ||
+            !isfinite(model->alpha_max_rad) ||
+            !isfinite(model->beta_min_rad) ||
+            !isfinite(model->beta_max_rad) ||
+            model->mach_min < 0.0 ||
+            model->mach_min >= model->mach_max ||
+            model->alpha_min_rad >= model->alpha_max_rad ||
+            model->beta_min_rad >= model->beta_max_rad) {
+            (void)fclose(file);
+            return SIM_ERR_CONFIG;
+        }
+    }
     for (index = 0u; index < 6u; ++index) {
         char name[8];
         AeroSurrogateLinearTerm term;
@@ -125,6 +153,12 @@ SimStatus aero_surrogate_evaluate(
         return SIM_ERR_INVALID_ARG;
     }
     if (!isfinite(mach) || mach < 0.0 || !isfinite(alpha_rad) || !isfinite(beta_rad) ||
+        !isfinite(model->mach_min) || !isfinite(model->mach_max) ||
+        !isfinite(model->alpha_min_rad) || !isfinite(model->alpha_max_rad) ||
+        !isfinite(model->beta_min_rad) || !isfinite(model->beta_max_rad) ||
+        model->mach_min < 0.0 || model->mach_min >= model->mach_max ||
+        model->alpha_min_rad >= model->alpha_max_rad ||
+        model->beta_min_rad >= model->beta_max_rad ||
         !term_is_finite(&model->cx) ||
         !term_is_finite(&model->cy) ||
         !term_is_finite(&model->cz) ||
@@ -132,6 +166,11 @@ SimStatus aero_surrogate_evaluate(
         !term_is_finite(&model->cm) ||
         !term_is_finite(&model->cn)) {
         return SIM_ERR_NUMERIC;
+    }
+    if (mach < model->mach_min || mach > model->mach_max ||
+        alpha_rad < model->alpha_min_rad || alpha_rad > model->alpha_max_rad ||
+        beta_rad < model->beta_min_rad || beta_rad > model->beta_max_rad) {
+        return SIM_ERR_OUT_OF_RANGE;
     }
     out->cx = term_evaluate(&model->cx, mach, alpha_rad, beta_rad);
     out->cy = term_evaluate(&model->cy, mach, alpha_rad, beta_rad);

@@ -7,6 +7,19 @@
 #include <stdio.h>
 #include <string.h>
 
+static double clamp_fault_value(double value, double minimum, double maximum)
+{
+    return value < minimum ? minimum : (value > maximum ? maximum : value);
+}
+
+static Vec3 clamp_fault_vec3(Vec3 value, double minimum, double maximum)
+{
+    return vec3_make(
+        clamp_fault_value(value.x, minimum, maximum),
+        clamp_fault_value(value.y, minimum, maximum),
+        clamp_fault_value(value.z, minimum, maximum));
+}
+
 /** @brief 构造 `faults[index].field` 路径。 */
 static SimStatus make_fault_path(
     size_t index,
@@ -209,9 +222,12 @@ static SimStatus parse_type(const char *text, FaultType *type)
     if (text == 0 || type == 0) {
         return SIM_ERR_INVALID_ARG;
     }
-    if (strcmp(text, "BIAS") == 0) {
+    if (strcmp(text, "BIAS") == 0 ||
+        strcmp(text, "SENSOR_FAULT_BIAS") == 0 ||
+        strcmp(text, "ACTUATOR_FAULT_BIAS") == 0) {
         *type = FAULT_TYPE_BIAS;
-    } else if (strcmp(text, "DROPOUT") == 0) {
+    } else if (strcmp(text, "DROPOUT") == 0 ||
+        strcmp(text, "SENSOR_FAULT_DROPOUT") == 0) {
         *type = FAULT_TYPE_DROPOUT;
     } else if (strcmp(text, "COMMUNICATION_LOSS") == 0 ||
         strcmp(text, "COMM_DROPOUT") == 0 ||
@@ -220,13 +236,16 @@ static SimStatus parse_type(const char *text, FaultType *type)
     } else if (strcmp(text, "FORCE_INVALID") == 0 ||
         strcmp(text, "INVALID") == 0) {
         *type = FAULT_TYPE_FORCE_INVALID;
-    } else if (strcmp(text, "STUCK") == 0) {
+    } else if (strcmp(text, "STUCK") == 0 ||
+        strcmp(text, "ACTUATOR_FAULT_STUCK") == 0) {
         *type = FAULT_TYPE_STUCK;
     } else if (strcmp(text, "SCALE") == 0) {
         *type = FAULT_TYPE_SCALE;
-    } else if (strcmp(text, "DRIFT") == 0) {
+    } else if (strcmp(text, "DRIFT") == 0 ||
+        strcmp(text, "SENSOR_FAULT_DRIFT") == 0) {
         *type = FAULT_TYPE_DRIFT;
     } else if (strcmp(text, "RAMP_BIAS") == 0 ||
+        strcmp(text, "SENSOR_FAULT_RAMP_BIAS") == 0 ||
         strcmp(text, "RAMP") == 0) {
         *type = FAULT_TYPE_RAMP_BIAS;
     } else if (strcmp(text, "HOLD_VALUE") == 0 ||
@@ -242,6 +261,42 @@ static SimStatus parse_type(const char *text, FaultType *type)
         strcmp(text, "FRAME_REORDER") == 0 ||
         strcmp(text, "PACKET_REORDER") == 0) {
         *type = FAULT_TYPE_COMMUNICATION_REORDER;
+    } else if (strcmp(text, "COMMUNICATION_JITTER") == 0 ||
+        strcmp(text, "COMM_JITTER") == 0 ||
+        strcmp(text, "FRAME_JITTER") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_JITTER;
+    } else if (strcmp(text, "NOISE_INCREASE") == 0 ||
+        strcmp(text, "SENSOR_FAULT_NOISE_INCREASE") == 0) {
+        *type = FAULT_TYPE_NOISE_INCREASE;
+    } else if (strcmp(text, "SATURATION") == 0 ||
+        strcmp(text, "SENSOR_FAULT_SATURATION") == 0) {
+        *type = FAULT_TYPE_SATURATION;
+    } else if (strcmp(text, "ACTUATOR_FAULT_RATE_LIMIT") == 0 ||
+        strcmp(text, "ACTUATOR_FAULT_RATE_LIMIT_DEGRADED") == 0) {
+        *type = FAULT_TYPE_ACTUATOR_RATE_LIMIT;
+    } else if (strcmp(text, "ACTUATOR_FAULT_POSITION_LIMIT_DEGRADED") == 0) {
+        *type = FAULT_TYPE_ACTUATOR_POSITION_LIMIT;
+    } else if (strcmp(text, "ACTUATOR_FAULT_DELAY") == 0) {
+        *type = FAULT_TYPE_ACTUATOR_DELAY;
+    } else if (strcmp(text, "ACTUATOR_FAULT_DISABLED") == 0) {
+        *type = FAULT_TYPE_ACTUATOR_DISABLED;
+    } else if (strcmp(text, "COMM_FAULT_DROP_PACKET") == 0 ||
+        strcmp(text, "DROP_PACKET") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_DROP;
+    } else if (strcmp(text, "COMM_FAULT_DUPLICATE_PACKET") == 0 ||
+        strcmp(text, "DUPLICATE_PACKET") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_DUPLICATE;
+    } else if (strcmp(text, "COMM_FAULT_CORRUPT_PACKET") == 0 ||
+        strcmp(text, "CORRUPT_PACKET") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_CORRUPT;
+    } else if (strcmp(text, "COMM_FAULT_DELAY_PACKET") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_DELAY;
+    } else if (strcmp(text, "COMM_FAULT_REORDER_PACKET") == 0) {
+        *type = FAULT_TYPE_COMMUNICATION_REORDER;
+    } else if (strcmp(text, "SENSOR_FAULT_DELAY") == 0) {
+        *type = FAULT_TYPE_SENSOR_DELAY;
+    } else if (strcmp(text, "SENSOR_FAULT_STUCK") == 0) {
+        *type = FAULT_TYPE_SENSOR_STUCK;
     } else {
         return SIM_ERR_CONFIG;
     }
@@ -321,6 +376,17 @@ static int target_actuator_index(FaultTarget target, size_t *index)
     return 0;
 }
 
+/** @brief 将可数值退化的传感器目标映射到连续通道索引。 */
+static int target_sensor_channel(FaultTarget target, size_t *index)
+{
+    if (index == 0 || target < FAULT_TARGET_SENSOR_SEEKER_RANGE ||
+        target > FAULT_TARGET_SENSOR_SPEED) {
+        return 0;
+    }
+    *index = (size_t)(target - FAULT_TARGET_SENSOR_SEEKER_RANGE);
+    return 1;
+}
+
 /** @brief 校验故障类型和目标对象是否匹配。 */
 static int fault_type_matches_target(const FaultDefinition *fault)
 {
@@ -339,6 +405,26 @@ static int fault_type_matches_target(const FaultDefinition *fault)
     if (fault->type == FAULT_TYPE_COMMUNICATION_REORDER) {
         return fault->target == FAULT_TARGET_SENSOR_FRAME;
     }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_JITTER) {
+        return fault->target == FAULT_TARGET_SENSOR_FRAME;
+    }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_DROP ||
+        fault->type == FAULT_TYPE_COMMUNICATION_DUPLICATE ||
+        fault->type == FAULT_TYPE_COMMUNICATION_CORRUPT) {
+        return fault->target == FAULT_TARGET_SENSOR_FRAME;
+    }
+    if (fault->type == FAULT_TYPE_NOISE_INCREASE ||
+        fault->type == FAULT_TYPE_SATURATION ||
+        fault->type == FAULT_TYPE_SENSOR_DELAY ||
+        fault->type == FAULT_TYPE_SENSOR_STUCK) {
+        return target_sensor_channel(fault->target, &actuator_index);
+    }
+    if (fault->type == FAULT_TYPE_ACTUATOR_RATE_LIMIT ||
+        fault->type == FAULT_TYPE_ACTUATOR_POSITION_LIMIT ||
+        fault->type == FAULT_TYPE_ACTUATOR_DELAY ||
+        fault->type == FAULT_TYPE_ACTUATOR_DISABLED) {
+        return target_actuator_index(fault->target, &actuator_index);
+    }
     if (fault->type == FAULT_TYPE_STUCK ||
         fault->type == FAULT_TYPE_SCALE) {
         return target_actuator_index(fault->target, &actuator_index);
@@ -356,6 +442,10 @@ static int fault_type_matches_target(const FaultDefinition *fault)
         default:
             return 0;
         }
+    }
+    if (fault->type == FAULT_TYPE_BIAS &&
+        target_actuator_index(fault->target, &actuator_index)) {
+        return 1;
     }
     if (fault->type != FAULT_TYPE_BIAS &&
         fault->type != FAULT_TYPE_DRIFT &&
@@ -385,19 +475,25 @@ static int fault_is_sensor_frame_communication(const FaultDefinition *fault)
     return fault->type == FAULT_TYPE_DROPOUT ||
         fault->type == FAULT_TYPE_FORCE_INVALID ||
         fault->type == FAULT_TYPE_COMMUNICATION_DELAY ||
-        fault->type == FAULT_TYPE_COMMUNICATION_REORDER;
+        fault->type == FAULT_TYPE_COMMUNICATION_REORDER ||
+        fault->type == FAULT_TYPE_COMMUNICATION_JITTER ||
+        fault->type == FAULT_TYPE_COMMUNICATION_DROP ||
+        fault->type == FAULT_TYPE_COMMUNICATION_DUPLICATE ||
+        fault->type == FAULT_TYPE_COMMUNICATION_CORRUPT;
 }
 
 /** @brief 将单条激活故障累加到本步效果。 */
 static SimStatus accumulate_fault(
-    const FaultDefinition *fault,
+    FaultInjection *faults,
+    FaultDefinition *fault,
     double sim_time_s,
     FaultStepEffects *effects)
 {
     size_t actuator_index;
+    size_t sensor_channel;
     double value_scale = 1.0;
 
-    if (fault == 0 || effects == 0 || !isfinite(sim_time_s)) {
+    if (faults == 0 || fault == 0 || effects == 0 || !isfinite(sim_time_s)) {
         return SIM_ERR_INVALID_ARG;
     }
     ++effects->active_fault_count;
@@ -418,6 +514,30 @@ static SimStatus accumulate_fault(
         effects->communication_reorder_enabled = 1;
         return SIM_OK;
     }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_JITTER) {
+        const unsigned int delay_steps =
+            fault->delay_pattern_steps[fault->delay_pattern_index];
+
+        effects->communication_delay_enabled = 1;
+        if (delay_steps > effects->communication_delay_steps) {
+            effects->communication_delay_steps = delay_steps;
+        }
+        fault->delay_pattern_index =
+            (fault->delay_pattern_index + 1u) % fault->delay_pattern_count;
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_DROP) {
+        effects->communication_drop_enabled = 1;
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_DUPLICATE) {
+        effects->communication_duplicate_enabled = 1;
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_COMMUNICATION_CORRUPT) {
+        effects->communication_corrupt_enabled = 1;
+        return SIM_OK;
+    }
     if (fault->type == FAULT_TYPE_STUCK) {
         if (!target_actuator_index(fault->target, &actuator_index)) {
             return SIM_ERR_CONFIG;
@@ -430,6 +550,131 @@ static SimStatus accumulate_fault(
             return SIM_ERR_CONFIG;
         }
         effects->actuator_command_scale[actuator_index] *= fault->scale;
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_ACTUATOR_RATE_LIMIT ||
+        fault->type == FAULT_TYPE_ACTUATOR_POSITION_LIMIT ||
+        fault->type == FAULT_TYPE_ACTUATOR_DELAY ||
+        fault->type == FAULT_TYPE_ACTUATOR_DISABLED ||
+        (fault->type == FAULT_TYPE_BIAS &&
+            target_actuator_index(fault->target, &actuator_index))) {
+        if (!target_actuator_index(fault->target, &actuator_index)) {
+            return SIM_ERR_CONFIG;
+        }
+        if (fault->type == FAULT_TYPE_ACTUATOR_RATE_LIMIT) {
+            effects->actuator_rate_limit_scale[actuator_index] *= fault->scale;
+        } else if (fault->type == FAULT_TYPE_ACTUATOR_POSITION_LIMIT) {
+            effects->actuator_position_limit_scale[actuator_index] *= fault->scale;
+        } else if (fault->type == FAULT_TYPE_ACTUATOR_DELAY) {
+            if (fault->delay_steps > effects->actuator_delay_steps[actuator_index]) {
+                effects->actuator_delay_steps[actuator_index] = fault->delay_steps;
+            }
+        } else if (fault->type == FAULT_TYPE_ACTUATOR_DISABLED) {
+            effects->actuator_disabled[actuator_index] = 1;
+        } else {
+            effects->actuator_command_bias[actuator_index] += fault->scalar_value;
+        }
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_SENSOR_DELAY ||
+        fault->type == FAULT_TYPE_SENSOR_STUCK) {
+        if (!target_sensor_channel(fault->target, &sensor_channel)) {
+            return SIM_ERR_CONFIG;
+        }
+        if (fault->type == FAULT_TYPE_SENSOR_DELAY) {
+            if (fault->delay_steps > effects->sensor_delay_steps[sensor_channel]) {
+                effects->sensor_delay_steps[sensor_channel] = fault->delay_steps;
+            }
+        } else {
+            effects->sensor_stuck_enabled[sensor_channel] = 1;
+        }
+        effects->sensor_fault_set_mask |= SIM_SENSOR_FAULT_INJECTED_DEGRADED;
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_NOISE_INCREASE) {
+        if (!target_sensor_channel(fault->target, &sensor_channel)) {
+            return SIM_ERR_CONFIG;
+        }
+        effects->sensor_fault_set_mask |= SIM_SENSOR_FAULT_INJECTED_DEGRADED;
+        switch (fault->target) {
+        case FAULT_TARGET_SENSOR_SEEKER_RANGE:
+            effects->seeker_range_bias_m += sim_random_normal(
+                &faults->random,
+                0.0,
+                fault->scalar_value);
+            break;
+        case FAULT_TARGET_SENSOR_SEEKER_LOS_UNIT:
+            effects->seeker_los_unit_bias = vec3_add(
+                effects->seeker_los_unit_bias,
+                vec3_make(
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.x),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.y),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.z)));
+            break;
+        case FAULT_TARGET_SENSOR_SEEKER_LOS_RATE:
+            effects->seeker_los_rate_bias_radps = vec3_add(
+                effects->seeker_los_rate_bias_radps,
+                vec3_make(
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.x),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.y),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.z)));
+            break;
+        case FAULT_TARGET_SENSOR_SEEKER_CLOSING_VELOCITY:
+            effects->seeker_closing_velocity_bias_mps += sim_random_normal(
+                &faults->random,
+                0.0,
+                fault->scalar_value);
+            break;
+        case FAULT_TARGET_SENSOR_IMU_GYRO:
+            effects->gyro_bias_b_radps = vec3_add(
+                effects->gyro_bias_b_radps,
+                vec3_make(
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.x),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.y),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.z)));
+            break;
+        case FAULT_TARGET_SENSOR_ACCEL:
+            effects->accel_bias_ecef_mps2 = vec3_add(
+                effects->accel_bias_ecef_mps2,
+                vec3_make(
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.x),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.y),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.z)));
+            break;
+        case FAULT_TARGET_SENSOR_SPEED:
+            effects->speed_bias_ecef_mps = vec3_add(
+                effects->speed_bias_ecef_mps,
+                vec3_make(
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.x),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.y),
+                    sim_random_normal(&faults->random, 0.0, fault->vector_value.z)));
+            break;
+        default:
+            return SIM_ERR_CONFIG;
+        }
+        return SIM_OK;
+    }
+    if (fault->type == FAULT_TYPE_SATURATION) {
+        if (!target_sensor_channel(fault->target, &sensor_channel)) {
+            return SIM_ERR_CONFIG;
+        }
+        if (effects->saturation_enabled[sensor_channel] == 0) {
+            effects->saturation_min[sensor_channel] = fault->minimum_value;
+            effects->saturation_max[sensor_channel] = fault->maximum_value;
+            effects->saturation_enabled[sensor_channel] = 1;
+        } else {
+            if (fault->minimum_value > effects->saturation_min[sensor_channel]) {
+                effects->saturation_min[sensor_channel] = fault->minimum_value;
+            }
+            if (fault->maximum_value < effects->saturation_max[sensor_channel]) {
+                effects->saturation_max[sensor_channel] = fault->maximum_value;
+            }
+            if (effects->saturation_min[sensor_channel] >
+                effects->saturation_max[sensor_channel]) {
+                return SIM_ERR_CONFIG;
+            }
+        }
+        effects->sensor_fault_set_mask |= SIM_SENSOR_FAULT_SATURATED;
         return SIM_OK;
     }
     if (fault->type == FAULT_TYPE_HOLD_VALUE) {
@@ -549,6 +794,7 @@ static int fault_is_active(const FaultDefinition *fault, double sim_time_s)
 {
     const double epsilon = 1.0e-12;
     double end_time_s;
+    double phase_s;
 
     if (fault == 0 || fault->enabled == 0) {
         return 0;
@@ -560,14 +806,32 @@ static int fault_is_active(const FaultDefinition *fault, double sim_time_s)
     if (fault_is_sensor_frame_communication(fault) != 0) {
         end_time_s += fault->recovery_hold_s;
     }
-    return sim_time_s + epsilon >= fault->start_time_s &&
-        sim_time_s < end_time_s - epsilon;
+    if (sim_time_s + epsilon < fault->start_time_s ||
+        sim_time_s >= end_time_s - epsilon) {
+        return 0;
+    }
+    if (fault->burst_period_s <= 0.0) {
+        return 1;
+    }
+    phase_s = fmod(sim_time_s - fault->start_time_s, fault->burst_period_s);
+    if (phase_s < 0.0) {
+        phase_s += fault->burst_period_s;
+    }
+    return phase_s < epsilon || phase_s < fault->burst_active_s - epsilon;
 }
 
 void fault_injection_init_empty(FaultInjection *faults)
 {
     if (faults != 0) {
         (void)memset(faults, 0, sizeof(*faults));
+        sim_random_seed(&faults->random, UINT64_C(1));
+    }
+}
+
+void fault_injection_set_seed(FaultInjection *faults, uint64_t seed)
+{
+    if (faults != 0) {
+        sim_random_seed(&faults->random, seed);
     }
 }
 
@@ -599,6 +863,10 @@ SimStatus fault_injection_load_config(const ConfigTree *config, FaultInjection *
         double scalar = 0.0;
         Vec3 vector = vec3_make(0.0, 0.0, 0.0);
         int found = 0;
+        int burst_period_found = 0;
+        int burst_active_found = 0;
+        int minimum_found = 0;
+        int maximum_found = 0;
 
         fault->enabled = 1;
         (void)snprintf(fault->id, sizeof(fault->id), "fault_%02lu", (unsigned long)index);
@@ -683,6 +951,27 @@ SimStatus fault_injection_load_config(const ConfigTree *config, FaultInjection *
         if (found == 0) {
             fault->recovery_hold_s = 0.0;
         }
+        status = get_optional_double(
+            config,
+            index,
+            "burst_period_s",
+            &fault->burst_period_s,
+            &burst_period_found);
+        if (status != SIM_OK) {
+            return status;
+        }
+        status = get_optional_double(
+            config,
+            index,
+            "burst_active_s",
+            &fault->burst_active_s,
+            &burst_active_found);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (burst_period_found != burst_active_found) {
+            return SIM_ERR_CONFIG;
+        }
         status = get_optional_double(config, index, "value", &scalar, &found);
         if (status != SIM_OK) {
             return status;
@@ -701,25 +990,113 @@ SimStatus fault_injection_load_config(const ConfigTree *config, FaultInjection *
         if (found == 0) {
             fault->scale = fault->scalar_value;
         }
-        if (fault->type == FAULT_TYPE_COMMUNICATION_DELAY) {
+        status = get_optional_double(
+            config,
+            index,
+            "min_value",
+            &fault->minimum_value,
+            &minimum_found);
+        if (status == SIM_OK) {
+            status = get_optional_double(
+                config,
+                index,
+                "max_value",
+                &fault->maximum_value,
+                &maximum_found);
+        }
+        if (status != SIM_OK || minimum_found != maximum_found) {
+            return status == SIM_OK ? SIM_ERR_CONFIG : status;
+        }
+        if (fault->type == FAULT_TYPE_COMMUNICATION_DELAY ||
+            fault->type == FAULT_TYPE_ACTUATOR_DELAY ||
+            fault->type == FAULT_TYPE_SENSOR_DELAY) {
+            const double max_delay = fault->type == FAULT_TYPE_COMMUNICATION_DELAY ?
+                (double)ENV_MAX_COMMUNICATION_DELAY_STEPS :
+                (fault->type == FAULT_TYPE_SENSOR_DELAY ?
+                    (double)ENV_MAX_SENSOR_DELAY_STEPS :
+                    (double)ENV_MAX_ACTUATOR_DELAY_STEPS);
+
             if (fault->scalar_value < 1.0 ||
-                fault->scalar_value > (double)ENV_MAX_COMMUNICATION_DELAY_STEPS ||
+                fault->scalar_value > max_delay ||
                 floor(fault->scalar_value) != fault->scalar_value) {
                 return SIM_ERR_OUT_OF_RANGE;
             }
             fault->delay_steps = (unsigned int)fault->scalar_value;
+        }
+        if (fault->type == FAULT_TYPE_COMMUNICATION_JITTER) {
+            char path[128];
+            double pattern[ENV_MAX_COMMUNICATION_JITTER_PATTERN];
+            size_t pattern_index;
+
+            status = make_fault_path(index, "delay_pattern_steps", path, sizeof(path));
+            if (status == SIM_OK) {
+                status = config_get_array_count(
+                    config,
+                    path,
+                    &fault->delay_pattern_count);
+            }
+            if (status != SIM_OK || fault->delay_pattern_count == 0u ||
+                fault->delay_pattern_count > ENV_MAX_COMMUNICATION_JITTER_PATTERN) {
+                return status == SIM_OK ? SIM_ERR_OUT_OF_RANGE : status;
+            }
+            status = config_get_double_array(
+                config,
+                path,
+                pattern,
+                fault->delay_pattern_count);
+            if (status != SIM_OK) {
+                return status;
+            }
+            for (pattern_index = 0u;
+                 pattern_index < fault->delay_pattern_count;
+                 ++pattern_index) {
+                if (pattern[pattern_index] < 1.0 ||
+                    pattern[pattern_index] > (double)ENV_MAX_COMMUNICATION_DELAY_STEPS ||
+                    floor(pattern[pattern_index]) != pattern[pattern_index]) {
+                    return SIM_ERR_OUT_OF_RANGE;
+                }
+                fault->delay_pattern_steps[pattern_index] =
+                    (unsigned int)pattern[pattern_index];
+            }
         }
         if (!isfinite(fault->start_time_s) || fault->start_time_s < 0.0 ||
             !isfinite(fault->duration_s) || fault->duration_s <= 0.0 ||
             !isfinite(fault->ramp_in_s) || fault->ramp_in_s < 0.0 ||
             !isfinite(fault->recovery_ramp_s) || fault->recovery_ramp_s < 0.0 ||
             !isfinite(fault->recovery_hold_s) || fault->recovery_hold_s < 0.0 ||
+            !isfinite(fault->burst_period_s) || fault->burst_period_s < 0.0 ||
+            !isfinite(fault->burst_active_s) || fault->burst_active_s < 0.0 ||
             !isfinite(fault->scalar_value) ||
             !vec3_isfinite(fault->vector_value) ||
-            !isfinite(fault->scale)) {
+            !isfinite(fault->scale) ||
+            (minimum_found != 0 &&
+                (!isfinite(fault->minimum_value) ||
+                    !isfinite(fault->maximum_value)))) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        if (fault->type == FAULT_TYPE_SATURATION &&
+            (minimum_found == 0 || fault->minimum_value > fault->maximum_value)) {
+            return minimum_found == 0 ? SIM_ERR_CONFIG : SIM_ERR_OUT_OF_RANGE;
+        }
+        if (fault->type == FAULT_TYPE_NOISE_INCREASE &&
+            (fault->scalar_value < 0.0 || fault->vector_value.x < 0.0 ||
+                fault->vector_value.y < 0.0 || fault->vector_value.z < 0.0)) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        if ((fault->type == FAULT_TYPE_ACTUATOR_RATE_LIMIT ||
+                fault->type == FAULT_TYPE_ACTUATOR_POSITION_LIMIT) &&
+            (fault->scale < 0.0 || fault->scale > 1.0)) {
             return SIM_ERR_OUT_OF_RANGE;
         }
         if (fault->recovery_hold_s > 0.0 && fault_is_sensor_frame_communication(fault) == 0) {
+            return SIM_ERR_CONFIG;
+        }
+        if (burst_period_found != 0 &&
+            (fault->burst_active_s <= 0.0 ||
+                fault->burst_period_s <= 0.0 ||
+                fault->burst_active_s > fault->burst_period_s ||
+                fault_is_sensor_frame_communication(fault) == 0 ||
+                fault->recovery_hold_s > 0.0)) {
             return SIM_ERR_CONFIG;
         }
         if (!fault_type_matches_target(fault)) {
@@ -747,6 +1124,12 @@ SimStatus fault_injection_update(
     effects->actuator_command_scale[0] = 1.0;
     effects->actuator_command_scale[1] = 1.0;
     effects->actuator_command_scale[2] = 1.0;
+    effects->actuator_rate_limit_scale[0] = 1.0;
+    effects->actuator_rate_limit_scale[1] = 1.0;
+    effects->actuator_rate_limit_scale[2] = 1.0;
+    effects->actuator_position_limit_scale[0] = 1.0;
+    effects->actuator_position_limit_scale[1] = 1.0;
+    effects->actuator_position_limit_scale[2] = 1.0;
     *transition_count = 0u;
     if (faults->enabled == 0) {
         return SIM_OK;
@@ -775,9 +1158,12 @@ SimStatus fault_injection_update(
             }
             ++(*transition_count);
             fault->was_active = active;
+            if (active != 0 && fault->type == FAULT_TYPE_COMMUNICATION_JITTER) {
+                fault->delay_pattern_index = 0u;
+            }
         }
         if (active != 0) {
-            SimStatus status = accumulate_fault(fault, sim_time_s, effects);
+            SimStatus status = accumulate_fault(faults, fault, sim_time_s, effects);
 
             if (status != SIM_OK) {
                 return status;
@@ -839,6 +1225,48 @@ void fault_injection_apply_sensor(const FaultStepEffects *effects, SensorFrame *
     if (effects->speed_hold_enabled != 0) {
         sensor->missile_vel_ecef_meas = effects->speed_hold_ecef_mps;
     }
+    if (effects->saturation_enabled[0] != 0) {
+        sensor->target_range_meas = clamp_fault_value(
+            sensor->target_range_meas,
+            effects->saturation_min[0],
+            effects->saturation_max[0]);
+    }
+    if (effects->saturation_enabled[1] != 0) {
+        sensor->target_los_unit_ecef_meas = clamp_fault_vec3(
+            sensor->target_los_unit_ecef_meas,
+            effects->saturation_min[1],
+            effects->saturation_max[1]);
+    }
+    if (effects->saturation_enabled[2] != 0) {
+        sensor->target_los_rate_ecef_meas = clamp_fault_vec3(
+            sensor->target_los_rate_ecef_meas,
+            effects->saturation_min[2],
+            effects->saturation_max[2]);
+    }
+    if (effects->saturation_enabled[3] != 0) {
+        sensor->target_closing_velocity_meas = clamp_fault_value(
+            sensor->target_closing_velocity_meas,
+            effects->saturation_min[3],
+            effects->saturation_max[3]);
+    }
+    if (effects->saturation_enabled[4] != 0) {
+        sensor->missile_gyro_b_meas = clamp_fault_vec3(
+            sensor->missile_gyro_b_meas,
+            effects->saturation_min[4],
+            effects->saturation_max[4]);
+    }
+    if (effects->saturation_enabled[5] != 0) {
+        sensor->missile_accel_ecef_meas = clamp_fault_vec3(
+            sensor->missile_accel_ecef_meas,
+            effects->saturation_min[5],
+            effects->saturation_max[5]);
+    }
+    if (effects->saturation_enabled[6] != 0) {
+        sensor->missile_vel_ecef_meas = clamp_fault_vec3(
+            sensor->missile_vel_ecef_meas,
+            effects->saturation_min[6],
+            effects->saturation_max[6]);
+    }
     sensor->sensor_valid_flags &= ~effects->sensor_valid_clear_mask;
     sensor->sensor_fault_flags |= effects->sensor_fault_set_mask;
 }
@@ -854,11 +1282,34 @@ void fault_injection_apply_actuators(
         return;
     }
     for (index = 0u; index < 3u; ++index) {
-        commands[index] *= effects->actuator_command_scale[index];
+        commands[index] =
+            (commands[index] * effects->actuator_command_scale[index]) +
+            effects->actuator_command_bias[index];
+        if (effects->actuator_disabled[index] != 0) {
+            commands[index] = 0.0;
+            actuators[index].fault_flags |= ACTUATOR_FAULT_DISABLED;
+        } else {
+            actuators[index].fault_flags &= ~ACTUATOR_FAULT_DISABLED;
+        }
         if (effects->actuator_stuck[index] != 0) {
             actuators[index].fault_flags |= ACTUATOR_FAULT_STUCK;
         } else {
             actuators[index].fault_flags &= ~ACTUATOR_FAULT_STUCK;
+        }
+        if (effects->actuator_rate_limit_scale[index] != 1.0) {
+            actuators[index].fault_flags |= ACTUATOR_FAULT_RATE_LIMIT_DEGRADED;
+        } else {
+            actuators[index].fault_flags &= ~ACTUATOR_FAULT_RATE_LIMIT_DEGRADED;
+        }
+        if (effects->actuator_position_limit_scale[index] != 1.0) {
+            actuators[index].fault_flags |= ACTUATOR_FAULT_POSITION_LIMIT_DEGRADED;
+        } else {
+            actuators[index].fault_flags &= ~ACTUATOR_FAULT_POSITION_LIMIT_DEGRADED;
+        }
+        if (effects->actuator_delay_steps[index] != 0u) {
+            actuators[index].fault_flags |= ACTUATOR_FAULT_DELAYED;
+        } else {
+            actuators[index].fault_flags &= ~ACTUATOR_FAULT_DELAYED;
         }
     }
 }

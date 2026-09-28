@@ -7,6 +7,7 @@ set(ENV_HEADERS
 set(ENV_MODEL_HEADERS
     include/env/actuator_model.h
     include/env/aero_database.h
+    include/env/aero_database_v2.h
     include/env/aero_model.h
     include/env/aero_surrogate.h
     include/env/atmosphere_model.h
@@ -15,6 +16,7 @@ set(ENV_MODEL_HEADERS
     include/env/fault_injection.h
     include/env/geo_coordinate.h
     include/env/gravity_model.h
+    include/env/hit_detect.h
     include/env/map_tile.h
     include/env/mass_model.h
     include/env/missile_plant_6dof.h
@@ -26,11 +28,14 @@ set(ENV_MODEL_HEADERS
     include/env/sensor_speed.h
     include/env/sensor_vector3.h
     include/env/terrain_model.h
+    include/env/target_model.h
+    include/env/wind_model.h
 )
 
 set(ENV_MODEL_SOURCES
     src/actuator_model.c
     src/aero_database.c
+    src/aero_database_v2.c
     src/aero_model.c
     src/aero_surrogate.c
     src/atmosphere_model.c
@@ -39,6 +44,7 @@ set(ENV_MODEL_SOURCES
     src/fault_injection.c
     src/geo_coordinate.c
     src/gravity_model.c
+    src/hit_detect.c
     src/map_tile.c
     src/mass_model.c
     src/missile_plant_6dof.c
@@ -50,6 +56,8 @@ set(ENV_MODEL_SOURCES
     src/sensor_speed.c
     src/sensor_vector3.c
     src/terrain_model.c
+    src/target_model.c
+    src/wind_model.c
 )
 
 set(ENV_SOURCES

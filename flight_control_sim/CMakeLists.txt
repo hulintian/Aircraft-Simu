@@ -1,11 +1,13 @@
 set(FC_HEADERS
     include/fc/autopilot.h
     include/fc/command_manager.h
+    include/fc/control_quality.h
     include/fc/estimator.h
     include/fc/fc_app.h
     include/fc/fc_config.h
     include/fc/fc_context.h
     include/fc/fc_health.h
+    include/fc/fc_internal_log.h
     include/fc/fc_modes.h
     include/fc/fc_scheduler.h
     include/fc/fc_state.h
@@ -18,8 +20,10 @@ set(FC_HEADERS
 set(FC_LIB_SOURCES
     src/autopilot.c
     src/command_manager.c
+    src/control_quality.c
     src/estimator.c
     src/fc_health.c
+    src/fc_internal_log.c
     src/fc_modes.c
     src/fc_scheduler.c
     src/fc_state.c

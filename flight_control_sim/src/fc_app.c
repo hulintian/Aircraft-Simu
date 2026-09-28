@@ -4,29 +4,37 @@
  *  该模块负责加载配置、接收传感器帧、执行 PNG 制导并向环境程序发出
  *  控制指令。
  */
+#define _POSIX_C_SOURCE 200809L
+
 #include "fc/fc_app.h"
 
+#include "common/build_info.h"
 #include "common/config.h"
+#include "common/crc32.h"
 #include "common/logger.h"
 #include "common/packet.h"
 #include "common/protocol.h"
+#include "common/realtime_pacer.h"
 #include "common/status.h"
 #include "fc/fc_health.h"
+#include "fc/fc_internal_log.h"
 #include "fc/fc_modes.h"
 #include "fc/fc_state.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FC_PACKET_BUFFER_SIZE 1024u
-#define FC_INTERNAL_LOG_WIRE_SIZE 92u
+#define FC_MAX_CONFIG_WARNINGS 32u
 
 typedef struct FcRuntimeConfig {
     /** @brief 环境进程 UDP 基础端口。 */
@@ -41,7 +49,197 @@ typedef struct FcRuntimeConfig {
     int binary_logs;
     /** @brief 日志刷新周期，单位帧。 */
     unsigned int flush_every_steps;
+    /** @brief 环境进程墙钟运行模式，用于性能报告关联。 */
+    char run_mode[32];
+    /** @brief 环境命令同步策略，用于性能报告关联。 */
+    char synchronization_mode[32];
 } FcRuntimeConfig;
+
+/** @brief 一类飞控墙钟耗时的固定内存统计。 */
+typedef struct FcTimingAccumulator {
+    size_t count;
+    double total_s;
+    double max_s;
+} FcTimingAccumulator;
+
+/** @brief 飞控进程墙钟性能和报文质量统计。 */
+typedef struct FcPerformanceStats {
+    double run_wall_time_s;
+    double target_step_period_s;
+    double startup_sensor_wait_time_s;
+    size_t valid_sensor_frame_count;
+    size_t dropped_packet_count;
+    size_t receive_timeout_count;
+    size_t graceful_stop_count;
+    size_t protocol_minor_mismatch_count;
+    FcTimingAccumulator sensor_receive_wait;
+    FcTimingAccumulator receive_timeout_wait;
+    FcTimingAccumulator controller_compute;
+    FcTimingAccumulator internal_log_write;
+    FcTimingAccumulator command_send;
+} FcPerformanceStats;
+
+/** @brief 飞控和共享运行时配置中的未识别字段集合。 */
+typedef struct FcConfigWarningCollector {
+    char source[32];
+    char paths[FC_MAX_CONFIG_WARNINGS][256];
+    size_t stored_count;
+    size_t total_count;
+} FcConfigWarningCollector;
+
+/** @brief 收集飞控未知配置字段并输出启动 warning。 */
+static void collect_unknown_config_key(
+    const char *object_path,
+    const char *key,
+    void *user_data)
+{
+    FcConfigWarningCollector *collector = (FcConfigWarningCollector *)user_data;
+    char full_path[256];
+
+    if (collector == 0 || object_path == 0 || key == 0) {
+        return;
+    }
+    (void)snprintf(
+        full_path,
+        sizeof(full_path),
+        "%s.%s%s%s",
+        collector->source,
+        object_path[0] == '\0' ? "" : object_path,
+        object_path[0] == '\0' ? "" : ".",
+        key);
+    (void)fprintf(stderr, "flight_control_sim: config warning: unrecognized field %s\n", full_path);
+    if (collector->stored_count < FC_MAX_CONFIG_WARNINGS) {
+        (void)snprintf(
+            collector->paths[collector->stored_count],
+            sizeof(collector->paths[collector->stored_count]),
+            "%s",
+            full_path);
+        ++collector->stored_count;
+    }
+    ++collector->total_count;
+}
+
+/** @brief 审计飞控及共享运行时配置的直接对象键。 */
+static SimStatus audit_fc_config_fields(
+    const ConfigTree *fc,
+    const ConfigTree *runtime,
+    FcConfigWarningCollector *collector)
+{
+    static const char *const fc_root[] = {
+        "schema_version", "scheduler", "guidance", "autopilot", "safety"
+    };
+    static const char *const scheduler_keys[] = { "base_rate_hz", "tasks" };
+    static const char *const task_keys[] = { "name", "period_ticks" };
+    static const char *const guidance_keys[] = {
+        "type", "navigation_constant", "max_accel_mps2", "max_accel_rate_mps3"
+    };
+    static const char *const autopilot_keys[] = {
+        "enable_attitude_loop", "enable_control_allocation", "max_attitude_cmd_rad",
+        "max_body_rate_cmd_radps", "attitude_time_constant_s", "gyro_damping_gain",
+        "fin_accel_effectiveness_mps2_per_rad", "max_fin_deflection_rad"
+    };
+    static const char *const safety_keys[] = {
+        "sensor_timeout_s", "command_hold_s", "reject_nan", "reject_old_seq"
+    };
+    static const char *const runtime_root[] = {
+        "schema_version", "campaign", "network", "logging", "tools", "instances"
+    };
+    static const char *const campaign_keys[] = {
+        "campaign_id", "instance_count", "schedule", "run_mode", "synchronization_mode",
+        "max_parallel_instances", "base_random_seed", "failure_strategy"
+    };
+    static const char *const network_keys[] = {
+        "protocol_version_major", "protocol_version_minor", "environment_base_port",
+        "flight_control_base_port", "host"
+    };
+    static const char *const logging_keys[] = {
+        "output_dir", "instance_dir_template", "binary_logs", "event_log", "flush_every_steps"
+    };
+    const char *const *keys;
+    const char *path;
+    size_t key_count;
+    size_t unknown_count = 0u;
+    size_t task_count = 0u;
+    size_t index;
+    int exists = 0;
+    SimStatus status;
+
+#define CHECK(tree, source_name, object_path, allowed) \
+    do { \
+        (void)snprintf(collector->source, sizeof(collector->source), "%s", source_name); \
+        keys = allowed; \
+        path = object_path; \
+        key_count = sizeof(allowed) / sizeof((allowed)[0]); \
+        status = config_visit_unknown_keys( \
+            tree, path, keys, key_count, collect_unknown_config_key, collector, &unknown_count); \
+        if (status != SIM_OK) { \
+            return status; \
+        } \
+    } while (0)
+    CHECK(fc, "flight_control", "", fc_root);
+    CHECK(fc, "flight_control", "scheduler", scheduler_keys);
+    CHECK(fc, "flight_control", "guidance", guidance_keys);
+    status = config_path_exists(fc, "autopilot", &exists);
+    if (status != SIM_OK) {
+        return status;
+    }
+    if (exists != 0) {
+        CHECK(fc, "flight_control", "autopilot", autopilot_keys);
+    }
+    CHECK(fc, "flight_control", "safety", safety_keys);
+    status = config_get_array_count(fc, "scheduler.tasks", &task_count);
+    if (status != SIM_OK && status != SIM_ERR_CONFIG) {
+        return status;
+    }
+    for (index = 0u; status == SIM_OK && index < task_count; ++index) {
+        char task_path[64];
+
+        (void)snprintf(task_path, sizeof(task_path), "scheduler.tasks[%zu]", index);
+        (void)snprintf(collector->source, sizeof(collector->source), "flight_control");
+        status = config_visit_unknown_keys(
+            fc,
+            task_path,
+            task_keys,
+            sizeof(task_keys) / sizeof(task_keys[0]),
+            collect_unknown_config_key,
+            collector,
+            &unknown_count);
+        if (status != SIM_OK) {
+            return status;
+        }
+    }
+    CHECK(runtime, "runtime", "", runtime_root);
+    CHECK(runtime, "runtime", "campaign", campaign_keys);
+    CHECK(runtime, "runtime", "network", network_keys);
+    CHECK(runtime, "runtime", "logging", logging_keys);
+#undef CHECK
+    return SIM_OK;
+}
+
+/** @brief 记录一次有限非负飞控墙钟耗时。 */
+static void timing_accumulate(FcTimingAccumulator *stats, double duration_s)
+{
+    if (stats == 0 || !isfinite(duration_s) || duration_s < 0.0) {
+        return;
+    }
+    ++stats->count;
+    stats->total_s += duration_s;
+    if (duration_s > stats->max_s) {
+        stats->max_s = duration_s;
+    }
+}
+
+/** @brief 完成一次飞控墙钟计时。 */
+static SimStatus timing_finish(double start_s, FcTimingAccumulator *stats)
+{
+    double end_s;
+    SimStatus status = monotonic_time_now(&end_s);
+
+    if (status == SIM_OK) {
+        timing_accumulate(stats, end_s - start_s);
+    }
+    return status;
+}
 
 /** @brief 从飞控配置中读取安全保护参数。 */
 static SimStatus load_safety_config(const ConfigTree *config, FcSafetyConfig *out)
@@ -144,6 +342,7 @@ static SimStatus load_runtime_config(const ConfigTree *runtime, FcRuntimeConfig 
     if (runtime == 0 || out == 0) {
         return SIM_ERR_INVALID_ARG;
     }
+    (void)memset(out, 0, sizeof(*out));
 
     status = config_get_uint32(runtime, "network.environment_base_port", &out->env_base_port);
     if (status != SIM_OK) {
@@ -168,6 +367,60 @@ static SimStatus load_runtime_config(const ConfigTree *runtime, FcRuntimeConfig 
     status = config_get_uint32(runtime, "logging.flush_every_steps", &out->flush_every_steps);
     if (status != SIM_OK || out->flush_every_steps == 0u) {
         out->flush_every_steps = 100u;
+    }
+    {
+        int run_mode_exists = 0;
+
+        status = config_path_exists(runtime, "campaign.run_mode", &run_mode_exists);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (run_mode_exists == 0) {
+            (void)snprintf(out->run_mode, sizeof(out->run_mode), "SIL_FAST");
+        } else {
+            status = config_get_string(
+                runtime,
+                "campaign.run_mode",
+                out->run_mode,
+                sizeof(out->run_mode));
+            if (status != SIM_OK) {
+                return status;
+            }
+            if (strcmp(out->run_mode, "SIL_FAST") != 0 &&
+                strcmp(out->run_mode, "SIL_REALTIME") != 0) {
+                return SIM_ERR_CONFIG;
+            }
+        }
+    }
+    {
+        int synchronization_mode_exists = 0;
+
+        status = config_path_exists(
+            runtime,
+            "campaign.synchronization_mode",
+            &synchronization_mode_exists);
+        if (status != SIM_OK) {
+            return status;
+        }
+        if (synchronization_mode_exists == 0) {
+            (void)snprintf(
+                out->synchronization_mode,
+                sizeof(out->synchronization_mode),
+                "LOCKSTEP");
+        } else {
+            status = config_get_string(
+                runtime,
+                "campaign.synchronization_mode",
+                out->synchronization_mode,
+                sizeof(out->synchronization_mode));
+            if (status != SIM_OK) {
+                return status;
+            }
+            if (strcmp(out->synchronization_mode, "LOCKSTEP") != 0 &&
+                strcmp(out->synchronization_mode, "FREE_RUNNING") != 0) {
+                return SIM_ERR_CONFIG;
+            }
+        }
     }
     return SIM_OK;
 }
@@ -322,27 +575,6 @@ static SimStatus send_ready_heartbeat(
     return sent == (ssize_t)packet_size ? SIM_OK : SIM_ERR_IO;
 }
 
-/** @brief 写入小端 32 位无符号整数。 */
-static void write_u32_le(unsigned char *out, uint32_t value)
-{
-    out[0] = (unsigned char)(value & UINT32_C(0xff));
-    out[1] = (unsigned char)((value >> 8u) & UINT32_C(0xff));
-    out[2] = (unsigned char)((value >> 16u) & UINT32_C(0xff));
-    out[3] = (unsigned char)((value >> 24u) & UINT32_C(0xff));
-}
-
-/** @brief 写入小端双精度浮点。 */
-static void write_f64_le(unsigned char *out, double value)
-{
-    uint64_t bits;
-    unsigned int index;
-
-    (void)memcpy(&bits, &value, sizeof(bits));
-    for (index = 0u; index < 8u; ++index) {
-        out[index] = (unsigned char)((bits >> (8u * index)) & UINT64_C(0xff));
-    }
-}
-
 /** @brief 创建飞控内部日志实例目录。 */
 static SimStatus make_fc_instance_dir(
     const char *base_dir,
@@ -369,6 +601,169 @@ static SimStatus make_fc_instance_dir(
     return SIM_OK;
 }
 
+/** @brief 将已校验配置树按输入原始字节写入实例快照。 */
+static SimStatus write_config_snapshot(
+    const ConfigTree *tree,
+    const char *instance_dir,
+    const char *name)
+{
+    char path[1024];
+    FILE *file;
+
+    if (tree == 0 || tree->data == 0 || instance_dir == 0 || name == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    (void)snprintf(path, sizeof(path), "%s/%s", instance_dir, name);
+    file = fopen(path, "wb");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    if (fwrite(tree->data, 1u, tree->size, file) != tree->size) {
+        (void)fclose(file);
+        return SIM_ERR_IO;
+    }
+    return fclose(file) == 0 ? SIM_OK : SIM_ERR_IO;
+}
+
+/** @brief 格式化当前 UTC 墙钟，仅写 provenance，不参与控制计算。 */
+static void format_wall_clock_utc(char *out, size_t out_size)
+{
+    time_t now;
+    struct tm utc;
+
+    if (out == 0 || out_size == 0u) {
+        return;
+    }
+    now = time(0);
+    if (now == (time_t)-1 || gmtime_r(&now, &utc) == 0 ||
+        strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", &utc) == 0u) {
+        (void)snprintf(out, out_size, "unknown");
+    }
+}
+
+/** @brief 写出飞控配置、软件身份和日志路径的独立运行清单。 */
+static SimStatus write_fc_run_manifest(
+    const FcContext *ctx,
+    const FcRuntimeConfig *runtime,
+    const ConfigTree *fc_tree,
+    const ConfigTree *runtime_tree,
+    const FcConfigWarningCollector *config_warnings)
+{
+    char instance_dir[512];
+    char path[1024];
+    char campaign_id[128] = "unknown";
+    char start_time_wall_clock[32];
+    FILE *file;
+    SimStatus status;
+
+    if (ctx == 0 || runtime == 0 || fc_tree == 0 || runtime_tree == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = make_fc_instance_dir(
+        runtime->output_dir,
+        ctx->instance_id,
+        instance_dir,
+        sizeof(instance_dir));
+    if (status != SIM_OK) {
+        return status;
+    }
+    status = write_config_snapshot(
+        fc_tree,
+        instance_dir,
+        "config_snapshot_flight_control.json");
+    if (status == SIM_OK) {
+        status = write_config_snapshot(
+            runtime_tree,
+            instance_dir,
+            "fc_config_snapshot_runtime.json");
+    }
+    if (status != SIM_OK) {
+        return status;
+    }
+    (void)config_get_string(
+        runtime_tree,
+        "campaign.campaign_id",
+        campaign_id,
+        sizeof(campaign_id));
+    format_wall_clock_utc(start_time_wall_clock, sizeof(start_time_wall_clock));
+    (void)snprintf(path, sizeof(path), "%s/fc_run_manifest.json", instance_dir);
+    file = fopen(path, "wb");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    (void)fprintf(file, "{\n");
+    (void)fprintf(file, "  \"schema_version\": 1,\n");
+    (void)fprintf(file, "  \"instance_id\": %u,\n", ctx->instance_id);
+    (void)fprintf(file, "  \"campaign_id\": \"%s\",\n", campaign_id);
+    (void)fprintf(
+        file,
+        "  \"program_version\": \"flight_control_sim %d.%d.%d\",\n",
+        MISSILE_SIM_VERSION_MAJOR,
+        MISSILE_SIM_VERSION_MINOR,
+        MISSILE_SIM_VERSION_PATCH);
+    (void)fprintf(file, "  \"git_commit\": \"%s\",\n", MISSILE_SIM_GIT_COMMIT);
+    (void)fprintf(
+        file,
+        "  \"git_worktree_dirty\": %s,\n",
+        MISSILE_SIM_GIT_DIRTY != 0 ? "true" : "false");
+    (void)fprintf(file, "  \"build_time\": \"%s\",\n", MISSILE_SIM_BUILD_TIME);
+    (void)fprintf(file, "  \"compiler\": \"%s\",\n", MISSILE_SIM_COMPILER);
+    (void)fprintf(file, "  \"start_time_wall_clock\": \"%s\",\n", start_time_wall_clock);
+    (void)fprintf(
+        file,
+        "  \"protocol_version\": \"%d.%d\",\n",
+        MISSILE_SIM_PROTOCOL_VERSION_MAJOR,
+        MISSILE_SIM_PROTOCOL_VERSION_MINOR);
+    (void)fprintf(file, "  \"flight_control_path\": \"%s\",\n", ctx->flight_control_path);
+    (void)fprintf(file, "  \"runtime_path\": \"%s\",\n", ctx->runtime_path);
+    (void)fprintf(
+        file,
+        "  \"config_crc32\": { \"flight_control\": \"0x%08x\", "
+        "\"runtime\": \"0x%08x\" },\n",
+        crc32_compute(fc_tree->data, fc_tree->size),
+        crc32_compute(runtime_tree->data, runtime_tree->size));
+    (void)fprintf(file, "  \"config_snapshots\": {\n");
+    (void)fprintf(
+        file,
+        "    \"flight_control\": \"%s/config_snapshot_flight_control.json\",\n",
+        instance_dir);
+    (void)fprintf(
+        file,
+        "    \"runtime\": \"%s/fc_config_snapshot_runtime.json\"\n",
+        instance_dir);
+    (void)fprintf(file, "  },\n");
+    (void)fprintf(
+        file,
+        "  \"unrecognized_config_field_count\": %lu,\n",
+        config_warnings != 0 ? (unsigned long)config_warnings->total_count : 0ul);
+    (void)fprintf(file, "  \"unrecognized_config_fields\": [");
+    if (config_warnings != 0) {
+        size_t warning_index;
+
+        for (warning_index = 0u;
+             warning_index < config_warnings->stored_count;
+             ++warning_index) {
+            (void)fprintf(
+                file,
+                "%s\"%s\"",
+                warning_index == 0u ? "" : ", ",
+                config_warnings->paths[warning_index]);
+        }
+    }
+    (void)fprintf(file, "],\n");
+    (void)fprintf(file, "  \"run_mode\": \"%s\",\n", runtime->run_mode);
+    (void)fprintf(
+        file,
+        "  \"synchronization_mode\": \"%s\",\n",
+        runtime->synchronization_mode);
+    (void)fprintf(file, "  \"log_files\": {\n");
+    (void)fprintf(file, "    \"internal\": \"%s/fc_internal_log.bin\",\n", instance_dir);
+    (void)fprintf(file, "    \"performance\": \"%s/fc_performance.json\"\n", instance_dir);
+    (void)fprintf(file, "  }\n");
+    (void)fprintf(file, "}\n");
+    return fclose(file) == 0 ? SIM_OK : SIM_ERR_IO;
+}
+
 /** @brief 打开飞控内部持久化日志。 */
 static FILE *open_internal_log(const FcRuntimeConfig *runtime, uint32_t instance_id)
 {
@@ -389,7 +784,7 @@ static FILE *open_internal_log(const FcRuntimeConfig *runtime, uint32_t instance
 static SimStatus write_internal_log(FILE *file, const ControlCommand *command)
 {
     unsigned char record[FC_INTERNAL_LOG_WIRE_SIZE];
-    size_t offset = 0u;
+    SimStatus status;
 
     if (file == 0) {
         return SIM_OK;
@@ -397,35 +792,147 @@ static SimStatus write_internal_log(FILE *file, const ControlCommand *command)
     if (command == 0) {
         return SIM_ERR_INVALID_ARG;
     }
-    write_u32_le(&record[offset], command->seq);
-    offset += 4u;
-    write_f64_le(&record[offset], command->sim_time);
-    offset += 8u;
-    write_u32_le(&record[offset], command->command_mode);
-    offset += 4u;
-    write_u32_le(&record[offset], command->command_status);
-    offset += 4u;
-    write_f64_le(&record[offset], command->accel_cmd_ecef.x);
-    offset += 8u;
-    write_f64_le(&record[offset], command->accel_cmd_ecef.y);
-    offset += 8u;
-    write_f64_le(&record[offset], command->accel_cmd_ecef.z);
-    offset += 8u;
-    write_f64_le(&record[offset], command->attitude_cmd.x);
-    offset += 8u;
-    write_f64_le(&record[offset], command->attitude_cmd.y);
-    offset += 8u;
-    write_f64_le(&record[offset], command->attitude_cmd.z);
-    offset += 8u;
-    write_f64_le(&record[offset], command->body_rate_cmd.x);
-    offset += 8u;
-    write_f64_le(&record[offset], command->body_rate_cmd.y);
-    offset += 8u;
-    write_f64_le(&record[offset], command->body_rate_cmd.z);
-    offset += 8u;
-    return offset == sizeof(record) && fwrite(record, 1u, sizeof(record), file) == sizeof(record) ?
-        SIM_OK :
-        SIM_ERR_IO;
+    status = fc_internal_log_encode(command, record, sizeof(record));
+    if (status != SIM_OK) {
+        return status;
+    }
+    return fwrite(record, 1u, sizeof(record), file) == sizeof(record) ? SIM_OK : SIM_ERR_IO;
+}
+
+/** @brief 写出不参与控制计算和确定性回归的飞控墙钟性能报告。 */
+static SimStatus write_performance_report(
+    const FcRuntimeConfig *runtime,
+    uint32_t instance_id,
+    const FcPerformanceStats *stats,
+    const FcConfigWarningCollector *config_warnings)
+{
+    char instance_dir[512];
+    char path[1024];
+    FILE *file;
+
+    if (runtime == 0 || stats == 0 || runtime->output_dir[0] == '\0') {
+        return SIM_ERR_INVALID_ARG;
+    }
+    if (make_fc_instance_dir(
+            runtime->output_dir,
+            instance_id,
+            instance_dir,
+            sizeof(instance_dir)) != SIM_OK) {
+        return SIM_ERR_IO;
+    }
+    (void)snprintf(path, sizeof(path), "%s/fc_performance.json", instance_dir);
+    file = fopen(path, "wb");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    (void)fprintf(file, "{\n");
+    (void)fprintf(file, "  \"schema_version\": 1,\n");
+    (void)fprintf(file, "  \"scope\": \"wall_clock_diagnostics_not_control_input\",\n");
+    (void)fprintf(
+        file,
+        "  \"unrecognized_config_field_count\": %lu,\n",
+        config_warnings != 0 ? (unsigned long)config_warnings->total_count : 0ul);
+    (void)fprintf(file, "  \"unrecognized_config_fields\": [");
+    if (config_warnings != 0) {
+        size_t warning_index;
+
+        for (warning_index = 0u;
+             warning_index < config_warnings->stored_count;
+             ++warning_index) {
+            (void)fprintf(
+                file,
+                "%s\"%s\"",
+                warning_index == 0u ? "" : ", ",
+                config_warnings->paths[warning_index]);
+        }
+    }
+    (void)fprintf(file, "],\n");
+    (void)fprintf(file, "  \"run_mode\": \"%s\",\n", runtime->run_mode);
+    (void)fprintf(
+        file,
+        "  \"synchronization_mode\": \"%s\",\n",
+        runtime->synchronization_mode);
+    (void)fprintf(file, "  \"target_step_period_s\": %.9f,\n", stats->target_step_period_s);
+    (void)fprintf(file, "  \"run_wall_time_s\": %.9f,\n", stats->run_wall_time_s);
+    (void)fprintf(
+        file,
+        "  \"startup_sensor_wait_time_s\": %.12f,\n",
+        stats->startup_sensor_wait_time_s);
+    (void)fprintf(
+        file,
+        "  \"valid_sensor_frame_count\": %lu,\n",
+        (unsigned long)stats->valid_sensor_frame_count);
+    (void)fprintf(
+        file,
+        "  \"dropped_packet_count\": %lu,\n",
+        (unsigned long)stats->dropped_packet_count);
+    (void)fprintf(
+        file,
+        "  \"receive_timeout_count\": %lu,\n",
+        (unsigned long)stats->receive_timeout_count);
+    (void)fprintf(
+        file,
+        "  \"graceful_stop_count\": %lu,\n",
+        (unsigned long)stats->graceful_stop_count);
+    (void)fprintf(
+        file,
+        "  \"protocol_minor_mismatch_count\": %lu,\n",
+        (unsigned long)stats->protocol_minor_mismatch_count);
+    (void)fprintf(
+        file,
+        "  \"mean_sensor_receive_wait_time_s\": %.12f,\n",
+        stats->sensor_receive_wait.count > 0u ?
+            stats->sensor_receive_wait.total_s / (double)stats->sensor_receive_wait.count : 0.0);
+    (void)fprintf(
+        file,
+        "  \"max_sensor_receive_wait_time_s\": %.12f,\n",
+        stats->sensor_receive_wait.max_s);
+    (void)fprintf(
+        file,
+        "  \"mean_receive_timeout_wait_time_s\": %.12f,\n",
+        stats->receive_timeout_wait.count > 0u ?
+            stats->receive_timeout_wait.total_s / (double)stats->receive_timeout_wait.count : 0.0);
+    (void)fprintf(
+        file,
+        "  \"max_receive_timeout_wait_time_s\": %.12f,\n",
+        stats->receive_timeout_wait.max_s);
+    (void)fprintf(
+        file,
+        "  \"controller_compute_sample_count\": %lu,\n",
+        (unsigned long)stats->controller_compute.count);
+    (void)fprintf(
+        file,
+        "  \"mean_controller_compute_time_s\": %.12f,\n",
+        stats->controller_compute.count > 0u ?
+            stats->controller_compute.total_s / (double)stats->controller_compute.count : 0.0);
+    (void)fprintf(
+        file,
+        "  \"max_controller_compute_time_s\": %.12f,\n",
+        stats->controller_compute.max_s);
+    (void)fprintf(
+        file,
+        "  \"mean_internal_log_write_time_s\": %.12f,\n",
+        stats->internal_log_write.count > 0u ?
+            stats->internal_log_write.total_s / (double)stats->internal_log_write.count : 0.0);
+    (void)fprintf(
+        file,
+        "  \"max_internal_log_write_time_s\": %.12f,\n",
+        stats->internal_log_write.max_s);
+    (void)fprintf(
+        file,
+        "  \"mean_command_send_time_s\": %.12f,\n",
+        stats->command_send.count > 0u ?
+            stats->command_send.total_s / (double)stats->command_send.count : 0.0);
+    (void)fprintf(
+        file,
+        "  \"max_command_send_time_s\": %.12f,\n",
+        stats->command_send.max_s);
+    (void)fprintf(
+        file,
+        "  \"controller_realtime_margin_s\": %.12f\n",
+        stats->target_step_period_s - stats->controller_compute.max_s);
+    (void)fprintf(file, "}\n");
+    return fclose(file) == 0 ? SIM_OK : SIM_ERR_IO;
 }
 
 /** @brief 运行飞控仿真主循环。 */
@@ -441,9 +948,14 @@ SimStatus fc_app_run(const FcContext *ctx)
     int sock = -1;
     unsigned int fc_port;
     unsigned int env_port;
+    struct sockaddr_in env_addr;
     FcMode last_reported_mode = FC_POWER_ON;
     FILE *internal_log = 0;
     uint32_t logged_frames = 0u;
+    FcPerformanceStats performance_stats;
+    FcConfigWarningCollector config_warnings;
+    double run_wall_start_s = 0.0;
+    int protocol_minor_warning_written = 0;
 
     if (ctx == 0 || ctx->flight_control_path == 0 || ctx->runtime_path == 0) {
         return SIM_ERR_INVALID_ARG;
@@ -451,6 +963,8 @@ SimStatus fc_app_run(const FcContext *ctx)
 
     memset(&fc_tree, 0, sizeof(fc_tree));
     memset(&runtime_tree, 0, sizeof(runtime_tree));
+    memset(&performance_stats, 0, sizeof(performance_stats));
+    memset(&config_warnings, 0, sizeof(config_warnings));
     status = logger_open_stdout(&logger);
     if (status != SIM_OK) {
         return status;
@@ -490,9 +1004,34 @@ SimStatus fc_app_run(const FcContext *ctx)
         config_free(&runtime_tree);
         return status;
     }
+    status = audit_fc_config_fields(&fc_tree, &runtime_tree, &config_warnings);
+    if (status != SIM_OK) {
+        (void)fprintf(
+            stderr,
+            "flight_control_sim: config field audit failed: %s\n",
+            sim_status_to_string(status));
+        config_free(&fc_tree);
+        config_free(&runtime_tree);
+        return status;
+    }
     status = load_runtime_config(&runtime_tree, &runtime_cfg);
     if (status != SIM_OK) {
         (void)fprintf(stderr, "flight_control_sim: invalid runtime config: %s\n",
+            sim_status_to_string(status));
+        config_free(&fc_tree);
+        config_free(&runtime_tree);
+        return status;
+    }
+    status = write_fc_run_manifest(
+        ctx,
+        &runtime_cfg,
+        &fc_tree,
+        &runtime_tree,
+        &config_warnings);
+    if (status != SIM_OK) {
+        (void)fprintf(
+            stderr,
+            "flight_control_sim: failed to write provenance: %s\n",
             sim_status_to_string(status));
         config_free(&fc_tree);
         config_free(&runtime_tree);
@@ -525,14 +1064,34 @@ SimStatus fc_app_run(const FcContext *ctx)
         return status;
     }
     internal_log = open_internal_log(&runtime_cfg, ctx->instance_id);
+    if (runtime_cfg.binary_logs != 0 && internal_log == 0) {
+        (void)fprintf(stderr, "flight_control_sim: failed to open internal log\n");
+        config_free(&fc_tree);
+        config_free(&runtime_tree);
+        return SIM_ERR_IO;
+    }
 
     fc_port = runtime_cfg.fc_base_port + (2u * ctx->instance_id);
     env_port = runtime_cfg.env_base_port + (2u * ctx->instance_id);
+    (void)memset(&env_addr, 0, sizeof(env_addr));
+    env_addr.sin_family = AF_INET;
+    env_addr.sin_port = htons((uint16_t)env_port);
+    if (inet_pton(AF_INET, runtime_cfg.host, &env_addr.sin_addr) != 1) {
+        if (internal_log != 0) {
+            (void)fclose(internal_log);
+        }
+        config_free(&fc_tree);
+        config_free(&runtime_tree);
+        return SIM_ERR_CONFIG;
+    }
     status = bind_udp_socket(fc_port, &sock);
     if (status != SIM_OK) {
         (void)fprintf(stderr, "flight_control_sim: failed to bind UDP port %u: %s\n",
             fc_port,
             sim_status_to_string(status));
+        if (internal_log != 0) {
+            (void)fclose(internal_log);
+        }
         config_free(&fc_tree);
         config_free(&runtime_tree);
         return status;
@@ -545,6 +1104,19 @@ SimStatus fc_app_run(const FcContext *ctx)
         (void)fprintf(stderr, "flight_control_sim: failed to send ready heartbeat: %s\n",
             sim_status_to_string(status));
         (void)close(sock);
+        if (internal_log != 0) {
+            (void)fclose(internal_log);
+        }
+        config_free(&fc_tree);
+        config_free(&runtime_tree);
+        return status;
+    }
+    status = monotonic_time_now(&run_wall_start_s);
+    if (status != SIM_OK) {
+        (void)close(sock);
+        if (internal_log != 0) {
+            (void)fclose(internal_log);
+        }
         config_free(&fc_tree);
         config_free(&runtime_tree);
         return status;
@@ -554,18 +1126,91 @@ SimStatus fc_app_run(const FcContext *ctx)
         unsigned char buffer[FC_PACKET_BUFFER_SIZE];
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
-        ssize_t got = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_len);
+        ssize_t got;
+        int receive_errno = 0;
         SensorFrame sensor;
         ControlCommand command;
+        double receive_start_s = 0.0;
+        double receive_end_s = 0.0;
+        double receive_duration_s = 0.0;
 
+        status = monotonic_time_now(&receive_start_s);
+        if (status != SIM_OK) {
+            break;
+        }
+        got = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&from, &from_len);
         if (got < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            receive_errno = errno;
+        }
+        status = monotonic_time_now(&receive_end_s);
+        if (status != SIM_OK) {
+            break;
+        }
+        receive_duration_s = receive_end_s - receive_start_s;
+        if (!isfinite(receive_duration_s) || receive_duration_s < 0.0) {
+            status = SIM_ERR_NUMERIC;
+            break;
+        }
+        if (got < 0) {
+            if (receive_errno == EAGAIN || receive_errno == EWOULDBLOCK) {
+                ++performance_stats.receive_timeout_count;
+                timing_accumulate(
+                    &performance_stats.receive_timeout_wait,
+                    receive_duration_s);
                 break;
             }
             status = SIM_ERR_IO;
             break;
         }
+        if (from.sin_family != env_addr.sin_family ||
+            from.sin_port != env_addr.sin_port ||
+            from.sin_addr.s_addr != env_addr.sin_addr.s_addr) {
+            ++performance_stats.dropped_packet_count;
+            (void)fprintf(stderr, "flight_control_sim: dropped packet from unexpected peer\n");
+            continue;
+        }
+        {
+            PacketHeader header;
+
+            status = packet_peek_header(buffer, (size_t)got, &header);
+            if (status != SIM_OK) {
+                ++performance_stats.dropped_packet_count;
+                (void)fprintf(stderr, "flight_control_sim: dropped invalid packet header\n");
+                continue;
+            }
+            if (header.version_minor != MISSILE_SIM_PROTOCOL_VERSION_MINOR) {
+                ++performance_stats.protocol_minor_mismatch_count;
+                if (protocol_minor_warning_written == 0) {
+                    (void)fprintf(
+                        stderr,
+                        "flight_control_sim: protocol minor version %u differs from supported %u; "
+                        "using compatible v1 fields\n",
+                        (unsigned int)header.version_minor,
+                        (unsigned int)MISSILE_SIM_PROTOCOL_VERSION_MINOR);
+                    protocol_minor_warning_written = 1;
+                }
+            }
+        }
+        if ((size_t)got == SIM_SIM_CONTROL_PACKET_WIRE_SIZE) {
+            PacketHeader control_header;
+            SimControlAction action = (SimControlAction)0;
+
+            status = packet_decode_sim_control(
+                buffer,
+                (size_t)got,
+                ctx->instance_id,
+                &control_header,
+                &action);
+            if (status == SIM_OK && action == SIM_CONTROL_STOP) {
+                ++performance_stats.graceful_stop_count;
+                break;
+            }
+            ++performance_stats.dropped_packet_count;
+            (void)fprintf(stderr, "flight_control_sim: dropped invalid simulation control packet\n");
+            continue;
+        }
         if ((size_t)got != SIM_SENSOR_PACKET_WIRE_SIZE) {
+            ++performance_stats.dropped_packet_count;
             (void)fprintf(stderr, "flight_control_sim: dropped packet size=%ld expected=%zu\n",
                 (long)got,
                 (size_t)SIM_SENSOR_PACKET_WIRE_SIZE);
@@ -573,11 +1218,31 @@ SimStatus fc_app_run(const FcContext *ctx)
         }
         status = packet_decode_sensor_frame(buffer, (size_t)got, ctx->instance_id, &sensor);
         if (status != SIM_OK) {
+            ++performance_stats.dropped_packet_count;
             (void)fprintf(stderr, "flight_control_sim: dropped packet status=%s\n",
                 sim_status_to_string(status));
             continue;
         }
-        status = flight_controller_step(&controller, &sensor, &command);
+        if (performance_stats.valid_sensor_frame_count == 0u) {
+            performance_stats.startup_sensor_wait_time_s = receive_duration_s;
+        } else {
+            timing_accumulate(&performance_stats.sensor_receive_wait, receive_duration_s);
+        }
+        ++performance_stats.valid_sensor_frame_count;
+        if (performance_stats.target_step_period_s == 0.0) {
+            performance_stats.target_step_period_s = sensor.dt;
+        }
+        {
+            double controller_start_s = 0.0;
+
+            status = monotonic_time_now(&controller_start_s);
+            if (status == SIM_OK) {
+                status = flight_controller_step(&controller, &sensor, &command);
+            }
+            if (status == SIM_OK) {
+                status = timing_finish(controller_start_s, &performance_stats.controller_compute);
+            }
+        }
         if (status != SIM_OK) {
             (void)fprintf(stderr, "flight_control_sim: controller step failed seq=%u status=%s\n",
                 sensor.seq,
@@ -598,22 +1263,53 @@ SimStatus fc_app_run(const FcContext *ctx)
                 fc_mode_to_string((FcMode)command.command_mode),
                 command.command_status);
         }
-        status = write_internal_log(internal_log, &command);
+        {
+            double log_start_s = 0.0;
+
+            status = monotonic_time_now(&log_start_s);
+            if (status == SIM_OK) {
+                status = write_internal_log(internal_log, &command);
+            }
+            if (status == SIM_OK) {
+                ++logged_frames;
+                if (internal_log != 0 &&
+                    runtime_cfg.flush_every_steps > 0u &&
+                    (logged_frames % runtime_cfg.flush_every_steps) == 0u) {
+                    if (fflush(internal_log) != 0) {
+                        status = SIM_ERR_IO;
+                    }
+                }
+            }
+            if (status == SIM_OK) {
+                status = timing_finish(log_start_s, &performance_stats.internal_log_write);
+            }
+        }
         if (status != SIM_OK) {
             (void)fprintf(stderr, "flight_control_sim: internal log failed: %s\n",
                 sim_status_to_string(status));
             break;
         }
-        ++logged_frames;
-        if (internal_log != 0 &&
-            runtime_cfg.flush_every_steps > 0u &&
-            (logged_frames % runtime_cfg.flush_every_steps) == 0u) {
-            (void)fflush(internal_log);
+        {
+            double send_start_s = 0.0;
+
+            status = monotonic_time_now(&send_start_s);
+            if (status == SIM_OK) {
+                status = send_control_command(sock, &env_addr, ctx->instance_id, &command);
+            }
+            if (status == SIM_OK) {
+                status = timing_finish(send_start_s, &performance_stats.command_send);
+            }
         }
-        from.sin_port = htons((uint16_t)env_port);
-        status = send_control_command(sock, &from, ctx->instance_id, &command);
         if (status != SIM_OK) {
             break;
+        }
+    }
+
+    {
+        double run_wall_end_s = 0.0;
+
+        if (monotonic_time_now(&run_wall_end_s) == SIM_OK && run_wall_end_s >= run_wall_start_s) {
+            performance_stats.run_wall_time_s = run_wall_end_s - run_wall_start_s;
         }
     }
 
@@ -622,6 +1318,17 @@ SimStatus fc_app_run(const FcContext *ctx)
     }
     if (internal_log != 0) {
         (void)fclose(internal_log);
+    }
+    {
+        SimStatus report_status = write_performance_report(
+            &runtime_cfg,
+            ctx->instance_id,
+            &performance_stats,
+            &config_warnings);
+
+        if (status == SIM_OK && report_status != SIM_OK) {
+            status = report_status;
+        }
     }
     config_free(&fc_tree);
     config_free(&runtime_tree);
