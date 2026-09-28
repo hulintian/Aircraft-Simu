@@ -4,6 +4,7 @@
 > 当前完成度以 `README.md` 和 [project_framework.md](project_framework.md) 为准。
 > 上手构建、运行和常见修改路径见 [onboarding.md](onboarding.md)；与成熟飞行仿真软件的差距
 > 和后续路线见 [flight_sim_software_comparison.md](flight_sim_software_comparison.md)。
+> 统一验收命令和 V0-V7 证据边界见 [verification_guide.md](verification_guide.md)。
 
 ## 1. 实现目标
 
@@ -43,6 +44,21 @@ P8  日志、回放、批量验证
 ```
 
 不要先写复杂模型再补工程底座。先把构建、协议、配置、日志和测试框架打稳，后续模型才能持续替换。
+
+### 2.1 当前执行状态
+
+截至 2026-08-20，P0-P8 计划内 V0-V5 仓库验收入口均已实现。这里的“完成”只表示代码、
+配置、工具和自动测试闭合，不是产品完成百分比，也不包含真实型号数据标定、外部软件
+交叉验证或 HIL/实测 V6-V7。多轴成熟度见
+[current_progress_and_gaps.md](current_progress_and_gaps.md)。
+
+| 阶段 | 完成证据 |
+|---|---|
+| P0-P2 | 三个主程序 help/version/退出码、严格构建、公共库/配置/协议单测 |
+| P3-P4 | 双进程 LOCKSTEP/FREE_RUNNING、SIL 实时性能、完整 manifest/配置快照、真实来源 DEM 与 LOS 回归 |
+| P5-P6 | 6DOF/质量/风/脚本目标/连续命中/完整故障矩阵、内部日志和标准机动控制品质报告 |
+| P7 | 并发/串行、继续/停止失败策略、端口预检/ready 心跳和批次摘要集成测试 |
+| P8 | 被动/带飞控回放和 Monte Carlo manifest、精确/容差比较、统计、绘图和 4/16/128 压力层 |
 
 ## 3. P0 工程骨架
 
@@ -307,6 +323,7 @@ while running:
 - `LOCKSTEP` 模式下每帧有一条传感器帧和一条控制帧。
 - 生成：
   - `run_manifest.json`
+  - 三个实际输入配置字节快照及逐文件 CRC32
   - `sensor_log.bin`
   - `command_log.bin`
   - `event_log.txt`
@@ -398,8 +415,9 @@ actuator_pos
 
 ### 8.5 当前执行窗口
 
-P5 当前已经完成环境力链、6DOF 积分器、四类传感器误差、采样、延迟、丢包、
-基础 `faults.json` 故障注入、故障统计、错误配置拒绝和固定种子闭环一致性回归：
+P5 当前已经完成环境力链、6DOF 积分器、脚本目标机动、步间连续命中、四类传感器误差、
+采样、延迟、丢包、完整 `faults.json` 故障矩阵、故障统计、错误配置拒绝和固定种子闭环
+一致性回归：
 
 ```text
 faults.json
@@ -422,12 +440,13 @@ parameters
 enabled
 ```
 
-第一批实现已经覆盖仿真正确性需要的基础故障类型：
+实现已覆盖第 14 节设计故障矩阵：
 
 - 传感器强制无效。
 - 传感器附加偏置。
 - 传感器线性漂移。
 - 传感器斜坡恢复偏置。
+- 传感器确定性噪声增大、起点捕获卡滞、逐测量动态延迟和饱和。
 - 传感器卡常值 / 常值保持。
 - 传感器整帧丢包窗口。
 - 锁步安全的通信窗口故障：`sensor.frame` / `COMMUNICATION_LOSS` 会清除整帧测量有效位并置位 dropout flags。
@@ -438,7 +457,8 @@ enabled
 - 通信层 `sensor.frame` 故障支持 `recovery_hold_s` / `recovery_timeout_s`，可在故障窗口结束后
   继续保持故障效果再恢复，用于覆盖飞控超时后的恢复边界。
 - 执行机构卡死。
-- 执行机构比例缩放。
+- 执行机构偏置、比例缩放、速率/行程退化、命令延迟和失能。
+- 实际 UDP 报文丢弃、重复和 CRC 损坏；FREE_RUNNING 闭环覆盖损坏报文拒绝和后续恢复。
 
 当前基础验收已经证明故障触发后：
 
@@ -448,10 +468,15 @@ enabled
 - 同一随机种子下两次运行结果一致。
 - `summary.json` 或 `campaign_summary.json` 能汇总故障触发次数和影响范围。
 
-后续扩展不再阻塞 P6，但仍应补充：
+P5 工程验收后续已补齐：
 
-- 更多真实故障类型，例如非锁步乱序恢复和更贴近操作系统网络栈的真实丢包。
-- 真实 DEM 数据集加载后的 LOS 遮挡闭环场景；当前已用合成山脊瓦片覆盖闭环遮挡链路。
+- `burst_period_s` / `burst_active_s` 周期突发通信窗口。
+- `COMMUNICATION_JITTER` 固定模式变延迟和恢复跳变测试。
+- 珠峰附近真实来源 DEM fixture、来源/哈希清单、预处理 LOS 和双进程遮挡闭环。
+- 完整质心/惯量张量演化，以及风切变、阵风和固定种子湍流模型。
+
+`FREE_RUNNING` 已用于基础非锁步恢复；每传感器独立时间戳、时钟漂移和操作系统网络栈
+时序相关性仍属于协议 v2 与外部网络验证范围。
 
 ## 9. P6 飞控任务、制导与保护
 
@@ -551,10 +576,14 @@ SensorFrame
 - 闭环测试会解码 `command_log.bin`，验证导引头预热时进入命令保持，
   有效测量后进入制导激活并触发变化率限制。
 
-后续扩展仍应补充：
+P6 工程验收后续已补齐：
 
-- 更完整控制律验证和长时间故障恢复策略。当前已补充 PNG 加速度限幅、NaN 距离拒绝、
-  自动驾驶仪内环关闭透传路径和连续帧限幅/速率/舵偏边界单元验证；仍需高保真控制品质基准。
+- `fc_internal_log.bin` 固定记录格式和 `log_convert --type fc-internal` 正式解码。
+- 使用真实 `FlightController` 链的阶跃、指令反向和丢包恢复标准机动。
+- 上升时间、调节时间、超调、稳态误差、最大变化率和饱和占比的版本化阈值报告。
+- 命令保持超时按最后一帧新鲜命令计时，并有恢复边界单测。
+
+真实型号带宽、稳定裕度和飞行品质仍需 V6/V7 数据与试验，不作为 SIL 工程 P6 完成条件。
 
 ## 10. P7 多实例管理器
 
@@ -619,9 +648,11 @@ runtime.instances[]
 - 飞控启动完成后发送应用层 ready 心跳，管理器收到合法 `PACKET_HEARTBEAT`
   后才启动环境程序。
 - 管理器子进程失败时返回非零退出码，不再把失败批次伪装为成功。
-- `campaign_summary.json` 汇总每个实例的端口、配置路径、随机种子、退出状态和故障统计。
-- `instance_manager_test` 覆盖两实例并行计划、端口隔离、端口占用预检、显式种子、应用层 ready 心跳、
-  飞控早退失败路径、`STOP_ON_FAILURE` 跳过路径和批次摘要。
+- `campaign_summary.json` 汇总 campaign id、命中/未命中/超时、脱靶量 min/max/mean/std、
+  失败实例，以及每个实例的端口、配置路径、随机种子、退出状态和故障统计。
+- `instance_manager_test` 覆盖两实例并发和串行计划、端口隔离、端口占用预检、显式种子、
+  应用层 ready 心跳、飞控早退、`CONTINUE_ON_FAILURE` 后续继续、
+  `STOP_ON_FAILURE` 跳过路径和批次摘要。
 
 P7 计划内主链路能力已完成；后续只保留更复杂的调度器集成，例如远程节点启动和资源配额。
 
@@ -668,16 +699,19 @@ tools/plot
 
 P8 当前已经完成第一批可验证工具和诊断输出：
 
-- 新增 `tools/log_convert`，支持 `--type sensor|command`、`--instance-id`、
-  `--input` 和 `--output`。
+- 新增 `tools/log_convert`，支持 `--type sensor|command|fc-internal`、`--instance-id`、
+  `--input`、`--output` 和 `--manifest`，并写 `REPLAY_PASSIVE` sidecar manifest。
 - `sensor_log.bin` 与 `command_log.bin` 可按固定线格式解码、校验实例号和 CRC，
   并转换为 CSV。
 - 新增 `tools/replay`，支持使用 `sensor_log.bin` 离线驱动飞控并生成新的
-  `command_log.bin`。
-- 新增 `tools/compare_logs`，支持按逐帧字段比较 `sensor_log.bin` 或
-  `command_log.bin`，可输出首个发散帧和最大误差 JSON。
+  `command_log.bin`，同时写 `REPLAY_WITH_FC` manifest 和输入/配置/输出 CRC。
+- 新增 `tools/compare_logs`，支持比较 `sensor_log.bin`、`command_log.bin` 或
+  `trajectory.csv`，可输出首个发散帧、最大误差和 `EXACT`/`TOLERANCE` 模式 JSON；
+  `configs/verification/log_compare_exact.json` 和 `log_compare_tolerance.json`
+  分别提供逐字节/逐行精确基准与版本化绝对/相对容差。
 - 新增 `tools/batch_stats`，支持汇总多个 `summary.json` 或
-  `campaign_summary.json`，输出命中率、脱靶量统计、失败数、故障影响统计和
+  `campaign_summary.json`，按全部实例输出命中率、脱靶量样本数/均值/标准差、
+  失败实例、失败原因分布、故障影响统计和
   数值诊断最大/最小值、模型降级 flags 按位或、气动 flags 按位或、气动外推采样数和
   wall-clock 性能统计。
 - 新增 `tools/batch_runner`，支持按清单顺序调用 `instance_manager --runtime`，
@@ -691,35 +725,37 @@ P8 当前已经完成第一批可验证工具和诊断输出：
   `${truncated_normal:stream:mean:stddev:min:max}` 确定性截断正态扰动、
   `${choice:stream:option|option}` 确定性离散选择，以及
   `${correlated_normal:stream:base_stream:mean:stddev:rho}` 确定性相关正态扰动。
+  手写清单和模板生成两种路径均写 `MONTE_CARLO` 工作流 manifest。
 - `closed_loop_test` 已接入真实 `sensor_log.bin` 回放和 `command_log.bin`
   比较，验证固定输入日志可重放出一致控制输出。
-- 顶层 CMake 新增 `MISSILE_ENABLE_COVERAGE`、`MISSILE_ENABLE_SANITIZERS` 和
-  `MISSILE_ENABLE_LONG_TESTS`，coverage 构建已通过 9 个默认 CTest；
-  sanitizer 构建会在配置阶段检查 ASan/UBSan 运行库；长测选项会额外启用
-  `long_campaign_pressure_test`。
+- 顶层 CMake 提供 `MISSILE_ENABLE_COVERAGE`、`MISSILE_ENABLE_SANITIZERS`、
+  `MISSILE_ENABLE_MEDIUM_TESTS` 和 `MISSILE_ENABLE_LONG_TESTS`；默认有 11 个 CTest，
+  sanitizer 构建会在配置阶段检查 ASan/UBSan 运行库。
 - 环境侧新增 `trajectory_diagnostics.csv`，记录四元数、DCM、质量/惯量、
   模型降级 flags、气动状态、积分器和合力/力矩诊断；`summary.json`、`campaign_summary.json`
   和 `batch_stats` 会聚合四元数范数误差、DCM 正交性误差、最小质量、最小惯量、
   模型降级 flags 按位或、气动 flags 按位或和气动外推采样数。
-- 飞控侧新增 `fc_internal_log.bin`，记录每帧模式、状态和主要控制中间量。
+- 飞控侧新增固定记录格式 `fc_internal_log.bin`，记录每帧模式、状态和主要控制中间量，
+  并由 `log_convert --type fc-internal` 解码。
 - 新增 `aero_database` 气动表模块，覆盖版本化固定小端文件、样本 CRC、单位校验、
   单调性校验、样本插值、包络外错误、钳制告警和保持上一有效值策略。
 - 环境程序支持 `aerodynamics.table_path` 和
   `aerodynamics.table_extrapolation_policy`，可选气动表已接入统一环境力模型。
-- `run_manifest.json` 会记录气动表启用状态、表文件路径、内部文件格式版本、
+- 环境程序支持 `aerodynamics.table_v2_path`，六维 v2 表已由双进程闭环测试覆盖。
+- `run_manifest.json` 会记录软件/Git/编译器/构建时间、配置文件列表/CRC32/输入快照、
+  运行模式和标准日志路径；同时记录气动表启用状态、表文件路径、内部文件格式版本、
   包络外策略来源/覆盖值、surrogate 模型路径/模型版本/训练数据版本，
   以及地形启用状态、LOS 遮挡开关、缺瓦片策略和瓦片路径列表。
 - 新增 `log_convert_test`，覆盖 `command_log.bin` 到 CSV 的转换路径。
 - 新增 `p8_tools_test`，覆盖 `replay`、`compare_logs`、`batch_stats`、诊断统计聚合和截断日志失败路径。
 - 新增 `batch_runner_test`，覆盖清单运行入口和 Monte Carlo runtime 模板展开。
-- 新增默认关闭的 `long_campaign_pressure_test`，覆盖 6 个闭环实例、并发上限 3、
-  `completed_count`/`failed_count`、诊断汇总和 wall-clock 性能字段。
+- 新增 `control_quality_report` 和版本化 criteria，覆盖标准机动与工程阈值。
+- 压力测试分为默认 short 4 实例/并发 2、可选 medium 16/4 和 long 128/8，
+  均校验 `completed_count`/`failed_count`、随机种子、诊断和 wall-clock 字段。
+- 真实来源 DEM fixture、资源清单和真实 DEM LOS 双进程闭环已进入回归。
 
-后续扩展仍应补充：
-
-- 真实 DEM 数据集基准、磁盘缓存和真实 DEM LOS 遮挡闭环测试。
-- Monte Carlo 外部采样清单导入、真实大规模长时资源压测、气动表舵偏/高度维度、
-  真实数据基准、复杂代理模型训练/推理和真实 DEM 数据基准。
+P8 工程验收已经完成。真实目标机器长时容量、真实气动/器件数据和复杂代理模型训练
+属于 V6/V7 扩展，不计入 P8 软件工具链完成度。
 
 ### 11.6 P8 后模型保真度扩展
 
@@ -728,12 +764,14 @@ P8 完成后再推进以下能力，避免在回放和回归基础不稳时引�
 ```text
 aero_database
   已完成 Mach / AoA / beta 样本插值、版本化文件格式、CRC/单位校验和配置接入；
-  `run_manifest.json` 已记录表文件路径、内部文件格式版本、策略覆盖信息，以及
-  可选高度/舵偏包线元数据；待扩展 v2 多维表插值和真实数据基准。
+  v2 已完成 Mach / AoA / beta / 高度 / 俯仰舵偏 / 偏航舵偏六维规则网格、
+  64 角多线性插值、固定小端文件、CRC、三种包络策略、主力模型和闭环接入；
+  `run_manifest.json` 记录 v2 路径、版本和六轴维度。真实数据基准仍需 V6。
 
 aero_surrogate
-  已在 `run_manifest.json` 追踪 surrogate 模型路径、模型版本和训练数据版本；
-  已接入固定文本格式线性只读推理，覆盖缺项拒绝、Mach/alpha/beta 线性推理和气动力主路径；
+  已在 `run_manifest.json` 追踪 surrogate 模型路径、模型版本、训练数据版本和适用包线；
+  已接入固定文本格式线性只读推理，覆盖缺项拒绝、Mach/alpha/beta 线性推理、
+  包线外拒绝和气动力主路径；
   待扩展离线训练、复杂代理模型和真实数据基准。
 
 map_preprocess
@@ -744,7 +782,7 @@ map_preprocess
   索引内相对瓦片路径会按索引文件所在目录解析；
   `--nodata-fill` 显式缺测填补、`map.terrain.cache_tile_count` 固定槽位 LRU 懒加载/淘汰、
   `summary.json` 地形缓存统计已接入；
-  已接入合成山脊 LOS 遮挡闭环场景；待扩展真实 DEM 数据集基准、磁盘缓存和真实 DEM LOS 场景。
+  已接入带来源/哈希清单的珠峰附近真实来源 DEM fixture，以及真实 DEM LOS 遮挡闭环场景。
 
 diagnostics
   已聚合四元数范数误差、DCM 正交性误差、最小质量、最小惯量、

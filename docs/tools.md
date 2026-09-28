@@ -1,6 +1,6 @@
 # 工具使用指南
 
-> 更新时间：2026-07-05
+> 更新时间：2026-08-20
 > 本文说明 `tools/` 下各命令行工具的用途、输入输出和常见组合方式。
 
 ## 1. 使用前准备
@@ -43,12 +43,13 @@ runs/baseline_dev_001/
 | 工具 | 作用 | 常用输入 | 常用输出 |
 |---|---|---|---|
 | `instance_manager` | 启动一个或多个飞控-环境闭环实例 | `runtime.json` | `campaign_summary.json`、各实例运行目录 |
-| `log_convert` | 把二进制协议日志转为 CSV | `sensor_log.bin` 或 `command_log.bin` | CSV 或 stdout |
+| `log_convert` | 把协议或飞控内部二进制日志转为 CSV | sensor、command 或 `fc_internal_log.bin` | CSV 或 stdout |
 | `replay` | 用传感器日志离线重新驱动飞控 | `sensor_log.bin`、`flight_control.json` | 新的 `command_log.bin` |
-| `compare_logs` | 比较两份二进制协议日志 | 两份 sensor/command 日志 | JSON 对比报告或 stdout |
+| `compare_logs` | 比较两份协议日志或真值轨迹 | 两份 sensor/command 日志或 `trajectory.csv` | JSON 对比报告或 stdout |
 | `batch_stats` | 聚合单实例或批次摘要 | `summary.json`、`campaign_summary.json` | `stats.json` 或 stdout |
 | `map_preprocess` | 把高程网格转成内部地形瓦片 | 裸 ASCII、ESRI ASCII Grid、SRTM HGT | `*.tile`、可选二进制索引 |
 | `batch_runner` | 顺序运行多个 runtime，或生成 Monte Carlo runtime 清单 | runtime 清单或模板 | 多个批次输出、可选聚合统计 |
+| `control_quality_report` | 执行标准飞控机动并按阈值验收 | 飞控配置、criteria JSON | 控制品质 JSON 报告 |
 | `tools/plot/*.py` | 生成轨迹、状态、诊断和批次统计图 | `trajectory.csv`、`trajectory_diagnostics.csv`、`campaign_summary.json` | PNG |
 
 ## 3. instance_manager
@@ -63,6 +64,8 @@ runs/baseline_dev_001/
 参数：
 
 - `--runtime PATH`：运行时配置。省略时使用程序默认路径。
+- `--help`：打印参数帮助并成功退出。
+- `--version`：打印项目和协议版本并成功退出。
 
 重点看这些输出：
 
@@ -71,6 +74,10 @@ runs/baseline_dev_001/
 - `runs/<campaign>/instance_XXXX/summary.json`
 - `runs/<campaign>/instance_XXXX/sensor_log.bin`
 - `runs/<campaign>/instance_XXXX/command_log.bin`
+
+`run_manifest.json` 包含 Git/构建身份、逐配置 CRC32 和实际输入快照路径；
+`campaign_summary.json` 包含互斥的命中/未命中/超时计数、脱靶量 min/max/mean/std
+和失败实例列表。
 
 `runtime.json` 中的 `instances[]` 决定每个实例的 `instance_id`、配置路径、随机种子和启用状态。
 实例之间不共享运行时状态。
@@ -99,12 +106,28 @@ runs/baseline_dev_001/
   --output runs/baseline_dev_001/instance_0000/sensor_log.csv
 ```
 
+转换飞控内部日志：
+
+```sh
+./build/tools/log_convert/log_convert \
+  --type fc-internal \
+  --instance-id 0 \
+  --input runs/baseline_dev_001/instance_0000/fc_internal_log.bin \
+  --output runs/baseline_dev_001/instance_0000/fc_internal_log.csv
+```
+
 参数：
 
-- `--type sensor|command`：日志类型，必须和输入文件匹配。
+- `--type sensor|command|fc-internal`：日志类型，必须和输入文件匹配。
 - `--instance-id N`：只接受该实例号的报文。
 - `--input PATH`：输入二进制日志。
 - `--output PATH`：输出 CSV；省略时写到 stdout。
+- `--manifest PATH`：可选，指定 `REPLAY_PASSIVE` 运行清单。省略时使用
+  `<output>.run_manifest.json`；若输出到 stdout，则使用
+  `<input>.replay_passive.run_manifest.json`。
+
+清单记录输入/输出路径、流式 CRC32、字节数、记录数、协议和构建身份。被动回放不重新
+计算随机过程，因此 `random_seed` 为 `null`，并明确标记种子只存在于历史运行 provenance。
 
 常见用途：
 
@@ -131,6 +154,11 @@ runs/baseline_dev_001/
 - `--config PATH`：飞控配置。
 - `--input sensor_log.bin`：原始传感器日志。
 - `--output command_log.bin`：回放生成的控制命令日志。
+- `--manifest PATH`：可选，指定 `REPLAY_WITH_FC` 运行清单；省略时使用
+  `<output>.run_manifest.json`。
+
+回放清单记录飞控配置 schema/CRC、传感器输入 CRC、命令输出 CRC、输入帧数、输出命令数、
+Git/编译身份和协议版本。回放失败时工具返回非零；成功清单中的 `status` 为 `SIM_OK`。
 
 常见用途：
 
@@ -140,7 +168,7 @@ runs/baseline_dev_001/
 
 ## 6. compare_logs
 
-用途：逐帧比较两份二进制协议日志，定位首个发散帧和数值差异。
+用途：比较两份二进制协议日志或两份 `trajectory.csv`，定位首个发散帧和数值差异。
 
 比较原始命令日志和回放命令日志：
 
@@ -150,25 +178,31 @@ runs/baseline_dev_001/
   --instance-id 0 \
   --left runs/baseline_dev_001/instance_0000/command_log.bin \
   --right runs/baseline_dev_001/instance_0000/replayed_command_log.bin \
-  --abs-tol 1e-9 \
-  --rel-tol 1e-9 \
+  --tolerance-config configs/verification/log_compare_exact.json \
   --output runs/baseline_dev_001/instance_0000/command_compare.json
 ```
 
 参数：
 
-- `--type command|sensor`：比较控制命令日志或传感器日志。
+- `--type command|sensor|trajectory`：比较控制命令、传感器日志或真值轨迹 CSV。
 - `--instance-id N`：只接受该实例号的报文。
-- `--left A.bin`：基准日志。
-- `--right B.bin`：待比较日志。
+- `--left PATH`：基准协议日志或轨迹 CSV。
+- `--right PATH`：待比较协议日志或轨迹 CSV。
 - `--abs-tol X`：绝对容差；省略时使用工具默认值。
 - `--rel-tol X`：相对容差；省略时使用工具默认值。
+- `--tolerance-config FILE`：版本化 JSON 容差；命令行绝对/相对容差会覆盖文件值。
 - `--output result.json`：输出 JSON；省略时写到 stdout。
+
+比较模式：
+
+- `log_compare_exact.json`：绝对/相对容差均为零。协议日志按完整字节比较，轨迹按完整表头和数据行比较；报告为 `EXACT`。
+- `log_compare_tolerance.json`：按浮点绝对/相对阈值比较；协议字段、状态位、实例号、序号和模式仍精确匹配；报告为 `TOLERANCE`。
 
 常见用途：
 
 - 回放一致性检查：`command_log.bin` 对比 `replayed_command_log.bin`。
 - 固定种子回归：两次运行的 `sensor_log.bin` 或 `command_log.bin` 对比。
+- 环境真值回归：两次运行的 `trajectory.csv` 精确或容差对比。
 - 协议或飞控改动后定位第一个行为差异。
 
 ## 7. batch_stats
@@ -197,8 +231,9 @@ runs/baseline_dev_001/
 - `--input summary.json`：可重复指定；既可传单实例摘要，也可传批次摘要。
 - `--output stats.json`：输出统计 JSON；省略时写到 stdout。
 
-统计内容包括命中率、脱靶量、故障影响步数、诊断采样数、四元数误差、DCM 正交误差、
-质量/惯量下限、模型降级 flags、气动 flags、气动外推采样数和 wall-clock 耗时。
+统计内容包括命中率、脱靶量样本数/min/max/mean/std、失败实例和失败原因分布、
+故障影响步数、诊断采样数、四元数误差、DCM 正交误差、质量/惯量下限、
+模型降级 flags、气动 flags、气动外推采样数和 wall-clock 耗时。
 
 ## 8. map_preprocess
 
@@ -260,7 +295,8 @@ SRTM HGT 会从 `N30E120.hgt` 这类文件名推导 1 度瓦片范围：
 
 - SRTM HGT 的 void 值是 `-32768`，实际使用时应显式给 `--nodata-fill`。
 - 索引中的相对瓦片路径按索引文件所在目录解析，便于移动整个 DEM 目录。
-- 仓库不自带真实 DEM 数据集；真实数据的许可证和来源需要单独记录。
+- `tests/fixtures/dem/` 提供带来源、SHA-256 和回归预期的珠峰附近 9x9 真实来源最小 fixture。
+- 生产 DEM 的许可证、完整性、覆盖范围和高程基准仍需在独立资源清单中记录。
 
 ## 9. batch_runner
 
@@ -294,6 +330,8 @@ configs/baseline/runtime.json runs/baseline_dev_001/campaign_summary.json
 - `--batch-stats PATH`：可选，运行结束后调用 `batch_stats`。
 - `--output stats.json`：可选，聚合统计输出路径。
 - `--stop-on-failure`：任一 runtime 失败后停止后续运行。
+- `--run-manifest PATH`：可选，指定 `MONTE_CARLO` 工作流清单；省略时使用
+  `<runs.txt>.run_manifest.json`。
 
 ### 9.2 生成 Monte Carlo runtime 清单
 
@@ -314,6 +352,7 @@ configs/baseline/runtime.json runs/baseline_dev_001/campaign_summary.json
 - `--sample-count N`：样本数。
 - `--base-seed SEED`：基础种子；省略时使用工具默认值。
 - `--instance-manager PATH`：可选；生成后也可以继续调用管理器运行。
+- `--run-manifest PATH`：可选，覆盖默认 `<runs.txt>.run_manifest.json`。
 
 模板中可使用这些占位符：
 
@@ -330,6 +369,9 @@ configs/baseline/runtime.json runs/baseline_dev_001/campaign_summary.json
 - `${correlated_normal:stream:base_stream:mean:stddev:rho}`
 
 同一 `base_seed`、样本序号和 stream 会生成确定性扰动，适合可重复批量回归。
+工作流清单记录模板和运行列表 CRC、基础种子策略、请求/实际样本数、尝试/完成/失败数量、
+聚合统计路径和构建身份。各样本的具体配置版本与种子仍以生成的 runtime 和子运行
+`run_manifest.json` 为准。
 
 ## 10. 绘图工具
 
@@ -391,9 +433,32 @@ python3 tools/plot/plot_campaign.py \
 
 该图包含实例脱靶量散点、脱靶量分布、实例 wall-clock 耗时和完成/失败/命中计数。
 
-## 11. 常见工作流
+## 11. control_quality_report
 
-### 11.1 跑一次仿真并查看命令
+用途：使用实际 `FlightController` 链执行阶跃、指令反向和丢包恢复标准机动，计算
+上升时间、调节时间、超调、稳态误差、最大变化率和饱和占比。
+
+```sh
+./build/tools/control_quality/control_quality_report \
+  --flight-control configs/baseline/flight_control.json \
+  --criteria configs/verification/control_quality.json \
+  --output control_quality_report.json
+```
+
+参数：
+
+- `--flight-control PATH`：被验收的飞控配置。
+- `--criteria PATH`：版本化机动与阈值配置。
+- `--output PATH`：JSON 报告；省略时写到 stdout。
+
+报告的证据范围是工程 SIL 控制链，不代表真实对象稳定裕度或型号飞行品质。
+
+短中长压力测试、真实 DEM 证据和发布前检查见
+[验证与验收指南](verification_guide.md)。
+
+## 12. 常见工作流
+
+### 12.1 跑一次仿真并查看命令
 
 ```sh
 ./build/tools/instance_manager/instance_manager \
@@ -406,7 +471,7 @@ python3 tools/plot/plot_campaign.py \
   --output runs/baseline_dev_001/instance_0000/command_log.csv
 ```
 
-### 11.2 做飞控回放一致性检查
+### 12.2 做飞控回放一致性检查
 
 ```sh
 ./build/tools/replay/replay \
@@ -420,10 +485,11 @@ python3 tools/plot/plot_campaign.py \
   --instance-id 0 \
   --left runs/baseline_dev_001/instance_0000/command_log.bin \
   --right runs/baseline_dev_001/instance_0000/replayed_command_log.bin \
+  --tolerance-config configs/verification/log_compare_exact.json \
   --output runs/baseline_dev_001/instance_0000/command_compare.json
 ```
 
-### 11.3 做一组批量运行并聚合
+### 12.3 做一组批量运行并聚合
 
 ```sh
 ./build/tools/batch_runner/batch_runner \
@@ -433,7 +499,7 @@ python3 tools/plot/plot_campaign.py \
   --output batch_stats.json
 ```
 
-## 12. 排错
+## 13. 排错
 
 - 工具提示 `bad packet` 或 CRC 错误：确认 `--type` 是否和日志文件匹配，确认日志没有截断。
 - 工具提示 instance 不匹配：确认 `--instance-id` 和运行实例一致。

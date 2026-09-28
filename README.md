@@ -14,37 +14,53 @@ environment_sim
 
 文档入口：
 
+- [当前进度、成熟度与真实可用差距](docs/current_progress_and_gaps.md)：当前状态的唯一摘要入口，按多条成熟度轴说明已完成能力、现代平台差距和真实交付门槛。
 - [新成员上手指南](docs/onboarding.md)：按阅读顺序、构建运行、工具用途和常见改法快速进入项目。
 - [工具使用指南](docs/tools.md)：说明 `instance_manager`、日志转换、回放、比较、批量统计、地图预处理、批跑和绘图工具的用法。
+- [验证与验收指南](docs/verification_guide.md)：统一说明 V0-V7、默认回归、控制品质、容差基准和短中长压力测试。
 - [项目框架与当前实现](docs/project_framework.md)：以现有源码为准的模块、数据流、集成状态和缺口。
 - [总体设计](docs/design.md)：系统的目标架构、数学模型、完整能力设计和当前设计收敛基线。
 - [实现计划](docs/implementation_plan.md)：P0-P8 阶段任务和验收标准。
 - [与主流飞行仿真软件的差距调研](docs/flight_sim_software_comparison.md)：对比 JSBSim、FlightGear、X-Plane、MSFS、Aerospace Blockset、NASA Trick 和 STK，明确本项目边界与后续路线。
 - [飞行仿真与气动弹道研究调研](docs/research_survey_flight_sim_aero_ballistics.md)：历史研究背景，进度数字以 README 和项目框架为准。
+- [闭环仿真程序的研究依据报告](docs/research_report_evidence_basis.md)：把公开文献与现有设计、源码和测试逐项对应，并说明证据边界。
 
 ## 当前进度
 
 实现工作按照 [实现计划](docs/implementation_plan.md) 推进。
 
-当前总体实现进度约为 **99%**。该比例按实现计划中的模块和验收项粗略计算，
-表示工程功能完成度，不表示已经达到可交付武器级或适航级软件成熟度。
+当前状态不能用一个“完成百分比”概括：
 
-| 阶段 | 状态 | 估算 | 已实现内容 |
-|---|---|---:|---|
-| P0 工程骨架 | 完成 | 100% | C11、CMake、严格警告、CTest、三个可执行程序 |
-| P1 common | 完成 | 100% | 状态码、向量、矩阵、四元数、仿真时间、随机数、CRC32、环形缓冲区、日志 |
-| P2 协议与配置 | 完成 | 100% | JSON 语法、schema_version 和必填字段校验；固定小端线协议、CRC、版本和实例号校验 |
-| P3 单实例闭环 | 完成 | 100% | 双进程 UDP LOCKSTEP、二进制日志、运行清单、事件日志、摘要和集成测试 |
-| P4 地球与地形 | 基本完成 | 99% | WGS-84、LLA/ECEF、ENU/NED、固定格式地形瓦片、`map.tile_path`/`map.tile_paths[]`/`map.tile_index_path` 文本/二进制空间索引加载、`cache_tile_count` 固定槽位 LRU 懒加载/淘汰、裸 ASCII/ESRI ASCII Grid/SRTM HGT 预处理、NODATA 显式填补、DEM 插值、AGL、碰撞、LOS 遮挡和合成山脊遮挡闭环；真实 DEM 数据集基准和磁盘缓存未接入 |
-| P5 环境与传感器 | 基本完成 | 99% | 环境力链、四类传感器误差/延迟/丢包、基础故障脚本、漂移、斜坡恢复偏置、卡常值、整帧通信丢失、锁步安全通信延迟和上一帧重放乱序故障、故障统计、数值诊断、错误路径和固定种子回归已接入 |
-| P6 飞控系统 | 主链路基本完成 | 94% | `missile_flight_control` 静态库、状态机、健康/保护、估计、制导管理、姿态/角速度自动驾驶仪、舵面控制分配、命令管理、多速率调度、幅值/变化率限制、飞控内部日志和单元测试；已覆盖 PNG 方向/限幅/NaN 拒绝、自动驾驶仪内环开关路径、通信恢复后的安全监控恢复边界和连续帧控制品质边界 |
-| P7 多实例 | 完成 | 100% | `instances[]` 逐实例计划、显式随机种子、并发/串行调度、子程序路径配置化、端口预检、应用层 ready 心跳、失败返回码、任务摘要和管理器集成测试 |
-| P8 回放与验证 | 基本完成 | 99% | 二进制日志、轨迹 CSV、数值诊断、模型降级 flags、气动包线 flags 和 wall-clock 性能统计汇总、任务摘要、绘图脚本、`log_convert`、`replay`、`compare_logs`、`batch_stats`、`map_preprocess`、`batch_runner`、版本化气动表文件、固定格式线性 surrogate 只读推理、气动/地形资源/surrogate 资源 manifest 追踪、Monte Carlo 模板展开和确定性均匀/LHS 均匀/Halton 低差异均匀/正态/对数正态/截断正态/离散选择/相关正态扰动、真实闭环回放比较、覆盖率/sanitizer 构建配置、可选多实例压力 CTest 和工具测试；真实数据基准、更复杂采样策略、复杂代理模型训练/推理和真实大规模长时资源压测仍未实现 |
+- **仓库内软件平台：P0-P8/V0-V5 验收入口已闭合**。构建、单元、双进程闭环、回放、
+  Monte Carlo、运行清单、性能和压力测试均有实现与自动证据。
+- **目标型号可用性：未完成 V6/V7**。缺目标外形气动/推进/器件标定、独立工具或试验
+  相关性、真实飞控接口、HIL/台架和目标硬件实时性证据。
+- **当前可声明能力**：软件在环闭环工程基线，可用于模型开发和回归。
+- **当前不可声明能力**：真实型号精度、实物命中性能、合格飞控或与成熟商业平台等价。
+
+完整多轴状态、P0/P1 缺口和真实可用门槛见
+[当前进度、成熟度与真实可用差距](docs/current_progress_and_gaps.md)。
+
+| 阶段 | 状态 | 已实现内容 |
+|---|---|---|
+| P0 工程骨架 | 完成 | C11、CMake、严格警告、CTest 和三个主程序 |
+| P1 common | 完成 | 状态码、数学、仿真时间、随机数、CRC32、环形缓冲区和日志 |
+| P2 协议与配置 | 完成 | JSON 校验；固定小端线协议、CRC、版本和实例号校验 |
+| P3 单实例闭环 | 软件验收完成 | 双进程 UDP、LOCKSTEP/FREE_RUNNING、SIL_FAST/SIL_REALTIME、配置快照/CRC、运行清单、性能和集成测试 |
+| P4 地球与地形 | 完成 | WGS-84、坐标变换、瓦片/索引、固定槽位磁盘懒加载 LRU、三类 DEM 预处理、真实来源 fixture、AGL/碰撞和真实 DEM LOS 闭环 |
+| P5 环境与传感器 | 软件验收完成 | 6DOF/RK4、质量/惯量/质心演化、脚本目标机动、连续命中判定、风和多率传感器，以及完整传感器/执行机构/通信故障矩阵 |
+| P6 飞控系统 | 完成 | 状态机、保护、估计、PNG、自动驾驶仪、控制分配、多速率调度、命令管理、正式内部日志解码和标准机动控制品质报告 |
+| P7 多实例 | 完成 | 逐实例计划/种子、并发/串行、端口预检、ready 心跳、继续/停止失败策略和任务摘要 |
+| P8 回放与验证 | 软件验收完成 | 被动/带飞控回放、工作流 manifest、精确/容差比较、统计、Monte Carlo、绘图、v1/v2 气动表和 4/16/128 压力层级 |
 
 当前环境主循环已经使用 ECEF 真值状态、六自由度刚体状态、三轴虚拟执行机构和
 RK4 积分。重力、大气、气动、推进、质量消耗和地球自转项已经通过统一环境力模型
 组成 `force_b`、`moment_b` 和 ECEF 重力输入。基线启用重力、大气、低阻力气动和
-地球自转，推进模型进入主链路但默认关闭。
+地球自转，推进模型进入主链路但默认关闭。可选质量属性模型会随推进剂比例更新质心和
+完整惯量张量；风模型支持高度切变、正弦阵风和固定种子的一阶高斯-马尔可夫湍流。
+目标真值模型支持 `CONSTANT_VELOCITY` 和按 ECEF 常加速度段配置的
+`SCRIPTED_ACCELERATION`；机动开始/结束边界在步内分段积分。命中与最近点统计使用步间
+连续相对线段，避免两个离散端点都在命中半径外时漏掉高速穿越。
 
 飞控指令当前仍保留加速度级虚拟执行机构形成等效控制力，同时自动驾驶仪已经把
 PNG 加速度转换为姿态命令、角速度命令和俯仰/偏航舵偏；环境气动模型会消费这些
@@ -53,9 +69,10 @@ PNG 加速度转换为姿态命令、角速度命令和俯仰/偏航舵偏；环
 支持偏置、白噪声、随机游走、量化、限幅、采样保持、延迟和整帧丢包。基线导引头
 延迟为 20 ms，飞控会对延迟预热、丢包或遮挡帧返回受控零指令。
 
-基础 `faults.json` 故障脚本已经进入环境主链路，当前支持传感器偏置、
-传感器线性漂移、传感器斜坡恢复偏置、传感器卡常值、传感器强制无效/丢包、
-锁步安全的整帧通信窗口无效化、锁步安全的通信层帧延迟、锁步安全的上一帧重放乱序、虚拟执行机构卡滞和命令缩放，并会记录故障开始/恢复事件。
+基础 `faults.json` 故障脚本已经进入环境主链路，当前支持传感器偏置、漂移、斜坡恢复、
+噪声增大、强制无效/丢包、起点卡滞、动态延迟和饱和；执行机构卡滞、偏置、命令缩放、
+速率/行程退化、延迟和失能；以及报文丢弃、固定/模式变延迟、重复、CRC 损坏和上一帧
+重放乱序。故障使用实例私有随机流，并记录开始/恢复事件。
 通信延迟故障使用 `target: "sensor.frame"`、`type: "COMMUNICATION_DELAY"` 或
 `"FRAME_DELAY"`，`value` 为 1 到 16 的延迟步数；故障激活预热期会发送无效帧，
 延迟线填满后发送滞后帧，让飞控旧帧/保持保护路径接管。
@@ -64,6 +81,12 @@ PNG 加速度转换为姿态命令、角速度命令和俯仰/偏航舵偏；环
 用于覆盖协议旧帧拒绝和控制保持路径，同时不破坏一帧一指令的闭环节拍。
 通信层 `sensor.frame` 故障可配置 `recovery_hold_s`，在主故障窗口结束后继续保持
 故障效果一段时间，再记录恢复事件，用于覆盖飞控超时后的恢复边界。
+通信故障还可用 `burst_period_s`/`burst_active_s` 形成周期突发；
+`COMMUNICATION_JITTER` 使用 `delay_pattern_steps` 生成确定性变延迟。示例见
+`configs/verification/faults_communication_stress.json`。
+真实 UDP 报文故障使用 `COMM_FAULT_DROP_PACKET`、`COMM_FAULT_DUPLICATE_PACKET` 和
+`COMM_FAULT_CORRUPT_PACKET`；这类故障建议在 `FREE_RUNNING` 下测试恢复，在
+`LOCKSTEP` 下丢包或损坏报文会按设计触发控制接收超时。
 `summary.json` 会输出故障配置数量、触发/恢复次数、故障激活步数、传感器/执行机构
 影响步数和数值诊断最大/最小值；`campaign_summary.json` 会聚合成功实例的故障和数值诊断统计。闭环回归会用同一固定种子
 运行两次，并逐字节比较 `summary.json` 和 `sensor_log.bin`。环境侧会写出
@@ -71,17 +94,24 @@ PNG 加速度转换为姿态命令、角速度命令和俯仰/偏航舵偏；环
 惯量、模型降级 flags、积分器和合力/力矩诊断。
 飞控状态机、按 `scheduler.tasks[]` 执行的多速率调度、估计器、制导管理器、
 姿态/角速度自动驾驶仪、控制分配、命令管理、变化率限制和保护状态位已经进入主链路。
-飞控进程会在实例输出目录写出 `fc_internal_log.bin`，用于记录每帧保护/模式和控制中间量。
+飞控进程会在实例输出目录写出固定 92 字节记录格式的 `fc_internal_log.bin`，
+`log_convert --type fc-internal` 可正式解码为 CSV。`control_quality_report` 使用真实飞控链
+执行阶跃、反向和丢包恢复机动，并按版本化阈值输出工程控制品质报告。
 地形接口、`map.tile_path`/`map.tile_paths[]`/`map.tile_index_path` 文本/二进制空间索引瓦片加载、裸 ASCII/ESRI ASCII Grid 到内部瓦片格式的
-`map_preprocess` 工具、`--index-output` 二进制索引输出和运行时固定槽位 LRU 瓦片缓存已经完成，但仓库中尚无真实 DEM 数据集，基线配置使用
-`FLAT_FILL` 零高程策略。环境运行清单会记录地形启用状态、LOS 遮挡开关、缺瓦片策略、
+`map_preprocess` 工具、`--index-output` 二进制索引输出和运行时固定槽位 LRU 瓦片缓存已经完成。
+仓库提供带来源 URL、访问日期和 SHA-256 的珠峰附近 9x9 真实来源 DEM fixture，
+预处理测试和双进程闭环都覆盖阻挡 LOS；baseline 仍使用 `FLAT_FILL` 零高程策略。
+环境运行清单会记录地形启用状态、LOS 遮挡开关、缺瓦片策略、资源清单路径、
 平坦填充高度、瓦片索引路径和本实例加载的瓦片路径列表。
 
 环境库新增 `aero_database` 气动表查询模块，支持版本化固定小端文件格式、样本 CRC、
 Mach/迎角/侧滑角样本插值以及 `ERROR`、`CLAMP_AND_WARN`、`HOLD_LAST_VALID`
 三种包络外策略。环境程序可通过 `aerodynamics.table_path` 加载只读气动表；
-未配置时仍使用简化二次阻力/线性舵效 baseline。`run_manifest.json` 会记录气动表启用状态、
-表文件路径、内部文件格式版本、包络外策略来源/覆盖值，以及可选高度/舵偏包线元数据。
+也可通过 `aerodynamics.table_v2_path` 加载 Mach、迎角、侧滑角、高度、俯仰舵偏和
+偏航舵偏六维规则网格。v2 使用 64 角多线性插值，不再重复叠加低阶舵效。
+未配置时仍使用简化二次阻力/线性舵效 baseline。线性 surrogate 会校验
+Mach/迎角/侧滑角适用包线，包线外拒绝推理。`run_manifest.json` 会记录路径、
+文件格式版本、策略来源、v2 六轴维度和 surrogate 包线。
 
 `docs/design.md` 第 21 节已经把当前可执行设计收敛为工程基线，明确了环境被控对象、
 传感器、飞控、多实例、GPU/并行化边界，以及 P5-P8 的完成判据。`docs/project_framework.md`
@@ -112,7 +142,7 @@ flight_control_sim/     导航、制导、控制和飞控保护
 tools/instance_manager/ 多实例进程编排
 tools/log_convert/      二进制协议日志到 CSV 转换
 tools/replay/           使用 sensor_log.bin 重新驱动飞控生成 command_log.bin
-tools/compare_logs/     对比 sensor/command 二进制日志并输出 JSON 结果
+tools/compare_logs/     对比 sensor/command 二进制日志或 trajectory.csv 并输出 JSON 结果
 tools/batch_stats/      聚合 summary.json 与 campaign_summary.json
 tools/map_preprocess/   ASCII 高程网格到内部地形瓦片的预处理工具
 tools/batch_runner/     批次清单入口，顺序调用 instance_manager 并可选聚合统计
@@ -155,34 +185,44 @@ CCACHE_DISABLE=1 cmake -S . -B /tmp/missile_sanitize_build -DMISSILE_ENABLE_SANI
 
 该选项会在配置阶段检查 ASan/UBSan 运行库是否可用；当前环境缺少 ASan 运行库时会明确失败。
 
-可选多实例压力测试构建：
+可选 128 实例长压力测试构建：
 
 ```sh
 CCACHE_DISABLE=1 cmake -S . -B /tmp/missile_long_build -DMISSILE_ENABLE_LONG_TESTS=ON
 CCACHE_DISABLE=1 cmake --build /tmp/missile_long_build
-CCACHE_DISABLE=1 ctest --test-dir /tmp/missile_long_build -R long_campaign_pressure_test --output-on-failure
+CCACHE_DISABLE=1 ctest --test-dir /tmp/missile_long_build -R campaign_pressure_long_test --output-on-failure
 ```
 
-`long_campaign_pressure_test` 会启动 6 个闭环实例、并发上限 3，检查
+`campaign_pressure_long_test` 会启动 128 个闭环实例、并发上限 8，检查
 `campaign_summary.json` 中的 completed/failed 计数、诊断汇总和 wall-clock
-性能字段。它不是默认回归测试，避免拖慢常规开发循环。
+性能字段。`MISSILE_ENABLE_MEDIUM_TESTS=ON` 另提供 16 实例、并发 4 的 medium 层；
+默认 short 层为 4 实例、并发 2。完整命令见 [验证与验收指南](docs/verification_guide.md)。
 
 当前 CTest 包含：
 
 - `common_tests`：数学、随机数、环形缓冲区、配置和二进制协议。
-- `environment_tests`：地球坐标、地形、执行机构、气动数据库、环境模型和 6DOF 积分。
+- `environment_tests`：地球坐标、地形、执行机构、质量惯量、风模型、v1/v2 气动数据库、通信故障、环境力和 6DOF 积分。
 - `flight_control_tests`：P6 飞控状态机、三维 PNG 方向/限幅/NaN 拒绝、自动驾驶仪内环开关、命令限幅/变化率限制、通信恢复后的安全监控恢复边界、连续帧控制品质边界和保护动作。
-- `closed_loop_test`：飞控与环境双进程 UDP 闭环回归，并检查飞控内部日志、轨迹诊断、summary 诊断汇总和真实传感器日志回放比较。
-- `instance_manager_test`：P7 多实例计划解析、显式随机种子、端口隔离、端口占用预检、应用层 ready 心跳、飞控早退失败路径、`STOP_ON_FAILURE` 跳过路径和任务摘要。
-- `log_convert_test`：P8 `command_log.bin` 到 CSV 的协议解码转换。
-- `p8_tools_test`：P8 `replay`、`compare_logs`、`batch_stats` 正常路径、诊断/气动 flags 统计聚合和截断日志失败路径。
-- `map_preprocess_test`：ASCII 高程网格转内部瓦片、CRC 加载和 DEM 插值。
+- `closed_loop_test`：飞控与环境双进程 UDP 闭环回归，并检查真实来源 DEM LOS 遮挡、v1/v2 气动表、内部日志、轨迹诊断和真实日志回放比较。
+- `instance_manager_test`：P7 并发/串行多实例计划、显式随机种子、端口隔离、端口占用预检、应用层 ready 心跳、飞控早退、`CONTINUE_ON_FAILURE` 继续和 `STOP_ON_FAILURE` 跳过路径及任务摘要。
+- `log_convert_test`：sensor、command 和 `fc_internal_log.bin` 到 CSV 的正式解码转换。
+- `p8_tools_test`：P8 `replay`、二进制/轨迹精确与容差比较、`batch_stats` 脱靶统计/失败原因/诊断/气动 flags 聚合和截断日志失败路径。
+- `map_preprocess_test`：ASCII/ESRI/HGT、真实来源 DEM、CRC、插值和 LOS 回归。
 - `batch_runner_test`：批次清单解析、`instance_manager --runtime` 顺序调用和 Monte Carlo runtime 模板展开。
-- `long_campaign_pressure_test`：可选启用，覆盖 6 实例并发压力运行和 wall-clock 汇总字段。
+- `control_quality_test`：阶跃、反向和丢包恢复控制品质阈值。
+- `campaign_pressure_short_test`：默认 4 实例短压力；medium/long 可选覆盖 16/128 实例。
 
 `closed_loop_test` 会在本机回环地址创建 UDP 端口。如果运行环境限制网络命名空间，需要允许本地 UDP 回环通信。
 
 ## 单实例运行
+
+三个主程序都支持稳定的帮助、版本和错误退出码接口：
+
+```sh
+./build/environment_sim/environment_sim --version
+./build/flight_control_sim/flight_control_sim --version
+./build/tools/instance_manager/instance_manager --version
+```
 
 先启动飞控，再启动环境程序：
 
@@ -224,7 +264,8 @@ wait "$fc_pid"
 可绑定预检。环境进程支持 `--random-seed`，`run_manifest.json` 会记录实例实际使用
 的随机种子；`campaign_summary.json` 会记录每个实例的配置路径、端口、种子、退出
 状态和故障统计。管理器启动环境前会等待飞控应用层 ready 心跳，并能识别
-飞控在绑定前早退，并覆盖端口占用预检失败，以及 `STOP_ON_FAILURE` 下首个实例失败后跳过后续实例。
+飞控在绑定前早退；集成测试覆盖端口占用预检、`CONTINUE_ON_FAILURE` 下后续实例继续，
+以及 `STOP_ON_FAILURE` 下首个实例失败后跳过后续实例。
 
 ## 输出文件
 
@@ -235,6 +276,9 @@ runs/baseline_dev_001/
   campaign_summary.json
   instance_0000/
     run_manifest.json
+    config_snapshot_scenario.json
+    config_snapshot_runtime.json
+    config_snapshot_faults.json
     event_log.txt
     fc_internal_log.bin
     sensor_log.bin
@@ -244,14 +288,14 @@ runs/baseline_dev_001/
     summary.json
 ```
 
-- `run_manifest.json`：软件版本、协议版本、配置路径、端口、步长、实例随机种子、气动表资源和地形资源追踪字段。
+- `run_manifest.json`：软件/Git/编译器/构建时间、协议、运行模式、配置路径与 CRC32、配置快照、端口、步长、随机种子、标准日志路径、气动/地形资源和 surrogate 包线。
 - `event_log.txt`：启动、命中、通信异常和停止事件。
 - `fc_internal_log.bin`：飞控每帧模式、状态、加速度、姿态、角速度等内部记录。
 - `sensor_log.bin`：固定小端线格式的完整传感器报文。
 - `command_log.bin`：固定小端线格式的完整控制指令报文。
 - `trajectory.csv`：导弹和目标的 ECEF/LLA 状态、AGL、速度、加速度、质量、推进剂、合力、合力矩、距离和闭合速度。
 - `trajectory_diagnostics.csv`：四元数、DCM、质量/惯量、模型降级 flags、气动状态和积分器诊断。
-- `summary.json`：命中结果、最小距离、最近点时刻、退出原因、故障统计和数值诊断汇总。
+- `summary.json`：命中结果、最小距离、最近点时刻、退出原因、最大指令/实际加速度、丢包/超时、故障统计和数值诊断汇总。
 
 转换控制命令日志为 CSV：
 
@@ -273,7 +317,7 @@ runs/baseline_dev_001/
   --output runs/baseline_dev_001/instance_0000/replayed_command_log.bin
 ```
 
-比较两个协议日志并输出 JSON：
+比较两个协议日志并输出 JSON。固定平台可复现回归使用逐字节精确配置：
 
 ```sh
 ./build/tools/compare_logs/compare_logs \
@@ -281,8 +325,12 @@ runs/baseline_dev_001/
   --instance-id 0 \
   --left runs/baseline_dev_001/instance_0000/command_log.bin \
   --right runs/baseline_dev_001/instance_0000/replayed_command_log.bin \
+  --tolerance-config configs/verification/log_compare_exact.json \
   --output runs/baseline_dev_001/instance_0000/command_compare.json
 ```
+
+跨平台浮点回归使用 `log_compare_tolerance.json`；环境真值可用
+`--type trajectory` 比较两份 `trajectory.csv`。
 
 聚合单实例或批次摘要：
 
@@ -292,7 +340,8 @@ runs/baseline_dev_001/
   --output runs/baseline_dev_001/batch_stats.json
 ```
 
-`batch_stats` 会聚合命中率、脱靶量、故障影响步数、诊断采样数、最大四元数范数误差、
+`batch_stats` 会聚合命中率、逐实例脱靶量均值/标准差、失败实例和失败原因分布、
+故障影响步数、诊断采样数、最大四元数范数误差、
 最大 DCM 正交性误差、最小质量、最小惯量对角线、模型降级 flags 按位或、气动 flags 按位或、
 气动外推采样数、campaign wall-clock 总耗时和最慢实例耗时。
 
@@ -372,15 +421,18 @@ DEM 瓦片目录整体移动到运行环境。
 生成的清单第二列指向每个样本输出目录下的 `campaign_summary.json`，
 可继续交给 `batch_stats` 汇总。
 
-## 下一阶段
+## 真实可用门槛
 
-当前设计已经收敛，剩余开发重点是把验证基础扩展到真实数据和更高保真模型：
+P0-P8 软件验收入口已经闭合，但产品完成度没有达到 100%。继续提升可信度需要项目外输入，
+不能用更多单元测试替代：
 
-1. 完成真实 DEM 数据集基准、磁盘缓存和真实 DEM LOS 遮挡闭环场景。
-2. 扩展带超时恢复的真实网络丢包/非锁步乱序等更完整故障类型库，以及真实数据基准、Monte Carlo 采样策略和性能测试。
-3. 扩展气动表舵偏/高度维度、复杂代理模型训练/推理和真实 DEM 数据基准。
+1. 为目标外形导入 CFD、风洞或公开权威气动数据，并完成 V6 外部交叉验证。
+2. 用真实 IMU、执行机构、推进和质量属性数据标定模型，记录器件版本与适用包线。
+3. 在目标机器执行长时间资源基准，并对接真实总线/HIL、台架或实测数据完成 V7。
+4. 如需非锁步网络，升级协议为独立传感器时间戳和异步队列语义，再验证时钟漂移与操作系统网络抖动。
 
-P5 基础能力已经可用；剩余工作主要是更多故障类型和真实数据资源。
+在这些证据完成前，项目定位保持为“软件在环闭环仿真研究原型和工程骨架”。
+更完整的优先级和放行门槛见 [current_progress_and_gaps.md](docs/current_progress_and_gaps.md)。
 
 ## 绘图工具
 
