@@ -2,6 +2,8 @@
  *  @brief 使用 sensor_log.bin 重新驱动飞控静态库生成 command_log.bin。
  */
 #include "common/config.h"
+#include "common/build_info.h"
+#include "common/provenance.h"
 #include "common/packet.h"
 #include "common/status.h"
 #include "fc/fc_state.h"
@@ -14,15 +16,38 @@ typedef struct ReplayOptions {
     const char *config_path;
     const char *input_path;
     const char *output_path;
+    const char *manifest_path;
+    char default_manifest_path[1024];
     uint32_t instance_id;
 } ReplayOptions;
+
+typedef struct ReplayResult {
+    uint64_t frame_count;
+} ReplayResult;
 
 static void print_usage(const char *argv0)
 {
     (void)fprintf(
         stderr,
-        "usage: %s --instance-id N --config PATH --input sensor_log.bin --output command_log.bin\n",
+        "usage: %s --instance-id N --config PATH --input sensor_log.bin --output command_log.bin "
+        "[--manifest PATH]\n",
         argv0);
+}
+
+static int parse_uint32_arg(const char *text, uint32_t *out)
+{
+    char *end = 0;
+    unsigned long value;
+
+    if (text == 0 || out == 0 || text[0] == '\0' || text[0] == '-') {
+        return 0;
+    }
+    value = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || value > UINT32_MAX) {
+        return 0;
+    }
+    *out = (uint32_t)value;
+    return 1;
 }
 
 static SimStatus parse_args(int argc, char **argv, ReplayOptions *out)
@@ -40,7 +65,9 @@ static SimStatus parse_args(int argc, char **argv, ReplayOptions *out)
             exit(0);
         }
         if (strcmp(argv[i], "--instance-id") == 0 && (i + 1) < argc) {
-            out->instance_id = (uint32_t)strtoul(argv[++i], 0, 10);
+            if (!parse_uint32_arg(argv[++i], &out->instance_id)) {
+                return SIM_ERR_CONFIG;
+            }
             continue;
         }
         if (strcmp(argv[i], "--config") == 0 && (i + 1) < argc) {
@@ -55,9 +82,28 @@ static SimStatus parse_args(int argc, char **argv, ReplayOptions *out)
             out->output_path = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--manifest") == 0 && (i + 1) < argc) {
+            out->manifest_path = argv[++i];
+            continue;
+        }
         return SIM_ERR_CONFIG;
     }
-    return out->input_path != 0 && out->output_path != 0 ? SIM_OK : SIM_ERR_CONFIG;
+    if (out->input_path == 0 || out->output_path == 0) {
+        return SIM_ERR_CONFIG;
+    }
+    if (out->manifest_path == 0) {
+        const int written = snprintf(
+            out->default_manifest_path,
+            sizeof(out->default_manifest_path),
+            "%s.run_manifest.json",
+            out->output_path);
+
+        if (written < 0 || (size_t)written >= sizeof(out->default_manifest_path)) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        out->manifest_path = out->default_manifest_path;
+    }
+    return SIM_OK;
 }
 
 static int scheduler_config_has_task(const FlightControllerConfig *config, const char *name)
@@ -224,7 +270,7 @@ static SimStatus load_controller_config(const char *path, FlightControllerConfig
     return status;
 }
 
-static SimStatus replay_sensor_log(const ReplayOptions *options)
+static SimStatus replay_sensor_log(const ReplayOptions *options, ReplayResult *result)
 {
     FlightControllerConfig config;
     FlightController controller;
@@ -234,9 +280,10 @@ static SimStatus replay_sensor_log(const ReplayOptions *options)
     unsigned char command_packet[SIM_CONTROL_PACKET_WIRE_SIZE];
     SimStatus status;
 
-    if (options == 0) {
+    if (options == 0 || result == 0) {
         return SIM_ERR_INVALID_ARG;
     }
+    (void)memset(result, 0, sizeof(*result));
     status = load_controller_config(options->config_path, &config);
     if (status != SIM_OK) {
         return status;
@@ -293,24 +340,139 @@ static SimStatus replay_sensor_log(const ReplayOptions *options)
             status = SIM_ERR_IO;
             break;
         }
+        ++result->frame_count;
     }
-    (void)fclose(input);
+    if (fclose(input) != 0 && status == SIM_OK) {
+        status = SIM_ERR_IO;
+    }
     if (fclose(output) != 0 && status == SIM_OK) {
         status = SIM_ERR_IO;
     }
     return status;
 }
 
+static SimStatus write_replay_manifest(
+    const ReplayOptions *options,
+    const ReplayResult *result,
+    SimStatus run_status)
+{
+    uint32_t config_crc = 0u;
+    uint32_t input_crc = 0u;
+    uint32_t output_crc = 0u;
+    uint64_t config_size = 0u;
+    uint64_t input_size = 0u;
+    uint64_t output_size = 0u;
+    char wall_clock[32];
+    FILE *file;
+    SimStatus status;
+    int close_status;
+
+    if (options == 0 || result == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = provenance_file_crc32(options->config_path, &config_crc, &config_size);
+    if (status == SIM_OK) {
+        status = provenance_file_crc32(options->input_path, &input_crc, &input_size);
+    }
+    if (status == SIM_OK && run_status == SIM_OK) {
+        status = provenance_file_crc32(options->output_path, &output_crc, &output_size);
+    }
+    if (status != SIM_OK) {
+        return status;
+    }
+    provenance_format_wall_clock_utc(wall_clock, sizeof(wall_clock));
+    file = fopen(options->manifest_path, "wb");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    (void)fprintf(file, "{\n");
+    (void)fprintf(file, "  \"schema_version\": 1,\n");
+    (void)fprintf(file, "  \"run_mode\": \"REPLAY_WITH_FC\",\n");
+    (void)fprintf(file, "  \"status\": ");
+    (void)provenance_write_json_string(file, sim_status_to_string(run_status));
+    (void)fprintf(file, ",\n  \"instance_id\": %u,\n", options->instance_id);
+    (void)fprintf(file, "  \"random_seed\": null,\n");
+    (void)fprintf(file, "  \"random_seed_provenance\": \"not_used_by_fc_replay\",\n");
+    (void)fprintf(
+        file,
+        "  \"program_version\": \"replay %d.%d.%d\",\n",
+        MISSILE_SIM_VERSION_MAJOR,
+        MISSILE_SIM_VERSION_MINOR,
+        MISSILE_SIM_VERSION_PATCH);
+    (void)fprintf(file, "  \"git_commit\": ");
+    (void)provenance_write_json_string(file, MISSILE_SIM_GIT_COMMIT);
+    (void)fprintf(
+        file,
+        ",\n  \"git_worktree_dirty\": %s,\n",
+        MISSILE_SIM_GIT_DIRTY != 0 ? "true" : "false");
+    (void)fprintf(file, "  \"build_time\": ");
+    (void)provenance_write_json_string(file, MISSILE_SIM_BUILD_TIME);
+    (void)fprintf(file, ",\n  \"compiler\": ");
+    (void)provenance_write_json_string(file, MISSILE_SIM_COMPILER);
+    (void)fprintf(file, ",\n  \"start_time_wall_clock\": ");
+    (void)provenance_write_json_string(file, wall_clock);
+    (void)fprintf(
+        file,
+        ",\n  \"protocol_version\": \"%d.%d\",\n",
+        MISSILE_SIM_PROTOCOL_VERSION_MAJOR,
+        MISSILE_SIM_PROTOCOL_VERSION_MINOR);
+    (void)fprintf(file, "  \"flight_control_config\": { \"path\": ");
+    (void)provenance_write_json_string(file, options->config_path);
+    (void)fprintf(
+        file,
+        ", \"schema_version\": 1, \"crc32\": \"0x%08x\", \"size_bytes\": %llu },\n",
+        config_crc,
+        (unsigned long long)config_size);
+    (void)fprintf(file, "  \"log_files\": {\n    \"sensor_input\": { \"path\": ");
+    (void)provenance_write_json_string(file, options->input_path);
+    (void)fprintf(
+        file,
+        ", \"crc32\": \"0x%08x\", \"size_bytes\": %llu },\n",
+        input_crc,
+        (unsigned long long)input_size);
+    (void)fprintf(file, "    \"command_output\": { \"path\": ");
+    (void)provenance_write_json_string(file, options->output_path);
+    if (run_status == SIM_OK) {
+        (void)fprintf(
+            file,
+            ", \"crc32\": \"0x%08x\", \"size_bytes\": %llu }\n",
+            output_crc,
+            (unsigned long long)output_size);
+    } else {
+        (void)fprintf(file, ", \"crc32\": null, \"size_bytes\": null }\n");
+    }
+    (void)fprintf(file, "  },\n");
+    (void)fprintf(file, "  \"input_frame_count\": %llu,\n", (unsigned long long)result->frame_count);
+    (void)fprintf(file, "  \"output_command_count\": %llu\n", (unsigned long long)result->frame_count);
+    (void)fprintf(file, "}\n");
+    status = ferror(file) == 0 ? SIM_OK : SIM_ERR_IO;
+    close_status = fclose(file);
+    if (status != SIM_OK || close_status != 0) {
+        return SIM_ERR_IO;
+    }
+    return SIM_OK;
+}
+
 int main(int argc, char **argv)
 {
     ReplayOptions options;
+    ReplayResult result;
+    SimStatus manifest_status;
     SimStatus status = parse_args(argc, argv, &options);
 
     if (status != SIM_OK) {
         print_usage(argv[0]);
         return 2;
     }
-    status = replay_sensor_log(&options);
+    status = replay_sensor_log(&options, &result);
+    manifest_status = write_replay_manifest(&options, &result, status);
+    if (manifest_status != SIM_OK) {
+        (void)fprintf(
+            stderr,
+            "replay: failed to write manifest: %s\n",
+            sim_status_to_string(manifest_status));
+        return 1;
+    }
     if (status != SIM_OK) {
         (void)fprintf(stderr, "replay: failed: %s\n", sim_status_to_string(status));
         return 1;

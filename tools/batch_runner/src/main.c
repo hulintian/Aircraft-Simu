@@ -1,6 +1,8 @@
 /** @file main.c
  *  @brief 批次清单运行入口。
  */
+#include "common/build_info.h"
+#include "common/provenance.h"
 #include "common/status.h"
 
 #include <ctype.h>
@@ -34,6 +36,8 @@ typedef struct BatchRunnerArgs {
     const char *instance_manager_path;
     const char *batch_stats_path;
     const char *output_path;
+    const char *run_manifest_path;
+    char default_run_manifest_path[BATCH_RUNNER_MAX_PATH];
     size_t sample_count;
     uint64_t base_seed;
     int base_seed_set;
@@ -46,10 +50,10 @@ static void print_usage(const char *program)
     (void)fprintf(
         stderr,
         "usage: %s --manifest runs.txt --instance-manager PATH "
-        "[--batch-stats PATH --output stats.json] [--stop-on-failure]\n"
+        "[--batch-stats PATH --output stats.json] [--stop-on-failure] [--run-manifest PATH]\n"
         "       %s --generate-manifest runs.txt --runtime-template template.json "
         "--runtime-output-dir DIR --sample-count N [--base-seed SEED] "
-        "[--instance-manager PATH]\n",
+        "[--instance-manager PATH] [--run-manifest PATH]\n",
         program,
         program);
 }
@@ -135,6 +139,10 @@ static int parse_args(int argc, char **argv, BatchRunnerArgs *args)
             if (!consume_value(argc, argv, &index, &args->output_path)) {
                 return 0;
             }
+        } else if (strcmp(argv[index], "--run-manifest") == 0) {
+            if (!consume_value(argc, argv, &index, &args->run_manifest_path)) {
+                return 0;
+            }
         } else if (strcmp(argv[index], "--stop-on-failure") == 0) {
             args->stop_on_failure = 1;
         } else {
@@ -155,6 +163,20 @@ static int parse_args(int argc, char **argv, BatchRunnerArgs *args)
         if (args->manifest_path == 0 || args->instance_manager_path == 0) {
             return 0;
         }
+    }
+    if (args->run_manifest_path == 0) {
+        const char *manifest_base = args->generate_manifest_path != 0 ?
+            args->generate_manifest_path : args->manifest_path;
+        const int written = snprintf(
+            args->default_run_manifest_path,
+            sizeof(args->default_run_manifest_path),
+            "%s.run_manifest.json",
+            manifest_base);
+
+        if (written < 0 || (size_t)written >= sizeof(args->default_run_manifest_path)) {
+            return 0;
+        }
+        args->run_manifest_path = args->default_run_manifest_path;
     }
     return args->output_path == 0 || args->batch_stats_path != 0;
 }
@@ -1200,6 +1222,137 @@ static int run_batch_stats(
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
 }
 
+/** @brief 写出 Monte Carlo 工作流级运行清单。 */
+static SimStatus write_batch_run_manifest(
+    const BatchRunnerArgs *args,
+    size_t run_count,
+    size_t attempted_count,
+    size_t failure_count,
+    SimStatus workflow_status)
+{
+    const char *list_path;
+    uint32_t list_crc = 0u;
+    uint32_t template_crc = 0u;
+    uint64_t list_size = 0u;
+    uint64_t template_size = 0u;
+    char wall_clock[32];
+    FILE *file;
+    SimStatus status;
+    int close_status;
+
+    if (args == 0 || args->run_manifest_path == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    list_path = args->generate_manifest_path != 0 ?
+        args->generate_manifest_path : args->manifest_path;
+    status = provenance_file_crc32(list_path, &list_crc, &list_size);
+    if (status != SIM_OK) {
+        return status;
+    }
+    if (args->runtime_template_path != 0) {
+        status = provenance_file_crc32(
+            args->runtime_template_path,
+            &template_crc,
+            &template_size);
+        if (status != SIM_OK) {
+            return status;
+        }
+    }
+    provenance_format_wall_clock_utc(wall_clock, sizeof(wall_clock));
+    file = fopen(args->run_manifest_path, "wb");
+    if (file == 0) {
+        return SIM_ERR_IO;
+    }
+    (void)fprintf(file, "{\n");
+    (void)fprintf(file, "  \"schema_version\": 1,\n");
+    (void)fprintf(file, "  \"run_mode\": \"MONTE_CARLO\",\n");
+    (void)fprintf(file, "  \"status\": ");
+    (void)provenance_write_json_string(file, sim_status_to_string(workflow_status));
+    (void)fprintf(file, ",\n");
+    (void)fprintf(
+        file,
+        "  \"program_version\": \"batch_runner %d.%d.%d\",\n",
+        MISSILE_SIM_VERSION_MAJOR,
+        MISSILE_SIM_VERSION_MINOR,
+        MISSILE_SIM_VERSION_PATCH);
+    (void)fprintf(file, "  \"git_commit\": ");
+    (void)provenance_write_json_string(file, MISSILE_SIM_GIT_COMMIT);
+    (void)fprintf(
+        file,
+        ",\n  \"git_worktree_dirty\": %s,\n",
+        MISSILE_SIM_GIT_DIRTY != 0 ? "true" : "false");
+    (void)fprintf(file, "  \"build_time\": ");
+    (void)provenance_write_json_string(file, MISSILE_SIM_BUILD_TIME);
+    (void)fprintf(file, ",\n  \"compiler\": ");
+    (void)provenance_write_json_string(file, MISSILE_SIM_COMPILER);
+    (void)fprintf(file, ",\n  \"start_time_wall_clock\": ");
+    (void)provenance_write_json_string(file, wall_clock);
+    (void)fprintf(
+        file,
+        ",\n  \"protocol_version\": \"%d.%d\",\n",
+        MISSILE_SIM_PROTOCOL_VERSION_MAJOR,
+        MISSILE_SIM_PROTOCOL_VERSION_MINOR);
+    (void)fprintf(file, "  \"configuration_provenance\": ");
+    (void)provenance_write_json_string(file, "each generated runtime and child run_manifest");
+    (void)fprintf(file, ",\n  \"random_seed\": ");
+    if (args->runtime_template_path != 0) {
+        (void)fprintf(file, "%llu,\n", (unsigned long long)args->base_seed);
+        (void)fprintf(file, "  \"random_seed_policy\": \"base_seed_plus_sample_index\",\n");
+    } else {
+        (void)fprintf(file, "null,\n");
+        (void)fprintf(file, "  \"random_seed_policy\": \"declared_by_input_runtime_files\",\n");
+    }
+    (void)fprintf(file, "  \"inputs\": {\n    \"run_list\": { \"path\": ");
+    (void)provenance_write_json_string(file, list_path);
+    (void)fprintf(
+        file,
+        ", \"crc32\": \"0x%08x\", \"size_bytes\": %llu },\n",
+        list_crc,
+        (unsigned long long)list_size);
+    (void)fprintf(file, "    \"runtime_template\": ");
+    if (args->runtime_template_path != 0) {
+        (void)fprintf(file, "{ \"path\": ");
+        (void)provenance_write_json_string(file, args->runtime_template_path);
+        (void)fprintf(
+            file,
+            ", \"crc32\": \"0x%08x\", \"size_bytes\": %llu }\n",
+            template_crc,
+            (unsigned long long)template_size);
+    } else {
+        (void)fprintf(file, "null\n");
+    }
+    (void)fprintf(file, "  },\n");
+    (void)fprintf(file, "  \"outputs\": {\n    \"runtime_output_dir\": ");
+    if (args->runtime_output_dir != 0) {
+        (void)provenance_write_json_string(file, args->runtime_output_dir);
+    } else {
+        (void)fprintf(file, "null");
+    }
+    (void)fprintf(file, ",\n    \"batch_statistics\": ");
+    if (args->output_path != 0) {
+        (void)provenance_write_json_string(file, args->output_path);
+    } else {
+        (void)fprintf(file, "null");
+    }
+    (void)fprintf(file, "\n  },\n");
+    (void)fprintf(file, "  \"requested_sample_count\": %zu,\n", args->sample_count);
+    (void)fprintf(file, "  \"run_count\": %zu,\n", run_count);
+    (void)fprintf(file, "  \"attempted_count\": %zu,\n", attempted_count);
+    (void)fprintf(
+        file,
+        "  \"completed_count\": %zu,\n",
+        attempted_count >= failure_count ? attempted_count - failure_count : 0u);
+    (void)fprintf(file, "  \"failed_count\": %zu,\n", failure_count);
+    (void)fprintf(
+        file,
+        "  \"generated_only\": %s\n",
+        args->instance_manager_path == 0 ? "true" : "false");
+    (void)fprintf(file, "}\n");
+    status = ferror(file) == 0 ? SIM_OK : SIM_ERR_IO;
+    close_status = fclose(file);
+    return status == SIM_OK && close_status == 0 ? SIM_OK : SIM_ERR_IO;
+}
+
 int main(int argc, char **argv)
 {
     BatchRunnerArgs args;
@@ -1208,7 +1361,9 @@ int main(int argc, char **argv)
     size_t index;
     size_t failure_count = 0u;
     size_t stats_input_count = 0u;
+    size_t attempted_count = 0u;
     SimStatus status;
+    SimStatus manifest_status;
 
     if (!parse_args(argc, argv, &args)) {
         print_usage(argv[0]);
@@ -1221,6 +1376,18 @@ int main(int argc, char **argv)
             return 1;
         }
         if (args.instance_manager_path == 0) {
+            status = load_manifest(
+                args.generate_manifest_path,
+                runs,
+                BATCH_RUNNER_MAX_RUNS,
+                &run_count);
+            if (status == SIM_OK) {
+                status = write_batch_run_manifest(&args, run_count, 0u, 0u, SIM_OK);
+            }
+            if (status != SIM_OK) {
+                (void)fprintf(stderr, "failed to write run manifest: %s\n", sim_status_to_string(status));
+                return 1;
+            }
             return 0;
         }
         args.manifest_path = args.generate_manifest_path;
@@ -1231,6 +1398,7 @@ int main(int argc, char **argv)
         return 1;
     }
     for (index = 0u; index < run_count; ++index) {
+        ++attempted_count;
         if (run_instance_manager(args.instance_manager_path, runs[index].runtime_path) != 0) {
             ++failure_count;
             (void)fprintf(stderr, "instance_manager failed: %s\n", runs[index].runtime_path);
@@ -1245,8 +1413,27 @@ int main(int argc, char **argv)
     if (args.batch_stats_path != 0 && stats_input_count > 0u && failure_count == 0u) {
         if (run_batch_stats(args.batch_stats_path, args.output_path, runs, run_count) != 0) {
             (void)fprintf(stderr, "batch_stats failed\n");
+            manifest_status = write_batch_run_manifest(
+                &args,
+                run_count,
+                attempted_count,
+                failure_count,
+                SIM_ERR_INTERNAL);
+            if (manifest_status != SIM_OK) {
+                (void)fprintf(stderr, "failed to write run manifest: %s\n", sim_status_to_string(manifest_status));
+            }
             return 1;
         }
+    }
+    manifest_status = write_batch_run_manifest(
+        &args,
+        run_count,
+        attempted_count,
+        failure_count,
+        failure_count == 0u ? SIM_OK : SIM_ERR_INTERNAL);
+    if (manifest_status != SIM_OK) {
+        (void)fprintf(stderr, "failed to write run manifest: %s\n", sim_status_to_string(manifest_status));
+        return 1;
     }
     return failure_count == 0u ? 0 : 1;
 }

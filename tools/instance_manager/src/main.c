@@ -6,6 +6,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 
+#include "common/build_info.h"
 #include "common/config.h"
 #include "common/packet.h"
 #include "common/status.h"
@@ -13,6 +14,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <float.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
@@ -134,6 +136,8 @@ typedef struct InstanceSummary {
 } InstanceSummary;
 
 typedef struct ManagerConfig {
+    /** @brief 本次任务的稳定标识，写入批次摘要。 */
+    char campaign_id[128];
     /** @brief 本次任务实际启用的实例数。 */
     unsigned int instance_count;
     /** @brief 同时运行的实例对上限。 */
@@ -161,7 +165,19 @@ typedef struct ManagerConfig {
 /** @brief 打印命令行帮助。 */
 static void print_usage(const char *argv0)
 {
-    (void)printf("usage: %s [--runtime PATH]\n", argv0);
+    (void)printf("usage: %s [--help] [--version] [--runtime PATH]\n", argv0);
+}
+
+/** @brief 打印软件和协议版本。 */
+static void print_version(void)
+{
+    (void)printf(
+        "instance_manager missile_sim %d.%d.%d protocol %d.%d\n",
+        MISSILE_SIM_VERSION_MAJOR,
+        MISSILE_SIM_VERSION_MINOR,
+        MISSILE_SIM_VERSION_PATCH,
+        MISSILE_SIM_PROTOCOL_VERSION_MAJOR,
+        MISSILE_SIM_PROTOCOL_VERSION_MINOR);
 }
 
 /** @brief 返回 wall-clock 秒数，用于批次性能统计。 */
@@ -246,6 +262,10 @@ static SimStatus load_manager_config(const ConfigTree *runtime, ManagerConfig *o
     (void)snprintf(out->environment_program, sizeof(out->environment_program), "%s", ENVIRONMENT_PROGRAM);
     (void)snprintf(out->flight_control_program, sizeof(out->flight_control_program), "%s", FLIGHT_CONTROL_PROGRAM);
 
+    status = config_get_string(runtime, "campaign.campaign_id", out->campaign_id, sizeof(out->campaign_id));
+    if (status != SIM_OK || out->campaign_id[0] == '\0') {
+        return SIM_ERR_CONFIG;
+    }
     status = config_get_uint32(runtime, "campaign.instance_count", &configured_instance_count);
     if (status != SIM_OK) {
         return status;
@@ -482,32 +502,65 @@ static SimStatus preflight_ports(const ManagerConfig *cfg, const InstancePlan *p
     return SIM_OK;
 }
 
-/** @brief 创建用于接收飞控应用层 ready 心跳的临时 UDP socket。 */
-static SimStatus create_ready_socket(int *sock_out, unsigned int *port_out)
+/** @brief 判断端口是否已由本任务的环境或飞控实例预留。 */
+static int port_reserved_by_campaign(
+    unsigned int port,
+    const InstancePlan *plans,
+    unsigned int plan_count)
 {
-    int sock;
-    struct sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
+    unsigned int i;
 
-    if (sock_out == 0 || port_out == 0) {
+    if (plans == 0) {
+        return 0;
+    }
+    for (i = 0u; i < plan_count; ++i) {
+        if (plans[i].environment_port == port || plans[i].flight_control_port == port) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** @brief 创建用于接收飞控应用层 ready 心跳的临时 UDP socket。 */
+static SimStatus create_ready_socket(
+    const InstancePlan *plans,
+    unsigned int plan_count,
+    int *sock_out,
+    unsigned int *port_out)
+{
+    unsigned int attempt;
+
+    if (plans == 0 || plan_count == 0u || sock_out == 0 || port_out == 0) {
         return SIM_ERR_INVALID_ARG;
     }
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        return SIM_ERR_IO;
+    for (attempt = 0u; attempt < 64u; ++attempt) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in addr;
+        socklen_t addr_len = sizeof(addr);
+        unsigned int allocated_port;
+
+        if (sock < 0) {
+            return SIM_ERR_IO;
+        }
+        (void)memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(0u);
+        if (bind(sock, (const struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+            getsockname(sock, (struct sockaddr *)&addr, &addr_len) != 0) {
+            (void)close(sock);
+            return SIM_ERR_IO;
+        }
+        allocated_port = (unsigned int)ntohs(addr.sin_port);
+        if (port_reserved_by_campaign(allocated_port, plans, plan_count) != 0) {
+            (void)close(sock);
+            continue;
+        }
+        *sock_out = sock;
+        *port_out = allocated_port;
+        return SIM_OK;
     }
-    (void)memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(0u);
-    if (bind(sock, (const struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-        getsockname(sock, (struct sockaddr *)&addr, &addr_len) != 0) {
-        (void)close(sock);
-        return SIM_ERR_IO;
-    }
-    *sock_out = sock;
-    *port_out = (unsigned int)ntohs(addr.sin_port);
-    return SIM_OK;
+    return SIM_ERR_IO;
 }
 
 /** @brief 非阻塞检查 ready socket 是否收到指定实例的心跳。 */
@@ -651,16 +704,21 @@ static SimStatus wait_for_flight_control_ready(ManagedInstance *instance)
 static SimStatus launch_instance(
     ManagedInstance *instance,
     const char *runtime_path,
-    const ManagerConfig *cfg)
+    const ManagerConfig *cfg,
+    const InstancePlan *plans)
 {
     SimStatus status;
 
-    if (instance == 0 || runtime_path == 0 || cfg == 0) {
+    if (instance == 0 || runtime_path == 0 || cfg == 0 || plans == 0) {
         return SIM_ERR_INVALID_ARG;
     }
     instance->wall_time_start_s = wall_seconds_now();
     instance->wall_time_end_s = instance->wall_time_start_s;
-    status = create_ready_socket(&instance->ready_sock, &instance->ready_port);
+    status = create_ready_socket(
+        plans,
+        cfg->instance_count,
+        &instance->ready_sock,
+        &instance->ready_port);
     if (status != SIM_OK) {
         (void)snprintf(instance->launch_error, sizeof(instance->launch_error), "ready_socket_failed");
         instance->wall_time_end_s = wall_seconds_now();
@@ -814,6 +872,8 @@ static unsigned int write_campaign_summary(
     unsigned int failed = 0u;
     unsigned int summary_available = 0u;
     unsigned int hit_count = 0u;
+    unsigned int miss_count = 0u;
+    unsigned int timeout_count = 0u;
     unsigned int total_fault_start_count = 0u;
     unsigned int total_fault_end_count = 0u;
     unsigned int total_fault_sensor_affected_steps = 0u;
@@ -827,6 +887,11 @@ static unsigned int write_campaign_summary(
     double total_instance_wall_time_s = 0.0;
     double max_instance_wall_time_s = 0.0;
     double min_miss_distance = DBL_MAX;
+    double max_miss_distance = 0.0;
+    double miss_distance_sum = 0.0;
+    double miss_distance_square_sum = 0.0;
+    double miss_mean = 0.0;
+    double miss_variance = 0.0;
     double max_quat_norm_error = 0.0;
     double max_dcm_orthogonality_error = 0.0;
     double min_mass_kg = DBL_MAX;
@@ -872,13 +937,27 @@ static unsigned int write_campaign_summary(
             }
         }
         if (summaries[i].available != 0) {
+            const int is_timeout =
+                strcmp(summaries[i].exit_reason, "time_limit") == 0 ||
+                strstr(summaries[i].exit_reason, "timeout") != 0;
+
             ++summary_available;
-            if (summaries[i].hit_flag != 0) {
+            if (is_timeout != 0) {
+                ++timeout_count;
+            } else if (summaries[i].hit_flag != 0) {
                 ++hit_count;
+            } else {
+                ++miss_count;
             }
             if (summaries[i].miss_distance_m < min_miss_distance) {
                 min_miss_distance = summaries[i].miss_distance_m;
             }
+            if (summaries[i].miss_distance_m > max_miss_distance) {
+                max_miss_distance = summaries[i].miss_distance_m;
+            }
+            miss_distance_sum += summaries[i].miss_distance_m;
+            miss_distance_square_sum +=
+                summaries[i].miss_distance_m * summaries[i].miss_distance_m;
             total_fault_start_count += summaries[i].fault_start_count;
             total_fault_end_count += summaries[i].fault_end_count;
             total_fault_sensor_affected_steps += summaries[i].fault_sensor_affected_step_count;
@@ -904,7 +983,18 @@ static unsigned int write_campaign_summary(
         }
     }
 
+    miss_mean = summary_available > 0u ?
+        miss_distance_sum / (double)summary_available : 0.0;
+    miss_variance = summary_available > 0u ?
+        (miss_distance_square_sum / (double)summary_available) - (miss_mean * miss_mean) :
+        0.0;
+    if (miss_variance < 0.0 && miss_variance > -1.0e-12) {
+        miss_variance = 0.0;
+    }
     (void)fprintf(file, "{\n");
+    (void)fprintf(file, "  \"campaign_id\": ");
+    write_json_string(file, cfg->campaign_id);
+    (void)fprintf(file, ",\n");
     (void)fprintf(file, "  \"instance_count\": %u,\n", cfg->instance_count);
     (void)fprintf(file, "  \"schedule\": ");
     write_json_string(
@@ -923,10 +1013,29 @@ static unsigned int write_campaign_summary(
     (void)fprintf(file, "  \"failed_count\": %u,\n", failed);
     (void)fprintf(file, "  \"summary_available_count\": %u,\n", summary_available);
     (void)fprintf(file, "  \"hit_count\": %u,\n", hit_count);
+    (void)fprintf(file, "  \"miss_count\": %u,\n", miss_count);
+    (void)fprintf(file, "  \"timeout_count\": %u,\n", timeout_count);
+    (void)fprintf(
+        file,
+        "  \"hit_rate\": %.9f,\n",
+        summary_available > 0u ? (double)hit_count / (double)summary_available : 0.0);
     (void)fprintf(
         file,
         "  \"min_miss_distance\": %.6f,\n",
         summary_available > 0u ? min_miss_distance : 0.0);
+    (void)fprintf(
+        file,
+        "  \"miss_distance_min\": %.6f,\n",
+        summary_available > 0u ? min_miss_distance : 0.0);
+    (void)fprintf(
+        file,
+        "  \"miss_distance_max\": %.6f,\n",
+        summary_available > 0u ? max_miss_distance : 0.0);
+    (void)fprintf(file, "  \"miss_distance_mean\": %.6f,\n", miss_mean);
+    (void)fprintf(
+        file,
+        "  \"miss_distance_std\": %.6f,\n",
+        miss_variance > 0.0 ? sqrt(miss_variance) : 0.0);
     (void)fprintf(file, "  \"total_fault_start_count\": %u,\n", total_fault_start_count);
     (void)fprintf(file, "  \"total_fault_end_count\": %u,\n", total_fault_end_count);
     (void)fprintf(
@@ -1017,6 +1126,29 @@ static unsigned int write_campaign_summary(
             summaries[i].aero_extrapolated_sample_count,
             i + 1u == cfg->instance_count ? "" : ",");
     }
+    (void)fprintf(file, "  ],\n");
+    (void)fprintf(file, "  \"failed_instances\": [\n");
+    {
+        unsigned int failed_written = 0u;
+
+        for (i = 0u; i < cfg->instance_count; ++i) {
+            if (process_ok(instances[i].env_status) && process_ok(instances[i].fc_status)) {
+                continue;
+            }
+            (void)fprintf(file, "%s    { \"instance_id\": %u, ", failed_written == 0u ? "" : ",\n", instances[i].plan.instance_id);
+            (void)fprintf(
+                file,
+                "\"env_status\": %d, \"fc_status\": %d, \"reason\": ",
+                process_ok(instances[i].env_status) ? 0 : 1,
+                process_ok(instances[i].fc_status) ? 0 : 1);
+            write_json_string(file, summaries[i].exit_reason);
+            (void)fprintf(file, " }");
+            ++failed_written;
+        }
+        if (failed_written > 0u) {
+            (void)fprintf(file, "\n");
+        }
+    }
     (void)fprintf(file, "  ]\n");
     (void)fprintf(file, "}\n");
     (void)fclose(file);
@@ -1066,6 +1198,10 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[i], "--version") == 0) {
+            print_version();
             return 0;
         }
         if (strcmp(argv[i], "--runtime") == 0 && (i + 1) < argc) {
@@ -1118,7 +1254,7 @@ int main(int argc, char **argv)
             running < cfg.max_parallel_instances) {
             ManagedInstance *slot = &instances[next_to_launch];
 
-            status = launch_instance(slot, runtime_path, &cfg);
+            status = launch_instance(slot, runtime_path, &cfg, plans);
             if (status != SIM_OK) {
                 slot->env_status = 1;
                 slot->fc_status = 1;

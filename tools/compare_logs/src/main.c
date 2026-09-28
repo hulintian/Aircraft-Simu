@@ -1,10 +1,12 @@
 /** @file main.c
  *  @brief 比较协议二进制日志并输出回归判定。
  */
+#include "common/config.h"
 #include "common/packet.h"
 #include "common/status.h"
 #include "common/vec3.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,13 +14,20 @@
 
 typedef enum CompareKind {
     COMPARE_COMMAND = 0,
-    COMPARE_SENSOR = 1
+    COMPARE_SENSOR = 1,
+    COMPARE_TRAJECTORY = 2
 } CompareKind;
+
+enum {
+    COMPARE_CSV_LINE_SIZE = 8192,
+    COMPARE_CSV_MAX_COLUMNS = 128
+};
 
 typedef struct CompareOptions {
     const char *left_path;
     const char *right_path;
     const char *output_path;
+    const char *tolerance_config_path;
     uint32_t instance_id;
     double abs_tol;
     double rel_tol;
@@ -40,9 +49,40 @@ static void print_usage(const char *argv0)
 {
     (void)fprintf(
         stderr,
-        "usage: %s --type command|sensor --instance-id N --left A.bin --right B.bin "
-        "[--abs-tol X] [--rel-tol X] [--output result.json]\n",
+        "usage: %s --type command|sensor|trajectory --instance-id N --left A --right B "
+        "[--tolerance-config PATH] [--abs-tol X] [--rel-tol X] [--output result.json]\n",
         argv0);
+}
+
+/** @brief 读取版本化日志比较容差。 */
+static SimStatus load_tolerance_config(const char *path, double *abs_tol, double *rel_tol)
+{
+    ConfigTree tree;
+    SimStatus status;
+
+    if (path == 0 || abs_tol == 0 || rel_tol == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    status = config_load_file(path, &tree);
+    if (status != SIM_OK) {
+        return status;
+    }
+    status = config_validate_json(&tree);
+    if (status == SIM_OK) {
+        status = config_validate_schema(&tree, 1u);
+    }
+    if (status == SIM_OK) {
+        status = config_get_double(&tree, "compare_logs.abs_tol", abs_tol);
+    }
+    if (status == SIM_OK) {
+        status = config_get_double(&tree, "compare_logs.rel_tol", rel_tol);
+    }
+    config_free(&tree);
+    if (status == SIM_OK &&
+        (!isfinite(*abs_tol) || !isfinite(*rel_tol) || *abs_tol < 0.0 || *rel_tol < 0.0)) {
+        return SIM_ERR_OUT_OF_RANGE;
+    }
+    return status;
 }
 
 static SimStatus parse_args(int argc, char **argv, CompareOptions *out)
@@ -57,6 +97,15 @@ static SimStatus parse_args(int argc, char **argv, CompareOptions *out)
     out->abs_tol = 1.0e-9;
     out->rel_tol = 1.0e-9;
     for (i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--tolerance-config") == 0 && (i + 1) < argc) {
+            out->tolerance_config_path = argv[++i];
+        }
+    }
+    if (out->tolerance_config_path != 0 &&
+        load_tolerance_config(out->tolerance_config_path, &out->abs_tol, &out->rel_tol) != SIM_OK) {
+        return SIM_ERR_CONFIG;
+    }
+    for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             exit(0);
@@ -68,6 +117,8 @@ static SimStatus parse_args(int argc, char **argv, CompareOptions *out)
                 out->kind = COMPARE_COMMAND;
             } else if (strcmp(kind, "sensor") == 0) {
                 out->kind = COMPARE_SENSOR;
+            } else if (strcmp(kind, "trajectory") == 0) {
+                out->kind = COMPARE_TRAJECTORY;
             } else {
                 return SIM_ERR_CONFIG;
             }
@@ -89,6 +140,10 @@ static SimStatus parse_args(int argc, char **argv, CompareOptions *out)
             out->output_path = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--tolerance-config") == 0 && (i + 1) < argc) {
+            ++i;
+            continue;
+        }
         if (strcmp(argv[i], "--abs-tol") == 0 && (i + 1) < argc) {
             out->abs_tol = strtod(argv[++i], 0);
             continue;
@@ -99,7 +154,11 @@ static SimStatus parse_args(int argc, char **argv, CompareOptions *out)
         }
         return SIM_ERR_CONFIG;
     }
-    return out->left_path != 0 && out->right_path != 0 ? SIM_OK : SIM_ERR_CONFIG;
+    return out->left_path != 0 && out->right_path != 0 &&
+            isfinite(out->abs_tol) && out->abs_tol >= 0.0 &&
+            isfinite(out->rel_tol) && out->rel_tol >= 0.0 ?
+        SIM_OK :
+        SIM_ERR_CONFIG;
 }
 
 static double max_double(double a, double b)
@@ -208,7 +267,7 @@ static int compare_sensor(
     return ok;
 }
 
-static SimStatus compare_logs(const CompareOptions *options, CompareStats *stats)
+static SimStatus compare_binary_logs(const CompareOptions *options, CompareStats *stats)
 {
     FILE *left;
     FILE *right;
@@ -300,6 +359,10 @@ static SimStatus compare_logs(const CompareOptions *options, CompareStats *stats
                 frames_match = compare_sensor(&left_sensor, &right_sensor, options, stats);
             }
         }
+        if (options->abs_tol == 0.0 && options->rel_tol == 0.0 &&
+            memcmp(left_packet, right_packet, packet_size) != 0) {
+            frames_match = 0;
+        }
         if (status != SIM_OK || frames_match == 0) {
             stats->diverged = 1;
             if (stats->first_divergent_frame == UINT32_MAX) {
@@ -318,6 +381,183 @@ static SimStatus compare_logs(const CompareOptions *options, CompareStats *stats
     return status == SIM_ERR_BAD_PACKET ? SIM_OK : status;
 }
 
+/** @brief 将一行无引号数值 CSV 解析为浮点数组。 */
+static SimStatus parse_numeric_csv_row(
+    char *line,
+    double *values,
+    size_t capacity,
+    size_t *count_out)
+{
+    char *cursor = line;
+    size_t count = 0u;
+
+    if (line == 0 || values == 0 || count_out == 0) {
+        return SIM_ERR_INVALID_ARG;
+    }
+    while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
+        char *end = 0;
+        double value;
+
+        if (count >= capacity) {
+            return SIM_ERR_OUT_OF_RANGE;
+        }
+        errno = 0;
+        value = strtod(cursor, &end);
+        if (end == cursor || errno == ERANGE || !isfinite(value)) {
+            return SIM_ERR_BAD_PACKET;
+        }
+        while (*end == ' ' || *end == '\t') {
+            ++end;
+        }
+        values[count++] = value;
+        if (*end == ',') {
+            cursor = end + 1;
+            if (*cursor == '\0' || *cursor == '\n' || *cursor == '\r') {
+                return SIM_ERR_BAD_PACKET;
+            }
+            continue;
+        }
+        if (*end == '\0' || *end == '\n' || *end == '\r') {
+            cursor = end;
+            break;
+        }
+        return SIM_ERR_BAD_PACKET;
+    }
+    if (count == 0u) {
+        return SIM_ERR_BAD_PACKET;
+    }
+    *count_out = count;
+    return SIM_OK;
+}
+
+/** @brief 比较环境真值 trajectory.csv。 */
+static SimStatus compare_trajectory_logs(const CompareOptions *options, CompareStats *stats)
+{
+    FILE *left = fopen(options->left_path, "rb");
+    FILE *right;
+    char left_line[COMPARE_CSV_LINE_SIZE];
+    char right_line[COMPARE_CSV_LINE_SIZE];
+    SimStatus status = SIM_OK;
+
+    (void)memset(stats, 0, sizeof(*stats));
+    stats->first_divergent_frame = UINT32_MAX;
+    if (left == 0) {
+        return SIM_ERR_IO;
+    }
+    right = fopen(options->right_path, "rb");
+    if (right == 0) {
+        (void)fclose(left);
+        return SIM_ERR_IO;
+    }
+    if (fgets(left_line, sizeof(left_line), left) == 0 ||
+        fgets(right_line, sizeof(right_line), right) == 0) {
+        status = SIM_ERR_BAD_PACKET;
+    } else if (strcmp(left_line, right_line) != 0) {
+        stats->diverged = 1;
+        stats->first_divergent_frame = 0u;
+    }
+    while (status == SIM_OK) {
+        char *left_result = fgets(left_line, sizeof(left_line), left);
+        char *right_result = fgets(right_line, sizeof(right_line), right);
+        double left_values[COMPARE_CSV_MAX_COLUMNS];
+        double right_values[COMPARE_CSV_MAX_COLUMNS];
+        size_t left_count = 0u;
+        size_t right_count = 0u;
+        size_t index;
+        int frames_match = 1;
+
+        if (left_result == 0 && right_result == 0) {
+            if (ferror(left) != 0 || ferror(right) != 0) {
+                status = SIM_ERR_IO;
+            }
+            break;
+        }
+        if (left_result != 0) {
+            ++stats->frame_count_left;
+        }
+        if (right_result != 0) {
+            ++stats->frame_count_right;
+        }
+        if (left_result == 0 || right_result == 0) {
+            stats->diverged = 1;
+            stats->first_divergent_frame = stats->frame_count_left > stats->frame_count_right ?
+                stats->frame_count_left : stats->frame_count_right;
+            break;
+        }
+        if ((strchr(left_line, '\n') == 0 && feof(left) == 0) ||
+            (strchr(right_line, '\n') == 0 && feof(right) == 0)) {
+            status = SIM_ERR_BAD_PACKET;
+            break;
+        }
+        if (options->abs_tol == 0.0 && options->rel_tol == 0.0 &&
+            strcmp(left_line, right_line) != 0) {
+            frames_match = 0;
+        }
+        status = parse_numeric_csv_row(
+            left_line,
+            left_values,
+            COMPARE_CSV_MAX_COLUMNS,
+            &left_count);
+        if (status == SIM_OK) {
+            status = parse_numeric_csv_row(
+                right_line,
+                right_values,
+                COMPARE_CSV_MAX_COLUMNS,
+                &right_count);
+        }
+        if (status != SIM_OK || left_count != right_count) {
+            stats->diverged = 1;
+            if (stats->first_divergent_frame == UINT32_MAX) {
+                stats->first_divergent_frame = stats->frame_count_left;
+            }
+            if (status == SIM_OK) {
+                status = SIM_ERR_BAD_PACKET;
+            }
+            break;
+        }
+        for (index = 0u; index < left_count; ++index) {
+            frames_match = compare_double(
+                left_values[index],
+                right_values[index],
+                options,
+                stats) && frames_match;
+        }
+        if (frames_match == 0) {
+            stats->diverged = 1;
+            if (stats->first_divergent_frame == UINT32_MAX) {
+                stats->first_divergent_frame = stats->frame_count_left;
+            }
+        }
+    }
+    (void)fclose(left);
+    (void)fclose(right);
+    if (stats->first_divergent_frame == UINT32_MAX) {
+        stats->first_divergent_frame = 0u;
+    }
+    return status == SIM_ERR_BAD_PACKET ? SIM_OK : status;
+}
+
+static SimStatus compare_logs(const CompareOptions *options, CompareStats *stats)
+{
+    return options->kind == COMPARE_TRAJECTORY ?
+        compare_trajectory_logs(options, stats) :
+        compare_binary_logs(options, stats);
+}
+
+static const char *compare_kind_name(CompareKind kind)
+{
+    switch (kind) {
+    case COMPARE_COMMAND:
+        return "command";
+    case COMPARE_SENSOR:
+        return "sensor";
+    case COMPARE_TRAJECTORY:
+        return "trajectory";
+    default:
+        return "unknown";
+    }
+}
+
 static int write_result(const CompareOptions *options, const CompareStats *stats, SimStatus status)
 {
     FILE *out = stdout;
@@ -332,6 +572,21 @@ static int write_result(const CompareOptions *options, const CompareStats *stats
     (void)fprintf(out, "{\n");
     (void)fprintf(out, "  \"verdict\": \"%s\",\n", pass ? "PASS" : "FAIL");
     (void)fprintf(out, "  \"status\": \"%s\",\n", sim_status_to_string(status));
+    (void)fprintf(out, "  \"type\": \"%s\",\n", compare_kind_name(options->kind));
+    (void)fprintf(
+        out,
+        "  \"comparison_mode\": \"%s\",\n",
+        options->abs_tol == 0.0 && options->rel_tol == 0.0 ? "EXACT" : "TOLERANCE");
+    (void)fprintf(out, "  \"abs_tol\": %.17g,\n", options->abs_tol);
+    (void)fprintf(out, "  \"rel_tol\": %.17g,\n", options->rel_tol);
+    (void)fprintf(
+        out,
+        "  \"tolerance_config\": %s",
+        options->tolerance_config_path != 0 ? "\"" : "null");
+    if (options->tolerance_config_path != 0) {
+        (void)fprintf(out, "%s\"", options->tolerance_config_path);
+    }
+    (void)fprintf(out, ",\n");
     (void)fprintf(out, "  \"frame_count_left\": %u,\n", stats->frame_count_left);
     (void)fprintf(out, "  \"frame_count_right\": %u,\n", stats->frame_count_right);
     (void)fprintf(out, "  \"first_divergent_frame\": %u,\n", stats->first_divergent_frame);

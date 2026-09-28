@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "compare_logs": {
+    "abs_tol": 1.0e-9,
+    "rel_tol": 1.0e-9
+  }
+}
