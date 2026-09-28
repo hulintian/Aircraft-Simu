@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "faults": [
+    {
+      "id": "periodic_frame_loss",
+      "enabled": true,
+      "start_time_s": 2.0,
+      "duration_s": 3.0,
+      "target": "sensor.frame",
+      "type": "COMMUNICATION_LOSS",
+      "burst_period_s": 0.5,
+      "burst_active_s": 0.08
+    },
+    {
+      "id": "deterministic_delay_jitter",
+      "enabled": true,
+      "start_time_s": 6.0,
+      "duration_s": 3.0,
+      "target": "sensor.frame",
+      "type": "COMMUNICATION_JITTER",
+      "delay_pattern_steps": [1, 2, 4, 2]
+    },
+    {
+      "id": "periodic_previous_frame_replay",
+      "enabled": true,
+      "start_time_s": 10.0,
+      "duration_s": 3.0,
+      "target": "sensor.frame",
+      "type": "COMMUNICATION_REORDER",
+      "burst_period_s": 0.6,
+      "burst_active_s": 0.12
+    }
+  ]
+}

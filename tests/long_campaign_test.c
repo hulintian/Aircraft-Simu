@@ -16,10 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-enum {
-    LONG_CAMPAIGN_INSTANCE_COUNT = 6,
-    LONG_CAMPAIGN_MAX_PARALLEL = 3
-};
+enum { CAMPAIGN_PRESSURE_MAX_INSTANCES = 128 };
 
 /** @brief 尝试绑定一个 UDP 端口并持有套接字。 */
 static int bind_udp_port(unsigned int port, int *socket_out)
@@ -47,9 +44,12 @@ static int bind_udp_port(unsigned int port, int *socket_out)
 }
 
 /** @brief 为压力测试寻找一段连续可用端口。 */
-static int allocate_port_block(unsigned int *environment_base, unsigned int *flight_control_base)
+static int allocate_port_block(
+    unsigned int instance_count,
+    unsigned int *environment_base,
+    unsigned int *flight_control_base)
 {
-    const unsigned int required_ports = 2u * (unsigned int)LONG_CAMPAIGN_INSTANCE_COUNT;
+    const unsigned int required_ports = 2u * instance_count;
     const unsigned int first = 28000u;
     const unsigned int last = 62000u;
     const unsigned int span = (last - first - required_ports) / required_ports;
@@ -58,7 +58,7 @@ static int allocate_port_block(unsigned int *environment_base, unsigned int *fli
 
     for (attempt = 0u; attempt < span; ++attempt) {
         unsigned int base = first + (required_ports * ((attempt + rotate) % span));
-        int sockets[2u * LONG_CAMPAIGN_INSTANCE_COUNT];
+        int sockets[2u * CAMPAIGN_PRESSURE_MAX_INSTANCES];
         size_t index;
         int ok = 1;
 
@@ -93,7 +93,10 @@ static int write_runtime(
     const char *environment_program,
     const char *flight_control_program,
     unsigned int environment_base,
-    unsigned int flight_control_base)
+    unsigned int flight_control_base,
+    unsigned int instance_count,
+    unsigned int max_parallel,
+    const char *tier_name)
 {
     FILE *file = fopen(path, "wb");
     unsigned int index;
@@ -104,10 +107,10 @@ static int write_runtime(
     (void)fprintf(file, "{\n");
     (void)fprintf(file, "  \"schema_version\": 1,\n");
     (void)fprintf(file, "  \"campaign\": {\n");
-    (void)fprintf(file, "    \"campaign_id\": \"long_campaign_pressure_test\",\n");
-    (void)fprintf(file, "    \"instance_count\": %u,\n", (unsigned int)LONG_CAMPAIGN_INSTANCE_COUNT);
+    (void)fprintf(file, "    \"campaign_id\": \"campaign_pressure_%s\",\n", tier_name);
+    (void)fprintf(file, "    \"instance_count\": %u,\n", instance_count);
     (void)fprintf(file, "    \"schedule\": \"PARALLEL\",\n");
-    (void)fprintf(file, "    \"max_parallel_instances\": %u,\n", (unsigned int)LONG_CAMPAIGN_MAX_PARALLEL);
+    (void)fprintf(file, "    \"max_parallel_instances\": %u,\n", max_parallel);
     (void)fprintf(file, "    \"base_random_seed\": 10000,\n");
     (void)fprintf(file, "    \"failure_strategy\": \"CONTINUE_ON_FAILURE\"\n");
     (void)fprintf(file, "  },\n");
@@ -128,7 +131,7 @@ static int write_runtime(
     (void)fprintf(file, "    \"flight_control_program\": \"%s\"\n", flight_control_program);
     (void)fprintf(file, "  },\n");
     (void)fprintf(file, "  \"instances\": [\n");
-    for (index = 0u; index < (unsigned int)LONG_CAMPAIGN_INSTANCE_COUNT; ++index) {
+    for (index = 0u; index < instance_count; ++index) {
         (void)fprintf(file, "    {\n");
         (void)fprintf(file, "      \"enabled\": true,\n");
         (void)fprintf(file, "      \"instance_id\": %u,\n", index);
@@ -142,31 +145,55 @@ static int write_runtime(
         (void)fprintf(
             file,
             "    }%s\n",
-            index + 1u == (unsigned int)LONG_CAMPAIGN_INSTANCE_COUNT ? "" : ",");
+            index + 1u == instance_count ? "" : ",");
     }
     (void)fprintf(file, "  ]\n");
     (void)fprintf(file, "}\n");
     return fclose(file);
 }
 
-/** @brief 判断小文本文件是否包含指定片段。 */
+/** @brief 判断文本文件是否包含指定片段。 */
 static int text_file_contains(const char *path, const char *expected)
 {
-    char buffer[16384];
     FILE *file = fopen(path, "rb");
+    char *buffer;
+    long file_size;
     size_t size;
+    int contains;
 
     if (file == 0 || expected == 0) {
+        if (file != 0) {
+            (void)fclose(file);
+        }
         return 0;
     }
-    size = fread(buffer, 1u, sizeof(buffer) - 1u, file);
+    if (fseek(file, 0L, SEEK_END) != 0) {
+        (void)fclose(file);
+        return 0;
+    }
+    file_size = ftell(file);
+    if (file_size < 0L || fseek(file, 0L, SEEK_SET) != 0) {
+        (void)fclose(file);
+        return 0;
+    }
+    buffer = (char *)malloc((size_t)file_size + 1u);
+    if (buffer == 0) {
+        (void)fclose(file);
+        return 0;
+    }
+    size = fread(buffer, 1u, (size_t)file_size, file);
     (void)fclose(file);
     buffer[size] = '\0';
-    return strstr(buffer, expected) != 0;
+    contains = strstr(buffer, expected) != 0;
+    free(buffer);
+    return contains;
 }
 
 /** @brief 启动管理器并等待其在限定时间内退出。 */
-static int run_manager(const char *manager_program, const char *runtime_path)
+static int run_manager(
+    const char *manager_program,
+    const char *runtime_path,
+    unsigned int instance_count)
 {
     pid_t pid = fork();
     int status = 0;
@@ -184,7 +211,9 @@ static int run_manager(const char *manager_program, const char *runtime_path)
     if (pid <= 0) {
         return -1;
     }
-    for (attempt = 0u; attempt < 9000u; ++attempt) {
+    const unsigned int max_attempts = (30u + (10u * instance_count)) * 100u;
+
+    for (attempt = 0u; attempt < max_attempts; ++attempt) {
         pid_t result = waitpid(pid, &status, WNOHANG);
 
         if (result == pid) {
@@ -207,17 +236,41 @@ int main(int argc, char **argv)
     char output_dir[256];
     char runtime_path[320];
     char path[512];
+    char expected[128];
+    unsigned long parsed_instance_count;
+    unsigned long parsed_max_parallel;
+    unsigned int instance_count;
+    unsigned int max_parallel;
+    char *end = 0;
 
-    if (argc != 5) {
-        (void)fprintf(stderr, "long_campaign_test: invalid arguments\n");
+    if (argc != 8) {
+        (void)fprintf(stderr, "campaign_pressure_test: invalid arguments\n");
         return 2;
     }
-    if (allocate_port_block(&environment_base, &flight_control_base) != 0) {
-        (void)fprintf(stderr, "long_campaign_test: cannot allocate ports\n");
+    parsed_instance_count = strtoul(argv[5], &end, 10);
+    if (end == argv[5] || *end != '\0' || parsed_instance_count == 0ul ||
+        parsed_instance_count > CAMPAIGN_PRESSURE_MAX_INSTANCES) {
+        return 2;
+    }
+    end = 0;
+    parsed_max_parallel = strtoul(argv[6], &end, 10);
+    if (end == argv[6] || *end != '\0' || parsed_max_parallel == 0ul ||
+        parsed_max_parallel > parsed_instance_count) {
+        return 2;
+    }
+    instance_count = (unsigned int)parsed_instance_count;
+    max_parallel = (unsigned int)parsed_max_parallel;
+    if (allocate_port_block(instance_count, &environment_base, &flight_control_base) != 0) {
+        (void)fprintf(stderr, "campaign_pressure_test: cannot allocate ports\n");
         return 1;
     }
 
-    (void)snprintf(output_dir, sizeof(output_dir), "/tmp/missile_long_campaign_%ld", (long)getpid());
+    (void)snprintf(
+        output_dir,
+        sizeof(output_dir),
+        "/tmp/missile_campaign_%s_%ld",
+        argv[7],
+        (long)getpid());
     (void)snprintf(runtime_path, sizeof(runtime_path), "%s_runtime.json", output_dir);
     if (write_runtime(
             runtime_path,
@@ -226,30 +279,52 @@ int main(int argc, char **argv)
             argv[3],
             argv[4],
             environment_base,
-            flight_control_base) != 0) {
-        (void)fprintf(stderr, "long_campaign_test: cannot write runtime\n");
+            flight_control_base,
+            instance_count,
+            max_parallel,
+            argv[7]) != 0) {
+        (void)fprintf(stderr, "campaign_pressure_test: cannot write runtime\n");
         return 1;
     }
-    if (run_manager(argv[1], runtime_path) != 0) {
+    if (run_manager(argv[1], runtime_path, instance_count) != 0) {
         return 1;
     }
 
     (void)snprintf(path, sizeof(path), "%s/campaign_summary.json", output_dir);
-    if (!text_file_contains(path, "\"instance_count\": 6") ||
+    (void)snprintf(expected, sizeof(expected), "\"instance_count\": %u", instance_count);
+    if (!text_file_contains(path, expected) ||
+        !text_file_contains(path, "\"campaign_id\": \"campaign_pressure_") ||
         !text_file_contains(path, "\"schedule\": \"PARALLEL\"") ||
         !text_file_contains(path, "\"campaign_wall_time_s\":") ||
         !text_file_contains(path, "\"total_instance_wall_time_s\":") ||
         !text_file_contains(path, "\"max_instance_wall_time_s\":") ||
-        !text_file_contains(path, "\"completed_count\": 6") ||
+        !text_file_contains(path, "\"miss_distance_mean\":") ||
+        !text_file_contains(path, "\"miss_distance_std\":") ||
+        !text_file_contains(path, "\"failed_instances\":") ||
         !text_file_contains(path, "\"failed_count\": 0") ||
-        !text_file_contains(path, "\"summary_available_count\": 6") ||
         !text_file_contains(path, "\"total_diagnostic_sample_count\":") ||
-        !text_file_contains(path, "\"random_seed\": 10001") ||
-        !text_file_contains(path, "\"random_seed\": 10006")) {
+        !text_file_contains(path, "\"random_seed\": 10001")) {
+        return 1;
+    }
+    (void)snprintf(expected, sizeof(expected), "\"completed_count\": %u", instance_count);
+    if (!text_file_contains(path, expected)) {
+        return 1;
+    }
+    (void)snprintf(expected, sizeof(expected), "\"summary_available_count\": %u", instance_count);
+    if (!text_file_contains(path, expected)) {
+        return 1;
+    }
+    (void)snprintf(expected, sizeof(expected), "\"random_seed\": %u", 10000u + instance_count);
+    if (!text_file_contains(path, expected)) {
         return 1;
     }
 
-    (void)snprintf(path, sizeof(path), "%s/instance_0005/summary.json", output_dir);
+    (void)snprintf(
+        path,
+        sizeof(path),
+        "%s/instance_%04u/summary.json",
+        output_dir,
+        instance_count - 1u);
     if (!text_file_contains(path, "\"exit_reason\":")) {
         return 1;
     }

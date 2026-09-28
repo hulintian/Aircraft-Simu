@@ -2,6 +2,8 @@
  *  @brief map_preprocess 工具集成测试。
  */
 #include "env/map_tile.h"
+#include "env/earth_model.h"
+#include "env/geo_coordinate.h"
 #include "env/terrain_model.h"
 
 #include <math.h>
@@ -71,14 +73,23 @@ int main(int argc, char **argv)
     char esri_tile_path[128];
     char hgt_path[128];
     char hgt_tile_path[128];
+    char real_dem_path[512];
+    char real_dem_tile_path[128];
     char command[1024];
     FILE *grid;
     TerrainTile tile;
     double height_m = 0.0;
+    EarthModel earth;
+    TerrainModel terrain;
+    LlaCoord west;
+    LlaCoord east;
+    EcefCoord west_ecef;
+    EcefCoord east_ecef;
+    int occluded = 0;
     int failures = 0;
 
-    if (argc != 2) {
-        (void)fprintf(stderr, "usage: %s <map_preprocess>\n", argv[0]);
+    if (argc != 3) {
+        (void)fprintf(stderr, "usage: %s <map_preprocess> <source-root>\n", argv[0]);
         return 2;
     }
     (void)snprintf(grid_path, sizeof(grid_path), "/tmp/missile_grid_%ld.txt", (long)getpid());
@@ -107,6 +118,16 @@ int main(int argc, char **argv)
         hgt_tile_path,
         sizeof(hgt_tile_path),
         "/tmp/missile_hgt_tile_%ld.bin",
+        (long)getpid());
+    (void)snprintf(
+        real_dem_path,
+        sizeof(real_dem_path),
+        "%s/tests/fixtures/dem/everest_terrain_9x9.txt",
+        argv[2]);
+    (void)snprintf(
+        real_dem_tile_path,
+        sizeof(real_dem_tile_path),
+        "/tmp/missile_real_dem_tile_%ld.bin",
         (long)getpid());
     grid = fopen(grid_path, "w");
     if (grid == 0) {
@@ -138,6 +159,71 @@ int main(int argc, char **argv)
             &height_m) == SIM_OK,
         "map_preprocess_query");
     failures += expect_near(height_m, 150.0, 1.0e-12, "map_preprocess_height");
+    map_tile_unload(&tile);
+
+    (void)snprintf(
+        command,
+        sizeof(command),
+        "%s --input %s --output %s --width 9 --height 9 "
+        "--lat-min-deg 27.986973937353 --lat-max-deg 27.989399291155 "
+        "--lon-min-deg 86.923999786377 --lon-max-deg 86.926746368408",
+        argv[1],
+        real_dem_path,
+        real_dem_tile_path);
+    failures += expect(system(command) == 0, "map_preprocess_real_dem_command");
+    failures += expect(
+        map_tile_load_file(real_dem_tile_path, &tile) == SIM_OK,
+        "map_preprocess_real_dem_load");
+    failures += expect(
+        map_tile_get_height(
+            &tile,
+            27.989096121930 * 0.017453292519943295769236907684886,
+            86.925373077393 * 0.017453292519943295769236907684886,
+            &height_m) == SIM_OK,
+        "map_preprocess_real_dem_peak_query");
+    failures += expect_near(height_m, 8753.0, 1.0, "map_preprocess_real_dem_peak_height");
+    earth = earth_model_wgs84();
+    failures += expect(
+        earth_model_validate(&earth) == SIM_OK,
+        "map_preprocess_real_dem_earth_init");
+    failures += expect(
+        terrain_model_init(&terrain, &tile, 1u, MAP_MISSING_ERROR, 0.0) == SIM_OK,
+        "map_preprocess_real_dem_terrain_init");
+    west.lat_rad = 27.989096121930 * 0.017453292519943295769236907684886;
+    west.lon_rad = 86.923999786377 * 0.017453292519943295769236907684886;
+    west.height_m = 8720.0;
+    east = west;
+    east.lon_rad = 86.926746368408 * 0.017453292519943295769236907684886;
+    failures += expect(
+        geo_lla_to_ecef(&earth, &west, &west_ecef) == SIM_OK &&
+            geo_lla_to_ecef(&earth, &east, &east_ecef) == SIM_OK,
+        "map_preprocess_real_dem_los_ecef");
+    failures += expect(
+        terrain_line_of_sight_occluded(
+            &terrain,
+            &earth,
+            west_ecef.position_m,
+            east_ecef.position_m,
+            64u,
+            &occluded) == SIM_OK &&
+            occluded != 0,
+        "map_preprocess_real_dem_los_blocked");
+    west.height_m = 8800.0;
+    east.height_m = 8800.0;
+    failures += expect(
+        geo_lla_to_ecef(&earth, &west, &west_ecef) == SIM_OK &&
+            geo_lla_to_ecef(&earth, &east, &east_ecef) == SIM_OK,
+        "map_preprocess_real_dem_clear_los_ecef");
+    failures += expect(
+        terrain_line_of_sight_occluded(
+            &terrain,
+            &earth,
+            west_ecef.position_m,
+            east_ecef.position_m,
+            64u,
+            &occluded) == SIM_OK &&
+            occluded == 0,
+        "map_preprocess_real_dem_los_clear");
     map_tile_unload(&tile);
 
     grid = fopen(esri_grid_path, "w");
@@ -228,5 +314,6 @@ int main(int argc, char **argv)
     (void)unlink(esri_tile_path);
     (void)unlink(hgt_path);
     (void)unlink(hgt_tile_path);
+    (void)unlink(real_dem_tile_path);
     return failures == 0 ? 0 : 1;
 }

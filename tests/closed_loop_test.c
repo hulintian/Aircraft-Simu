@@ -6,6 +6,7 @@
 #include "common/packet.h"
 #include "common/protocol.h"
 #include "env/aero_database.h"
+#include "env/aero_database_v2.h"
 #include "env/map_tile.h"
 #include "env/terrain_model.h"
 #include "fc/fc_health.h"
@@ -39,6 +40,11 @@ typedef struct ClosedLoopRun {
 typedef struct ClosedLoopExpectation {
     int expect_los_occlusion;
     int expect_hit;
+    int expect_aero_v2;
+    const char *run_mode;
+    const char *synchronization_mode;
+    int validate_lockstep_command_semantics;
+    unsigned int expected_fault_count;
 } ClosedLoopExpectation;
 
 /** @brief 让内核临时分配一个可用的本地 UDP 端口。 */
@@ -71,7 +77,9 @@ static int write_runtime(
     const char *path,
     const char *output_dir,
     unsigned int environment_port,
-    unsigned int flight_control_port)
+    unsigned int flight_control_port,
+    const char *run_mode,
+    const char *synchronization_mode)
 {
     FILE *file = fopen(path, "wb");
 
@@ -83,9 +91,14 @@ static int write_runtime(
     (void)fprintf(
         file,
         "  \"campaign\": {"
+        "\"campaign_id\": \"closed_loop_test\", "
         "\"instance_count\": 1, "
         "\"max_parallel_instances\": 1, "
-        "\"base_random_seed\": 424242},\n");
+        "\"base_random_seed\": 424242, "
+        "\"run_mode\": \"%s\", "
+        "\"synchronization_mode\": \"%s\"},\n",
+        run_mode,
+        synchronization_mode);
     (void)fprintf(file, "  \"network\": {\n");
     (void)fprintf(file, "    \"environment_base_port\": %u,\n", environment_port);
     (void)fprintf(file, "    \"flight_control_base_port\": %u,\n", flight_control_port);
@@ -103,7 +116,7 @@ static int write_runtime(
 }
 
 /** @brief 为闭环测试生成一个不影响前三帧传感器校验的故障脚本。 */
-static int write_faults(const char *path)
+static int write_faults(const char *path, int include_professional_matrix)
 {
     FILE *file = fopen(path, "wb");
 
@@ -138,7 +151,47 @@ static int write_faults(const char *path)
     (void)fprintf(file, "      \"duration_s\": 0.02,\n");
     (void)fprintf(file, "      \"target\": \"sensor.frame\",\n");
     (void)fprintf(file, "      \"type\": \"COMMUNICATION_REORDER\"\n");
-    (void)fprintf(file, "    }\n");
+    (void)fprintf(file, "    }%s\n", include_professional_matrix != 0 ? "," : "");
+    if (include_professional_matrix != 0) {
+        static const char *const entries[] = {
+            "{\"id\":\"noise_increase\",\"start_time_s\":0.15,\"duration_s\":0.01,"
+            "\"target\":\"sensor.accel\",\"type\":\"SENSOR_FAULT_NOISE_INCREASE\","
+            "\"value_xyz\":[0.1,0.1,0.1]}",
+            "{\"id\":\"speed_saturation\",\"start_time_s\":0.16,\"duration_s\":0.01,"
+            "\"target\":\"sensor.speed\",\"type\":\"SENSOR_FAULT_SATURATION\","
+            "\"min_value\":-1000,\"max_value\":1000}",
+            "{\"id\":\"gyro_stuck\",\"start_time_s\":0.17,\"duration_s\":0.01,"
+            "\"target\":\"sensor.imu.gyro\",\"type\":\"SENSOR_FAULT_STUCK\"}",
+            "{\"id\":\"range_delay\",\"start_time_s\":0.18,\"duration_s\":0.01,"
+            "\"target\":\"sensor.seeker.range\",\"type\":\"SENSOR_FAULT_DELAY\",\"value\":1}",
+            "{\"id\":\"actuator_bias\",\"start_time_s\":0.19,\"duration_s\":0.01,"
+            "\"target\":\"actuator.accel_x\",\"type\":\"ACTUATOR_FAULT_BIAS\",\"value\":1}",
+            "{\"id\":\"actuator_rate\",\"start_time_s\":0.20,\"duration_s\":0.01,"
+            "\"target\":\"actuator.accel_y\",\"type\":\"ACTUATOR_FAULT_RATE_LIMIT\",\"scale\":0.5}",
+            "{\"id\":\"actuator_position\",\"start_time_s\":0.21,\"duration_s\":0.01,"
+            "\"target\":\"actuator.accel_z\","
+            "\"type\":\"ACTUATOR_FAULT_POSITION_LIMIT_DEGRADED\",\"scale\":0.5}",
+            "{\"id\":\"actuator_delay\",\"start_time_s\":0.22,\"duration_s\":0.01,"
+            "\"target\":\"actuator.accel_x\",\"type\":\"ACTUATOR_FAULT_DELAY\",\"value\":1}",
+            "{\"id\":\"actuator_disabled\",\"start_time_s\":0.23,\"duration_s\":0.01,"
+            "\"target\":\"actuator.accel_y\",\"type\":\"ACTUATOR_FAULT_DISABLED\"}",
+            "{\"id\":\"packet_drop\",\"start_time_s\":0.15,\"duration_s\":0.01,"
+            "\"target\":\"sensor.frame\",\"type\":\"COMM_FAULT_DROP_PACKET\"}",
+            "{\"id\":\"packet_duplicate\",\"start_time_s\":0.17,\"duration_s\":0.01,"
+            "\"target\":\"sensor.frame\",\"type\":\"COMM_FAULT_DUPLICATE_PACKET\"}",
+            "{\"id\":\"packet_corrupt\",\"start_time_s\":0.19,\"duration_s\":0.01,"
+            "\"target\":\"sensor.frame\",\"type\":\"COMM_FAULT_CORRUPT_PACKET\"}"
+        };
+        size_t index;
+
+        for (index = 0u; index < sizeof(entries) / sizeof(entries[0]); ++index) {
+            (void)fprintf(
+                file,
+                "    %s%s\n",
+                entries[index],
+                index + 1u < sizeof(entries) / sizeof(entries[0]) ? "," : "");
+        }
+    }
     (void)fprintf(file, "  ]\n");
     (void)fprintf(file, "}\n");
     return fclose(file);
@@ -173,33 +226,45 @@ static int write_test_tile(const char *path, int16_t height_m)
     return map_tile_write_file(path, &tile) == SIM_OK ? 0 : -1;
 }
 
-/** @brief 为闭环测试写一个端点低、中间视线高的遮挡山脊瓦片。 */
-static int write_test_occluding_tile(const char *path)
+/** @brief 从仓库真实来源 DEM fixture 写出珠峰附近内部瓦片。 */
+static int write_real_dem_tile(const char *path, const char *fixture_path)
 {
     TerrainTileHeader header = {
         TERRAIN_TILE_MAGIC,
         TERRAIN_TILE_VERSION,
         9u,
-        3u,
-        29.9 * 0.017453292519943295769236907684886,
-        30.2 * 0.017453292519943295769236907684886,
-        119.9 * 0.017453292519943295769236907684886,
-        120.2 * 0.017453292519943295769236907684886,
+        9u,
+        27.986973937353 * 0.017453292519943295769236907684886,
+        27.989399291155 * 0.017453292519943295769236907684886,
+        86.923999786377 * 0.017453292519943295769236907684886,
+        86.926746368408 * 0.017453292519943295769236907684886,
         1.0,
         0.0,
         0u
     };
-    int16_t samples[27];
+    int16_t samples[81];
     TerrainTile tile;
-    size_t row;
-    size_t column;
+    FILE *fixture;
+    size_t index;
 
-    for (row = 0u; row < 3u; ++row) {
-        for (column = 0u; column < 9u; ++column) {
-            samples[(row * 9u) + column] = column == 4u ? 30000 : 0;
-        }
+    if (path == 0 || fixture_path == 0) {
+        return -1;
     }
-    if (map_tile_bind(&tile, &header, samples, 27u) != SIM_OK) {
+    fixture = fopen(fixture_path, "rb");
+    if (fixture == 0) {
+        return -1;
+    }
+    for (index = 0u; index < 81u; ++index) {
+        int value;
+
+        if (fscanf(fixture, "%d", &value) != 1 || value < INT16_MIN || value > INT16_MAX) {
+            (void)fclose(fixture);
+            return -1;
+        }
+        samples[index] = (int16_t)value;
+    }
+    if (fclose(fixture) != 0 ||
+        map_tile_bind(&tile, &header, samples, 81u) != SIM_OK) {
         return -1;
     }
     return map_tile_write_file(path, &tile) == SIM_OK ? 0 : -1;
@@ -241,8 +306,14 @@ static int write_double_le(FILE *file, double value)
     return fwrite(bytes, 1u, sizeof(bytes), file) == sizeof(bytes) ? 0 : -1;
 }
 
-/** @brief 为闭环测试写一个单瓦片二进制空间索引。 */
-static int write_test_tile_index(const char *path, const char *tile_path)
+/** @brief 为闭环测试写一个指定经纬度范围的单瓦片二进制空间索引。 */
+static int write_test_tile_index_bounds(
+    const char *path,
+    const char *tile_path,
+    double lat_min_deg,
+    double lat_max_deg,
+    double lon_min_deg,
+    double lon_max_deg)
 {
     FILE *file = fopen(path, "wb");
     const uint16_t path_size = tile_path == 0 ? 0u : (uint16_t)strlen(tile_path);
@@ -258,16 +329,116 @@ static int write_test_tile_index(const char *path, const char *tile_path)
     if (write_u32_le(file, TERRAIN_TILE_INDEX_MAGIC) != 0 ||
         write_u16_le(file, (uint16_t)TERRAIN_TILE_INDEX_VERSION) != 0 ||
         write_u16_le(file, 1u) != 0 ||
-        write_double_le(file, 29.9 * 0.017453292519943295769236907684886) != 0 ||
-        write_double_le(file, 30.2 * 0.017453292519943295769236907684886) != 0 ||
-        write_double_le(file, 119.9 * 0.017453292519943295769236907684886) != 0 ||
-        write_double_le(file, 120.2 * 0.017453292519943295769236907684886) != 0 ||
+        write_double_le(file, lat_min_deg * 0.017453292519943295769236907684886) != 0 ||
+        write_double_le(file, lat_max_deg * 0.017453292519943295769236907684886) != 0 ||
+        write_double_le(file, lon_min_deg * 0.017453292519943295769236907684886) != 0 ||
+        write_double_le(file, lon_max_deg * 0.017453292519943295769236907684886) != 0 ||
         write_u16_le(file, path_size) != 0 ||
         fwrite(tile_path, 1u, path_size, file) != path_size) {
         (void)fclose(file);
         return -1;
     }
     return fclose(file) == 0 ? 0 : -1;
+}
+
+/** @brief 为 baseline 闭环范围写单瓦片二进制空间索引。 */
+static int write_test_tile_index(const char *path, const char *tile_path)
+{
+    return write_test_tile_index_bounds(path, tile_path, 29.9, 30.2, 119.9, 120.2);
+}
+
+/** @brief 替换文本文件中的一个唯一片段。 */
+static int replace_unique_text(
+    const char *path,
+    const char *needle,
+    const char *replacement)
+{
+    FILE *file;
+    char *input;
+    char *position;
+    long file_size;
+    size_t prefix_size;
+    size_t suffix_size;
+    int result = -1;
+
+    if (path == 0 || needle == 0 || replacement == 0) {
+        return -1;
+    }
+    file = fopen(path, "rb");
+    if (file == 0 || fseek(file, 0, SEEK_END) != 0 ||
+        (file_size = ftell(file)) < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        if (file != 0) {
+            (void)fclose(file);
+        }
+        return -1;
+    }
+    input = (char *)malloc((size_t)file_size + 1u);
+    if (input == 0 || fread(input, 1u, (size_t)file_size, file) != (size_t)file_size) {
+        free(input);
+        (void)fclose(file);
+        return -1;
+    }
+    (void)fclose(file);
+    input[(size_t)file_size] = '\0';
+    position = strstr(input, needle);
+    if (position == 0 || strstr(position + strlen(needle), needle) != 0) {
+        free(input);
+        return -1;
+    }
+    prefix_size = (size_t)(position - input);
+    suffix_size = (size_t)file_size - prefix_size - strlen(needle);
+    file = fopen(path, "wb");
+    if (file != 0) {
+        const int write_ok =
+            fwrite(input, 1u, prefix_size, file) == prefix_size &&
+            fwrite(replacement, 1u, strlen(replacement), file) == strlen(replacement) &&
+            fwrite(position + strlen(needle), 1u, suffix_size, file) == suffix_size;
+        const int close_ok = fclose(file) == 0;
+
+        file = 0;
+        if (write_ok != 0 && close_ok != 0) {
+            result = 0;
+        }
+    }
+    if (file != 0) {
+        (void)fclose(file);
+    }
+    free(input);
+    return result;
+}
+
+/** @brief 把临时场景改为真实 DEM 范围内的静止 LOS 遮挡算例。 */
+static int configure_real_dem_geometry(const char *scenario_path)
+{
+    return replace_unique_text(
+               scenario_path,
+               "[30.0, 120.0, 1000.0]",
+               "[27.989096121930, 86.923999786377, 8720.0]") == 0 &&
+            replace_unique_text(
+                scenario_path,
+                "[-390.0, -675.0, 0.0]",
+                "[0.0, 0.0, 0.0]") == 0 &&
+            replace_unique_text(
+                scenario_path,
+                "[30.0, 120.08, 1000.0]",
+                "[27.989096121930, 86.926746368408, 8720.0]") == 0 &&
+            replace_unique_text(
+                scenario_path,
+                "[100.0, 173.0, 0.0]",
+                "[0.0, 0.0, 0.0]") == 0 ? 0 : -1;
+}
+
+/** @brief 将普通气动资源场景转换为 v2 表场景并关闭 surrogate 路径。 */
+static int configure_aero_v2_scenario(const char *scenario_path)
+{
+    return replace_unique_text(
+               scenario_path,
+               "\"table_path\"",
+               "\"table_v2_path\"") == 0 &&
+            replace_unique_text(
+                scenario_path,
+                "\"surrogate_model_path\"",
+                "\"disabled_surrogate_model_path\"") == 0 ? 0 : -1;
 }
 
 /** @brief 写一个闭环测试使用的零系数气动表。 */
@@ -284,6 +455,29 @@ static int write_test_aero_table(const char *path)
         AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN) == SIM_OK ? 0 : -1;
 }
 
+/** @brief 写一个单点零系数六维 v2 气动表。 */
+static int write_test_aero_table_v2(const char *path)
+{
+    const double zero_axis[1] = { 0.0 };
+    const AeroCoefficientSet coefficients[1] = {
+        { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    };
+    const AeroDatabaseV2Grid grid = {
+        zero_axis, 1u,
+        zero_axis, 1u,
+        zero_axis, 1u,
+        zero_axis, 1u,
+        zero_axis, 1u,
+        zero_axis, 1u,
+        coefficients, 1u
+    };
+
+    return aero_database_v2_write_file(
+        path,
+        &grid,
+        AERO_DB_EXTRAPOLATION_CLAMP_AND_WARN) == SIM_OK ? 0 : -1;
+}
+
 /** @brief 写一个闭环测试使用的零系数线性代理模型。 */
 static int write_test_aero_surrogate(const char *path)
 {
@@ -293,6 +487,7 @@ static int write_test_aero_surrogate(const char *path)
         return -1;
     }
     if (fprintf(file, "MISSILE_AERO_SURROGATE_LINEAR_V1\n") < 0 ||
+        fprintf(file, "envelope 0.0 10.0 -3.2 3.2 -1.6 1.6\n") < 0 ||
         fprintf(file, "cx 0.0 0.0 0.0 0.0\n") < 0 ||
         fprintf(file, "cy 0.0 0.0 0.0 0.0\n") < 0 ||
         fprintf(file, "cz 0.0 0.0 0.0 0.0\n") < 0 ||
@@ -311,6 +506,7 @@ static int write_scenario_with_resource_paths(
     const char *dest_path,
     const char *tile_index_path,
     const char *aero_table_path,
+    const char *map_manifest_path,
     double max_time_override_s)
 {
     const char map_marker[] = "\"map\": {";
@@ -388,7 +584,12 @@ static int write_scenario_with_resource_paths(
     }
     if (fwrite(write_start, 1u, (size_t)(map_position - write_start) + sizeof(map_marker) - 1u, dest) !=
             (size_t)(map_position - write_start) + sizeof(map_marker) - 1u ||
-        fprintf(dest, "\n    \"tile_index_path\": \"%s\",", tile_index_path) < 0 ||
+        fprintf(
+            dest,
+            "\n    \"tile_index_path\": \"%s\",\n"
+            "    \"resource_manifest_path\": \"%s\",",
+            tile_index_path,
+            map_manifest_path) < 0 ||
         fwrite(
             map_position + sizeof(map_marker) - 1u,
             1u,
@@ -520,7 +721,8 @@ static int run_compare_tool(
     const char *program,
     const char *left_path,
     const char *right_path,
-    const char *output_path)
+    const char *output_path,
+    const char *tolerance_config_path)
 {
     pid_t pid = fork();
 
@@ -536,6 +738,8 @@ static int run_compare_tool(
             left_path,
             "--right",
             right_path,
+            "--tolerance-config",
+            tolerance_config_path,
             "--output",
             output_path,
             (char *)0);
@@ -588,20 +792,38 @@ static int file_exists_and_nonempty(const char *path)
     return stat(path, &info) == 0 && info.st_size > 0;
 }
 
-/** @brief 检查小型文本文件是否包含指定稳定字段。 */
+/** @brief 检查文本文件是否包含指定稳定字段。 */
 static int text_file_contains(const char *path, const char *expected)
 {
-    char buffer[4096];
+    char *buffer;
     FILE *file = fopen(path, "rb");
+    long file_size;
     size_t size;
+    int contains;
 
     if (file == 0 || expected == 0) {
+        if (file != 0) {
+            (void)fclose(file);
+        }
         return 0;
     }
-    size = fread(buffer, 1u, sizeof(buffer) - 1u, file);
+    if (fseek(file, 0L, SEEK_END) != 0 ||
+        (file_size = ftell(file)) < 0L ||
+        fseek(file, 0L, SEEK_SET) != 0) {
+        (void)fclose(file);
+        return 0;
+    }
+    buffer = (char *)malloc((size_t)file_size + 1u);
+    if (buffer == 0) {
+        (void)fclose(file);
+        return 0;
+    }
+    size = fread(buffer, 1u, (size_t)file_size, file);
     (void)fclose(file);
     buffer[size] = '\0';
-    return strstr(buffer, expected) != 0;
+    contains = size == (size_t)file_size && strstr(buffer, expected) != 0;
+    free(buffer);
+    return contains;
 }
 
 /** @brief 解码前三帧传感器日志并验证延迟预热、LOS 遮挡与各通道有效位。 */
@@ -734,20 +956,54 @@ static int files_equal(const char *left_path, const char *right_path)
 /** @brief 校验闭环运行产物和故障统计字段。 */
 static int validate_closed_loop_outputs(
     const ClosedLoopRun *run,
+    const char *scenario_path,
     const ClosedLoopExpectation *expectation)
 {
     char path[512];
+    char expected_fault_count[64];
 
-    if (run == 0 || expectation == 0) {
+    if (run == 0 || scenario_path == 0 || expectation == 0) {
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/run_manifest.json", run->instance_dir);
     if (!file_exists_and_nonempty(path) ||
         !text_file_contains(path, "\"faults_path\":") ||
         !text_file_contains(path, "\"random_seed\": 424242") ||
+        !text_file_contains(path, "\"campaign_id\":") ||
+        !text_file_contains(path, "\"git_commit\":") ||
+        !text_file_contains(path, "\"git_worktree_dirty\":") ||
+        !text_file_contains(path, "\"build_time\":") ||
+        !text_file_contains(path, "\"compiler\":") ||
+        !text_file_contains(path, "\"start_time_wall_clock\":") ||
+        !text_file_contains(path, "\"config_file_list\":") ||
+        !text_file_contains(path, "\"config_crc32\":") ||
+        !text_file_contains(path, "\"config_snapshots\":") ||
+        !text_file_contains(path, "\"unrecognized_config_field_count\":") ||
+        !text_file_contains(path, "\"unrecognized_config_fields\":") ||
+        !text_file_contains(path, expectation->run_mode) ||
+        !text_file_contains(path, expectation->synchronization_mode) ||
+        !text_file_contains(path, "\"integrator_type\": \"RK4\"") ||
+        !text_file_contains(path, "\"target_model\": \"CONSTANT_VELOCITY\"") ||
+        !text_file_contains(path, "\"target_maneuver_count\": 0") ||
+        !text_file_contains(path, "\"log_files\":") ||
+        !text_file_contains(path, "\"truth_trajectory\":") ||
+        !text_file_contains(path, "\"flight_control_internal\":") ||
         !text_file_contains(path, "\"gravity_enabled\": true") ||
         !text_file_contains(path, "\"aerodynamics_enabled\": true") ||
-        !text_file_contains(path, "\"aero_table_enabled\": true") ||
+        !text_file_contains(path, "\"earth_rotation_enabled\": true")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: run manifest core fields\n");
+        return 0;
+    }
+    if (expectation->expect_aero_v2 != 0) {
+        if (!text_file_contains(path, "\"aero_table_enabled\": false") ||
+            !text_file_contains(path, "\"aero_table_v2_enabled\": true") ||
+            !text_file_contains(path, "\"aero_table_v2_file_version\": 2") ||
+            !text_file_contains(path, "\"aero_table_v2_dimensions\": [1, 1, 1, 1, 1, 1]") ||
+            !text_file_contains(path, "\"aero_surrogate_enabled\": false")) {
+            (void)fprintf(stderr, "closed-loop output validation failed: aero v2 manifest fields\n");
+            return 0;
+        }
+    } else if (!text_file_contains(path, "\"aero_table_enabled\": true") ||
         !text_file_contains(path, "\"aero_table_file_version\": 1") ||
         !text_file_contains(path, "\"aero_table_extrapolation_policy\": \"CLAMP_AND_WARN\"") ||
         !text_file_contains(path, "\"aero_table_height_envelope_enabled\": true") ||
@@ -757,43 +1013,124 @@ static int validate_closed_loop_outputs(
         !text_file_contains(path, "\"aero_surrogate_enabled\": true") ||
         !text_file_contains(path, "\"aero_surrogate_model_version\": \"surrogate-test-v1\"") ||
         !text_file_contains(path, "\"aero_surrogate_training_data_version\": \"training-data-test-v1\"") ||
-        !text_file_contains(path, "\"earth_rotation_enabled\": true")) {
+        !text_file_contains(path, "\"aero_surrogate_envelope_available\": true") ||
+        !text_file_contains(path, "\"aero_surrogate_envelope\":")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: aero v1 manifest fields\n");
         return 0;
     }
     if (!text_file_contains(path, "\"terrain_enabled\": true") ||
         !text_file_contains(path, "\"terrain_los_occlusion_enabled\": true") ||
         !text_file_contains(path, "\"terrain_missing_policy\": \"FLAT_FILL\"") ||
         !text_file_contains(path, "\"terrain_cache_tile_count\": 16") ||
+        !text_file_contains(path, "\"terrain_resource_manifest_path_enabled\": true") ||
+        !text_file_contains(path, "\"mass_properties_enabled\": true") ||
+        !text_file_contains(path, "\"terrain_resource_manifest_path\":") ||
         !text_file_contains(path, "\"terrain_tile_index_path_enabled\": true") ||
         !text_file_contains(path, "\"terrain_tile_index_path\":") ||
         !text_file_contains(path, "\"terrain_tile_path_count\": 1") ||
         !text_file_contains(path, "\"terrain_tile_paths\": [")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: terrain manifest fields\n");
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/config_snapshot_scenario.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) || !files_equal(path, scenario_path)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: scenario snapshot\n");
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/config_snapshot_runtime.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) || !files_equal(path, run->runtime_path)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: runtime snapshot\n");
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/config_snapshot_faults.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) || !files_equal(path, run->faults_path)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: faults snapshot\n");
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/event_log.txt", run->instance_dir);
     if (!file_exists_and_nonempty(path) ||
         !text_file_contains(path, "FAULT_START") ||
         !text_file_contains(path, "FAULT_END")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: event log\n");
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/sensor_log.bin", run->instance_dir);
     if (!file_exists_and_nonempty(path) ||
         !sensor_log_reports_expected_pipeline(path, expectation->expect_los_occlusion)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: sensor log pipeline\n");
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/command_log.bin", run->instance_dir);
     if (!file_exists_and_nonempty(path) ||
-        !command_log_reports_expected_protection(path, expectation->expect_los_occlusion)) {
+        (expectation->validate_lockstep_command_semantics != 0 &&
+         !command_log_reports_expected_protection(path, expectation->expect_los_occlusion))) {
+        (void)fprintf(stderr, "closed-loop output validation failed: command log protection\n");
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/fc_internal_log.bin", run->instance_dir);
     if (!file_exists_and_nonempty(path)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: flight-control internal log\n");
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/fc_run_manifest.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) ||
+        !text_file_contains(path, "\"program_version\": \"flight_control_sim") ||
+        !text_file_contains(path, "\"flight_control_path\":") ||
+        !text_file_contains(path, "\"config_crc32\":") ||
+        !text_file_contains(path, "\"config_snapshots\":") ||
+        !text_file_contains(path, expectation->run_mode) ||
+        !text_file_contains(path, expectation->synchronization_mode)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: flight-control manifest\n");
+        return 0;
+    }
+    (void)snprintf(
+        path,
+        sizeof(path),
+        "%s/config_snapshot_flight_control.json",
+        run->instance_dir);
+    if (!file_exists_and_nonempty(path)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: flight-control snapshot\n");
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/fc_config_snapshot_runtime.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) || !files_equal(path, run->runtime_path)) {
+        (void)fprintf(stderr, "closed-loop output validation failed: fc runtime snapshot\n");
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/performance.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) ||
+        !text_file_contains(path, expectation->run_mode) ||
+        !text_file_contains(path, expectation->synchronization_mode) ||
+        !text_file_contains(path, "\"step_sample_count\":") ||
+        !text_file_contains(path, "\"mean_step_compute_time_s\":") ||
+        !text_file_contains(path, "\"max_control_roundtrip_time_s\":") ||
+        !text_file_contains(path, "\"realtime_overrun_count\":") ||
+        !text_file_contains(path, "\"realtime_margin_s\":") ||
+        !text_file_contains(path, "\"command_hold_count\":") ||
+        !text_file_contains(path, "\"protocol_minor_mismatch_count\": 0")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: environment performance\n");
+        return 0;
+    }
+    (void)snprintf(path, sizeof(path), "%s/fc_performance.json", run->instance_dir);
+    if (!file_exists_and_nonempty(path) ||
+        !text_file_contains(path, expectation->run_mode) ||
+        !text_file_contains(path, expectation->synchronization_mode) ||
+        !text_file_contains(path, "\"valid_sensor_frame_count\":") ||
+        !text_file_contains(path, "\"receive_timeout_count\": 0") ||
+        !text_file_contains(path, "\"graceful_stop_count\": 1") ||
+        !text_file_contains(path, "\"protocol_minor_mismatch_count\": 0") ||
+        !text_file_contains(path, "\"controller_compute_sample_count\":") ||
+        !text_file_contains(path, "\"mean_controller_compute_time_s\":") ||
+        !text_file_contains(path, "\"max_command_send_time_s\":") ||
+        !text_file_contains(path, "\"controller_realtime_margin_s\":")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: flight-control performance\n");
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/trajectory.csv", run->instance_dir);
     if (!file_exists_and_nonempty(path) ||
         !text_file_contains(path, "missile_mass_kg") ||
         !text_file_contains(path, "force_b_x_n")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: trajectory log\n");
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/trajectory_diagnostics.csv", run->instance_dir);
@@ -801,19 +1138,33 @@ static int validate_closed_loop_outputs(
         !text_file_contains(path, "quat_norm_error") ||
         !text_file_contains(path, "dcm_orthogonality_error") ||
         !text_file_contains(path, "model_degradation_flags")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: diagnostics log\n");
         return 0;
     }
     (void)snprintf(path, sizeof(path), "%s/summary.json", run->instance_dir);
+    (void)snprintf(
+        expected_fault_count,
+        sizeof(expected_fault_count),
+        "\"fault_configured_count\": %u",
+        expectation->expected_fault_count);
     if (!text_file_contains(
             path,
             expectation->expect_hit != 0 ? "\"hit_flag\": true" : "\"hit_flag\": false") ||
-        !text_file_contains(path, "\"fault_configured_count\": 3") ||
-        !text_file_contains(path, "\"fault_start_count\": 3") ||
-        !text_file_contains(path, "\"fault_end_count\": 3") ||
+        !text_file_contains(path, expected_fault_count) ||
+        !text_file_contains(path, "\"fault_start_count\":") ||
+        !text_file_contains(path, "\"fault_end_count\":") ||
+        !text_file_contains(path, "\"fault_count\":") ||
+        !text_file_contains(path, "\"max_command_norm\":") ||
+        !text_file_contains(path, "\"max_actual_accel\":") ||
+        !text_file_contains(path, "\"sensor_dropout_count\":") ||
+        !text_file_contains(path, "\"command_timeout_count\": 0") ||
+        !text_file_contains(path, "\"command_hold_count\":") ||
+        !text_file_contains(path, "\"protocol_minor_mismatch_count\": 0") ||
         !text_file_contains(path, "\"fault_sensor_affected_step_count\":") ||
         !text_file_contains(path, "\"terrain_cache_path_count\": 1") ||
         !text_file_contains(path, "\"terrain_cache_capacity\":") ||
         !text_file_contains(path, "\"terrain_cache_load_count\":")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: summary operational fields\n");
         return 0;
     }
     if (!text_file_contains(path, "\"diagnostic_sample_count\":") ||
@@ -824,6 +1175,7 @@ static int validate_closed_loop_outputs(
         !text_file_contains(path, "\"aero_model_flags_or\":") ||
         !text_file_contains(path, "\"model_degradation_flags_or\":") ||
         !text_file_contains(path, "\"aero_extrapolated_sample_count\":")) {
+        (void)fprintf(stderr, "closed-loop output validation failed: summary diagnostic fields\n");
         return 0;
     }
     return 1;
@@ -834,7 +1186,8 @@ static int validate_replay_compare(
     const ClosedLoopRun *run,
     const char *flight_control_config,
     const char *replay_program,
-    const char *compare_program)
+    const char *compare_program,
+    const char *exact_config_path)
 {
     char sensor_log_path[512];
     char command_log_path[512];
@@ -871,12 +1224,14 @@ static int validate_replay_compare(
             compare_program,
             command_log_path,
             replayed_command_path,
-            compare_output_path) != 0) {
+            compare_output_path,
+            exact_config_path) != 0) {
         (void)fprintf(stderr, "closed_loop_test: compare_logs failed\n");
         return 0;
     }
     return file_exists_and_nonempty(compare_output_path) &&
-        text_file_contains(compare_output_path, "\"verdict\": \"PASS\"");
+        text_file_contains(compare_output_path, "\"verdict\": \"PASS\"") &&
+        text_file_contains(compare_output_path, "\"comparison_mode\": \"EXACT\"");
 }
 
 /** @brief 启动一次闭环回归运行并等待两个进程正常退出。 */
@@ -885,6 +1240,8 @@ static int run_closed_loop_once(
     const char *environment_program,
     const char *flight_control_config,
     const char *scenario_config,
+    const char *run_mode,
+    const char *synchronization_mode,
     const char *label,
     ClosedLoopRun *run)
 {
@@ -896,7 +1253,7 @@ static int run_closed_loop_once(
     int env_status = 0;
     struct timespec startup_delay = { 0, 100000000L };
 
-    if (run == 0 || label == 0) {
+    if (run == 0 || run_mode == 0 || synchronization_mode == 0 || label == 0) {
         return -1;
     }
     (void)memset(run, 0, sizeof(*run));
@@ -928,11 +1285,19 @@ static int run_closed_loop_once(
         sizeof(run->faults_path),
         "%s_faults.json",
         run->output_dir);
-    if (write_runtime(run->runtime_path, run->output_dir, environment_port, flight_control_port) != 0) {
+    if (write_runtime(
+            run->runtime_path,
+            run->output_dir,
+            environment_port,
+            flight_control_port,
+            run_mode,
+            synchronization_mode) != 0) {
         (void)fprintf(stderr, "closed_loop_test: cannot write runtime config\n");
         return -1;
     }
-    if (write_faults(run->faults_path) != 0) {
+    if (write_faults(
+            run->faults_path,
+            strcmp(synchronization_mode, "FREE_RUNNING") == 0) != 0) {
         (void)fprintf(stderr, "closed_loop_test: cannot write faults config\n");
         (void)unlink(run->runtime_path);
         return -1;
@@ -981,8 +1346,28 @@ int main(int argc, char **argv)
     ClosedLoopRun first;
     ClosedLoopRun second;
     ClosedLoopRun occluded;
-    const ClosedLoopExpectation normal_expectation = { 0, 1 };
-    const ClosedLoopExpectation occluded_expectation = { 1, 0 };
+    ClosedLoopRun aero_v2;
+    const ClosedLoopExpectation normal_expectation = {
+        0, 1, 0,
+        "\"run_mode\": \"SIL_FAST\"",
+        "\"synchronization_mode\": \"LOCKSTEP\"",
+        1,
+        3u
+    };
+    const ClosedLoopExpectation occluded_expectation = {
+        1, 0, 0,
+        "\"run_mode\": \"SIL_FAST\"",
+        "\"synchronization_mode\": \"LOCKSTEP\"",
+        1,
+        3u
+    };
+    const ClosedLoopExpectation aero_v2_expectation = {
+        0, 0, 1,
+        "\"run_mode\": \"SIL_REALTIME\"",
+        "\"synchronization_mode\": \"FREE_RUNNING\"",
+        0,
+        15u
+    };
     char first_path[512];
     char second_path[512];
     char tile_path[256];
@@ -992,11 +1377,13 @@ int main(int argc, char **argv)
     char occluded_tile_relative_path[128];
     char occluded_tile_index_path[256];
     char aero_table_path[256];
+    char aero_table_v2_path[256];
     char aero_surrogate_path[280];
     char scenario_with_tile_path[256];
     char occluded_scenario_path[256];
+    char aero_v2_scenario_path[256];
 
-    if (argc != 7) {
+    if (argc != 10) {
         (void)fprintf(stderr, "closed_loop_test: invalid arguments\n");
         return 2;
     }
@@ -1037,12 +1424,29 @@ int main(int argc, char **argv)
         sizeof(aero_table_path),
         "/tmp/missile_closed_loop_aero_%ld.bin",
         (long)getpid());
+    (void)snprintf(
+        aero_table_v2_path,
+        sizeof(aero_table_v2_path),
+        "/tmp/missile_closed_loop_aero_v2_%ld.bin",
+        (long)getpid());
+    (void)snprintf(
+        aero_v2_scenario_path,
+        sizeof(aero_v2_scenario_path),
+        "/tmp/missile_closed_loop_aero_v2_scenario_%ld.json",
+        (long)getpid());
     (void)snprintf(aero_surrogate_path, sizeof(aero_surrogate_path), "%s.surrogate", aero_table_path);
     if (write_test_tile(tile_path, 0) != 0 ||
         write_test_tile_index(tile_index_path, tile_relative_path) != 0 ||
-        write_test_occluding_tile(occluded_tile_path) != 0 ||
-        write_test_tile_index(occluded_tile_index_path, occluded_tile_relative_path) != 0 ||
+        write_real_dem_tile(occluded_tile_path, argv[8]) != 0 ||
+        write_test_tile_index_bounds(
+            occluded_tile_index_path,
+            occluded_tile_relative_path,
+            27.986973937353,
+            27.989399291155,
+            86.923999786377,
+            86.926746368408) != 0 ||
         write_test_aero_table(aero_table_path) != 0 ||
+        write_test_aero_table_v2(aero_table_v2_path) != 0 ||
         write_test_aero_surrogate(aero_surrogate_path) != 0) {
         return 1;
     }
@@ -1052,28 +1456,43 @@ int main(int argc, char **argv)
             scenario_with_tile_path,
             tile_index_path,
             aero_table_path,
+            argv[7],
             0.0) != 0 ||
         write_scenario_with_resource_paths(
             argv[4],
             occluded_scenario_path,
             occluded_tile_index_path,
             aero_table_path,
-            0.25) != 0) {
+            argv[7],
+            0.25) != 0 ||
+        configure_real_dem_geometry(occluded_scenario_path) != 0 ||
+        write_scenario_with_resource_paths(
+            argv[4],
+            aero_v2_scenario_path,
+            tile_index_path,
+            aero_table_v2_path,
+            argv[7],
+            0.25) != 0 ||
+        configure_aero_v2_scenario(aero_v2_scenario_path) != 0) {
         return 1;
     }
-    if (run_closed_loop_once(argv[1], argv[2], argv[3], scenario_with_tile_path, "a", &first) != 0) {
+    if (run_closed_loop_once(
+            argv[1], argv[2], argv[3], scenario_with_tile_path,
+            "SIL_FAST", "LOCKSTEP", "a", &first) != 0) {
         return 1;
     }
-    if (!validate_closed_loop_outputs(&first, &normal_expectation)) {
+    if (!validate_closed_loop_outputs(&first, scenario_with_tile_path, &normal_expectation)) {
         return 1;
     }
-    if (!validate_replay_compare(&first, argv[3], argv[5], argv[6])) {
+    if (!validate_replay_compare(&first, argv[3], argv[5], argv[6], argv[9])) {
         return 1;
     }
-    if (run_closed_loop_once(argv[1], argv[2], argv[3], scenario_with_tile_path, "b", &second) != 0) {
+    if (run_closed_loop_once(
+            argv[1], argv[2], argv[3], scenario_with_tile_path,
+            "SIL_FAST", "LOCKSTEP", "b", &second) != 0) {
         return 1;
     }
-    if (!validate_closed_loop_outputs(&second, &normal_expectation)) {
+    if (!validate_closed_loop_outputs(&second, scenario_with_tile_path, &normal_expectation)) {
         return 1;
     }
     (void)snprintf(first_path, sizeof(first_path), "%s/summary.json", first.instance_dir);
@@ -1093,11 +1512,39 @@ int main(int argc, char **argv)
             argv[2],
             argv[3],
             occluded_scenario_path,
+            "SIL_FAST",
+            "LOCKSTEP",
             "los",
             &occluded) != 0) {
         return 1;
     }
-    if (!validate_closed_loop_outputs(&occluded, &occluded_expectation)) {
+    if (!validate_closed_loop_outputs(&occluded, occluded_scenario_path, &occluded_expectation)) {
+        return 1;
+    }
+    if (run_closed_loop_once(
+            argv[1],
+            argv[2],
+            argv[3],
+            aero_v2_scenario_path,
+            "SIL_REALTIME",
+            "FREE_RUNNING",
+            "aero_v2",
+            &aero_v2) != 0 ||
+        !validate_closed_loop_outputs(&aero_v2, aero_v2_scenario_path, &aero_v2_expectation)) {
+        return 1;
+    }
+    (void)snprintf(first_path, sizeof(first_path), "%s/config_snapshot_faults.json", aero_v2.instance_dir);
+    if (!text_file_contains(first_path, "SENSOR_FAULT_NOISE_INCREASE") ||
+        !text_file_contains(first_path, "SENSOR_FAULT_DELAY") ||
+        !text_file_contains(first_path, "ACTUATOR_FAULT_RATE_LIMIT") ||
+        !text_file_contains(first_path, "ACTUATOR_FAULT_DELAY") ||
+        !text_file_contains(first_path, "COMM_FAULT_DROP_PACKET") ||
+        !text_file_contains(first_path, "COMM_FAULT_DUPLICATE_PACKET") ||
+        !text_file_contains(first_path, "COMM_FAULT_CORRUPT_PACKET")) {
+        return 1;
+    }
+    (void)snprintf(first_path, sizeof(first_path), "%s/fc_performance.json", aero_v2.instance_dir);
+    if (text_file_contains(first_path, "\"dropped_packet_count\": 0")) {
         return 1;
     }
 
@@ -1107,13 +1554,17 @@ int main(int argc, char **argv)
     (void)unlink(second.faults_path);
     (void)unlink(occluded.runtime_path);
     (void)unlink(occluded.faults_path);
+    (void)unlink(aero_v2.runtime_path);
+    (void)unlink(aero_v2.faults_path);
     (void)unlink(tile_path);
     (void)unlink(tile_index_path);
     (void)unlink(occluded_tile_path);
     (void)unlink(occluded_tile_index_path);
     (void)unlink(aero_table_path);
+    (void)unlink(aero_table_v2_path);
     (void)unlink(aero_surrogate_path);
     (void)unlink(scenario_with_tile_path);
     (void)unlink(occluded_scenario_path);
+    (void)unlink(aero_v2_scenario_path);
     return 0;
 }

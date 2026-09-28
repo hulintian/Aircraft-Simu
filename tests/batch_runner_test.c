@@ -56,6 +56,8 @@ int main(int argc, char **argv)
 {
     char manifest_path[128];
     char generated_manifest_path[128];
+    char generated_run_manifest_path[192];
+    char manual_run_manifest_path[192];
     char generated_dir[128];
     char template_path[128];
     char script_path[128];
@@ -76,6 +78,16 @@ int main(int argc, char **argv)
     }
     (void)snprintf(manifest_path, sizeof(manifest_path), "/tmp/missile_batch_%ld.txt", (long)getpid());
     (void)snprintf(generated_manifest_path, sizeof(generated_manifest_path), "/tmp/missile_generated_batch_%ld.txt", (long)getpid());
+    (void)snprintf(
+        generated_run_manifest_path,
+        sizeof(generated_run_manifest_path),
+        "%s.run_manifest.json",
+        generated_manifest_path);
+    (void)snprintf(
+        manual_run_manifest_path,
+        sizeof(manual_run_manifest_path),
+        "%s.run_manifest.json",
+        manifest_path);
     (void)snprintf(generated_dir, sizeof(generated_dir), "/tmp/missile_mc_%ld", (long)getpid());
     (void)snprintf(template_path, sizeof(template_path), "/tmp/missile_runtime_template_%ld.json", (long)getpid());
     (void)snprintf(script_path, sizeof(script_path), "/tmp/missile_fake_manager_%ld.sh", (long)getpid());
@@ -132,6 +144,8 @@ int main(int argc, char **argv)
         script_path);
     failures += expect(system(command) == 0, "batch_runner_command");
     failures += expect(count_lines(marker_path) == 2, "batch_runner_line_count");
+    failures += expect(file_contains(manual_run_manifest_path, "\"run_mode\": \"MONTE_CARLO\""), "batch_runner_manual_run_mode");
+    failures += expect(file_contains(manual_run_manifest_path, "\"attempted_count\": 2"), "batch_runner_manual_attempted");
 
     file = fopen(template_path, "w");
     if (file == 0) {
@@ -162,6 +176,10 @@ int main(int argc, char **argv)
         generated_dir);
     failures += expect(system(command) == 0, "batch_runner_generate_command");
     failures += expect(count_lines(generated_manifest_path) == 2, "batch_runner_generated_manifest_lines");
+    failures += expect(file_contains(generated_run_manifest_path, "\"run_mode\": \"MONTE_CARLO\""), "batch_runner_generated_run_mode");
+    failures += expect(file_contains(generated_run_manifest_path, "\"random_seed\": 9000"), "batch_runner_generated_base_seed");
+    failures += expect(file_contains(generated_run_manifest_path, "\"run_count\": 2"), "batch_runner_generated_run_count");
+    failures += expect(file_contains(generated_run_manifest_path, "\"generated_only\": true"), "batch_runner_generated_only");
     failures += expect(file_contains(generated_manifest_path, "runtime_0000.json"), "batch_runner_manifest_runtime_a");
     failures += expect(file_contains(generated_manifest_path, "campaign_summary.json"), "batch_runner_manifest_stats_path");
     failures += expect(file_contains(generated_runtime_a, "\"base_random_seed\": 9000"), "batch_runner_seed_a");
@@ -271,6 +289,8 @@ int main(int argc, char **argv)
 
     (void)unlink(manifest_path);
     (void)unlink(generated_manifest_path);
+    (void)unlink(generated_run_manifest_path);
+    (void)unlink(manual_run_manifest_path);
     (void)unlink(template_path);
     (void)unlink(script_path);
     (void)unlink(marker_path);

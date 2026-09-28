@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "dataset_id": "mapzen_terrain_everest_z12_x3037_y1716_crop_9x9",
+  "description": "珠峰附近公开高程瓦片的 9x9 样本，用于真实来源 DEM 预处理、插值和 LOS 回归。",
+  "source": {
+    "dataset": "Mapzen Terrain Tiles",
+    "registry_url": "https://registry.opendata.aws/terrain-tiles/",
+    "object_url": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/12/3037/1716.png",
+    "accessed_utc": "2026-07-16",
+    "source_sha256": "fc91d79e680cebd18d896ef488facb03845039cf870bca44c915a55153627ff6",
+    "attribution_url": "https://github.com/tilezen/joerd/blob/master/docs/attribution.md"
+  },
+  "derivation": {
+    "source_projection": "EPSG:3857",
+    "output_coordinates": "WGS-84 latitude/longitude sample bounds",
+    "source_pixel_window": "x=0..8,y=16..24",
+    "elevation_formula_m": "R * 256 + G + B / 256 - 32768",
+    "row_order": "south_to_north",
+    "quantization_m": 1.0,
+    "output_file": "everest_terrain_9x9.txt",
+    "output_sha256": "1762663864851a22e4c88441b3f5e941e0fea13af7f360e74dbe0694a2a9d8ba"
+  },
+  "grid": {
+    "width": 9,
+    "height": 9,
+    "lat_min_deg": 27.986973937353,
+    "lat_max_deg": 27.989399291155,
+    "lon_min_deg": 86.923999786377,
+    "lon_max_deg": 86.926746368408,
+    "min_height_m": 8521,
+    "max_height_m": 8753
+  },
+  "regression_expectations": {
+    "peak_sample_lat_deg": 27.989096121930,
+    "peak_sample_lon_deg": 86.925373077393,
+    "peak_height_m": 8753,
+    "blocked_los_height_m": 8720,
+    "clear_los_height_m": 8800
+  }
+}
